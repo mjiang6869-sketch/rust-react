@@ -8,7 +8,7 @@ LIVE 真实订单只允许 `LIMIT + GTX` Maker-only，止盈和止损使用 redu
 
 ## 一键运行
 
-需要 Rust 稳定版、Node.js 20+、pnpm 和 curl。首次运行会按需安装前端/Electron 依赖并编译 Rust sidecar：
+需要 Rust 稳定版、Node.js 20+、pnpm 和 curl。Cloudflare 命令另外要求 Node.js 22+（Wrangler 当前运行时要求）。首次运行会按需安装前端/Electron 依赖并编译 Rust sidecar：
 
 ```sh
 ./scripts/run.sh              # 启动 Electron、Rust API 和 Vite

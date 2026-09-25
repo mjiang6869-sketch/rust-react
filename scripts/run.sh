@@ -28,6 +28,19 @@ require_command() {
   }
 }
 
+require_node22() {
+  require_command node
+  local version major
+  version="$(node -p 'process.versions.node')"
+  major="${version%%.*}"
+  if (( major < 22 )); then
+    printf 'Cloudflare Wrangler 需要 Node.js 22+，当前是 %s。请先执行：\n' "$version" >&2
+    printf '  nvm install 22 && nvm use 22\n' >&2
+    printf '然后重新运行：./scripts/run.sh %s\n' "${1:-cloudflare-check}" >&2
+    exit 1
+  fi
+}
+
 read_pid() {
   [[ -f "$PID_FILE" ]] || return 1
   local pid
@@ -113,20 +126,21 @@ start_app() {
 }
 
 cloudflare_check() {
-  require_command node
+  require_node22 cloudflare-check
   require_command pnpm
   (cd "$ROOT_DIR/cloudflare/worker" && pnpm install --frozen-lockfile && pnpm typecheck)
 }
 
 cloudflare_deploy() {
   cloudflare_check
-  (cd "$ROOT_DIR/cloudflare/worker" && pnpm deploy)
+  (cd "$ROOT_DIR/cloudflare/worker" && pnpm exec wrangler deploy --config wrangler.toml)
 }
 
 cloudflare_migrate() {
+  require_node22 cloudflare-migrate
   require_command pnpm
-  (cd "$ROOT_DIR/cloudflare/worker" && pnpm exec wrangler d1 execute rust-crypto-meta --remote --file=../d1/001_initial.sql)
-  (cd "$ROOT_DIR/cloudflare/worker" && pnpm exec wrangler d1 execute rust-crypto-meta --remote --file=../d1/002_operational_tables.sql)
+  (cd "$ROOT_DIR/cloudflare/worker" && pnpm exec wrangler d1 execute rust-crypto-meta --remote --config wrangler.toml --file=../d1/001_initial.sql)
+  (cd "$ROOT_DIR/cloudflare/worker" && pnpm exec wrangler d1 execute rust-crypto-meta --remote --config wrangler.toml --file=../d1/002_operational_tables.sql)
 }
 
 command_name="${1:-start}"
