@@ -97,6 +97,12 @@ interface TrendAnalysis {
   method: string;
 }
 
+interface AiReply {
+  answer: string;
+  source: string;
+  generated_at: string;
+}
+
 const kindLabel: Record<OrderKind, string> = {
   entry: "回踩开仓",
   take_profit: "Maker 止盈",
@@ -201,6 +207,9 @@ export default function App() {
   const [backtest, setBacktest] = useState<BacktestReport | null>(null);
   const [backtestBusy, setBacktestBusy] = useState(false);
   const [analysis, setAnalysis] = useState<TrendAnalysis | null>(null);
+  const [question, setQuestion] = useState("");
+  const [conversation, setConversation] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
+  const [aiBusy, setAiBusy] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -279,6 +288,27 @@ export default function App() {
     }
   };
 
+  const askAi = async () => {
+    const prompt = question.trim();
+    if (!prompt || aiBusy) return;
+    setAiBusy(true);
+    setConversation((current) => [...current, { role: "user", text: prompt }]);
+    setQuestion("");
+    try {
+      const reply = await request<AiReply>("/api/ai/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: prompt }),
+      });
+      setConversation((current) => [...current, { role: "assistant", text: reply.answer }]);
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "AI 分析失败");
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
   const config = snapshot?.config;
   const isTradFi = config?.contract_type === "TRADIFI_PERPETUAL";
   return (
@@ -318,6 +348,21 @@ export default function App() {
         <section className="panel chart-panel">
           <div className="panel-heading"><h2>K 线与趋势</h2><span>确定性拐点标注</span></div>
           <PriceChart analysis={analysis} />
+        </section>
+
+        <section className="panel ai-panel">
+          <div className="panel-heading"><h2>行情分析助手</h2><span>只读，不生成订单</span></div>
+          <div className="conversation" aria-live="polite">
+            {conversation.length ? conversation.map((message, index) => (
+              <div className={`message ${message.role}`} key={`${message.role}-${index}`}>
+                <span>{message.role === "user" ? "你" : "分析助手"}</span><p>{message.text}</p>
+              </div>
+            )) : <p className="empty">可以询问当前趋势、拐点、笔线段和中枢。分析结果只读，不会下单。</p>}
+          </div>
+          <form className="ai-form" onSubmit={(event) => { event.preventDefault(); void askAi(); }}>
+            <input aria-label="行情分析问题" value={question} maxLength={2000} placeholder="例如：当前趋势和最近中枢有什么关系？" onChange={(event) => setQuestion(event.target.value)} />
+            <button className="secondary" disabled={aiBusy || !question.trim()} type="submit">{aiBusy ? "分析中…" : "提问"}</button>
+          </form>
         </section>
 
         <div className="main-grid">

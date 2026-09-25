@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod analysis;
 pub mod backtest;
 pub mod execution;
@@ -20,6 +21,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::ai::{AnalysisRequest, AnalysisResponse};
 use crate::analysis::TrendAnalysis;
 use crate::backtest::{BacktestConfig, BacktestReport, FillModel};
 use crate::feed::{BinanceFeed, parse_ws_candle};
@@ -97,6 +99,7 @@ async fn main() -> Result<()> {
         .route("/api/state", get(get_state))
         .route("/api/history", get(get_history))
         .route("/api/analysis", get(get_analysis))
+        .route("/api/ai/analyze", post(ai_analyze))
         .route("/api/backtest", post(run_backtest))
         .route("/api/config", put(update_config))
         .route("/api/kill", post(kill))
@@ -128,6 +131,20 @@ async fn get_analysis(State(state): State<AppState>) -> Json<TrendAnalysis> {
     let engine = state.engine.lock().await;
     let candles: Vec<Candle> = engine.history.values().cloned().collect();
     Json(analysis::analyze(&candles))
+}
+
+async fn ai_analyze(
+    State(state): State<AppState>,
+    Json(request): Json<AnalysisRequest>,
+) -> ApiResult<Json<AnalysisResponse>> {
+    let engine = state.engine.lock().await;
+    let candles: Vec<Candle> = engine.history.values().cloned().collect();
+    let context = analysis::analyze(&candles);
+    drop(engine);
+    ai::analyze(request.question, &context)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_GATEWAY, format!("AI 分析失败：{error}")))
 }
 
 async fn run_backtest(
