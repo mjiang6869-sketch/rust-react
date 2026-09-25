@@ -77,6 +77,7 @@ interface LiveStatus {
   account_reconciled: boolean;
   armed: boolean;
   unresolved_order_ids: string[];
+  available_collateral: string;
   message: string;
 }
 
@@ -382,7 +383,7 @@ export default function App() {
           <div>
             <p className="eyebrow">USDⓈ-M 永续合约 · 失败突破回踩策略</p>
             <h1>{config?.symbol ?? "正在载入交易对"}</h1>
-            <p className="subheading">使用币安公开 1 分钟 K 线。订单、持仓和盈亏在本地模拟。</p>
+            <p className="subheading">使用币安公开 1 分钟 K 线。{snapshot?.mode === "LIVE" ? "真实订单必须经过账户对账和 Maker-only 安全闸门。" : "订单、持仓和盈亏在本地模拟。"}</p>
           </div>
           <div className="headline-actions">
             <span className={`badge ${snapshot?.feed_fresh ? "good" : "alert"}`}>
@@ -413,7 +414,7 @@ export default function App() {
 
         <section className="metrics" aria-label="运行概况">
           <article className="metric"><span>最新价格</span><strong>{snapshot?.candle ? number(snapshot.candle.close) : "—"}</strong><small>{snapshot?.candle ? time(snapshot.candle.open_time) : "等待行情"}</small></article>
-          <article className="metric"><span>可用保证金估值</span><strong>{snapshot ? number(snapshot.available_collateral) : "—"}</strong><small>模拟盘按 USDT/USDC 等值估算</small></article>
+          <article className="metric"><span>{snapshot?.mode === "LIVE" ? "交易所可用保证金" : "可用保证金估值"}</span><strong>{snapshot?.mode === "LIVE" ? number(liveStatus?.available_collateral ?? "0") : snapshot ? number(snapshot.available_collateral) : "—"}</strong><small>{snapshot?.mode === "LIVE" ? `按 ${config?.margin_asset ?? "结算资产"} 对账` : "模拟盘按 USDT/USDC 等值估算"}</small></article>
           <article className="metric"><span>USDT 余额</span><strong>{snapshot ? number(snapshot.wallet.usdt) : "—"}</strong><small>可在多资产模式下作共享保证金</small></article>
           <article className="metric"><span>USDC 余额</span><strong>{snapshot ? number(snapshot.wallet.usdc) : "—"}</strong><small>USDC 合约盈亏在此结算</small></article>
         </section>

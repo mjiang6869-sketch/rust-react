@@ -168,6 +168,7 @@ async fn get_live_status(State(state): State<AppState>) -> Json<LiveStatus> {
             account_reconciled: false,
             armed: false,
             unresolved_order_ids: Vec::new(),
+            available_collateral: rust_decimal::Decimal::ZERO,
             message: "LIVE runtime 尚未创建".to_string(),
         },
         LiveRuntime::status,
@@ -373,6 +374,7 @@ async fn close_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>
             account_reconciled: false,
             armed: false,
             unresolved_order_ids: Vec::new(),
+            available_collateral: rust_decimal::Decimal::ZERO,
             message: "LIVE runtime 尚未创建".to_string(),
         }));
     };
@@ -389,6 +391,7 @@ async fn close_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>
         account_reconciled: false,
         armed: false,
         unresolved_order_ids: Vec::new(),
+        available_collateral: rust_decimal::Decimal::ZERO,
         message: "LIVE runtime 已关闭".to_string(),
     }))
 }

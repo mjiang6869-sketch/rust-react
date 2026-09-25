@@ -60,6 +60,8 @@ pub struct LiveStatus {
     pub account_reconciled: bool,
     pub armed: bool,
     pub unresolved_order_ids: Vec<String>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub available_collateral: Decimal,
     pub message: String,
 }
 
@@ -506,6 +508,7 @@ impl LiveRuntime {
             account_reconciled: self.safety.account_reconciled(),
             armed: self.safety.is_armed(),
             unresolved_order_ids,
+            available_collateral: self.available_collateral,
             message,
         }
     }
