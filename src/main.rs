@@ -4,6 +4,7 @@ pub mod backtest;
 pub mod binance;
 pub mod execution;
 mod feed;
+pub mod live;
 mod model;
 pub mod order_state;
 mod paper;
