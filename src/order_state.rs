@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::user_stream::OrderTradeUpdate;
@@ -120,6 +121,61 @@ impl OrderReconciler {
             .collect()
     }
 
+    pub fn unresolved_client_order_ids(&self) -> Vec<String> {
+        self.orders
+            .values()
+            .filter(|order| !order.state.terminal())
+            .map(|order| order.client_order_id.clone())
+            .collect()
+    }
+
+    pub fn apply_query_response(
+        &mut self,
+        client_order_id: &str,
+        response: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<ReconcileAction, &'static str> {
+        let exchange_order_id = response["orderId"]
+            .as_i64()
+            .map(|value| value.to_string())
+            .or_else(|| response["orderId"].as_str().map(str::to_string))
+            .ok_or("订单查询响应缺少 orderId")?;
+        let returned_client_id = response["clientOrderId"]
+            .as_str()
+            .ok_or("订单查询响应缺少 clientOrderId")?;
+        if returned_client_id != client_order_id {
+            return Err("订单查询响应的 clientOrderId 不匹配");
+        }
+        let status = response["status"]
+            .as_str()
+            .ok_or("订单查询响应缺少 status")?;
+        let executed_quantity = Decimal::from_str_exact(
+            response["executedQty"]
+                .as_str()
+                .ok_or("订单查询响应缺少 executedQty")?,
+        )
+        .map_err(|_| "订单查询响应的 executedQty 无效")?;
+        let order = self
+            .orders
+            .get_mut(client_order_id)
+            .ok_or("未知客户端订单，拒绝查询结果")?;
+        if order
+            .exchange_order_id
+            .as_ref()
+            .is_some_and(|id| id != &exchange_order_id)
+            || executed_quantity > order.expected_quantity
+        {
+            order.state = RemoteOrderState::Unknown;
+            return Ok(ReconcileAction::Alert);
+        }
+        let state = state_from_binance_status(status).ok_or("订单查询返回未知状态")?;
+        order.exchange_order_id = Some(exchange_order_id);
+        order.filled_quantity = executed_quantity;
+        order.updated_at = now;
+        order.state = state;
+        Ok(action_for_state(state))
+    }
+
     pub fn apply_event(
         &mut self,
         event: &OrderTradeUpdate,
@@ -167,16 +223,32 @@ impl OrderReconciler {
                 return Ok(Some(ReconcileAction::Alert));
             }
         };
-        Ok(Some(match order.state {
-            RemoteOrderState::Filled => ReconcileAction::MarkFilled,
-            RemoteOrderState::Canceled | RemoteOrderState::Expired => ReconcileAction::MarkCanceled,
-            RemoteOrderState::Rejected => ReconcileAction::MarkRejected,
-            _ => ReconcileAction::QueryOrder,
-        }))
+        Ok(Some(action_for_state(order.state)))
     }
 
     pub fn get(&self, client_order_id: &str) -> Option<&TrackedOrder> {
         self.orders.get(client_order_id)
+    }
+}
+
+fn state_from_binance_status(status: &str) -> Option<RemoteOrderState> {
+    match status {
+        "NEW" => Some(RemoteOrderState::New),
+        "PARTIALLY_FILLED" => Some(RemoteOrderState::PartiallyFilled),
+        "FILLED" => Some(RemoteOrderState::Filled),
+        "CANCELED" => Some(RemoteOrderState::Canceled),
+        "REJECTED" => Some(RemoteOrderState::Rejected),
+        "EXPIRED" => Some(RemoteOrderState::Expired),
+        _ => None,
+    }
+}
+
+fn action_for_state(state: RemoteOrderState) -> ReconcileAction {
+    match state {
+        RemoteOrderState::Filled => ReconcileAction::MarkFilled,
+        RemoteOrderState::Canceled | RemoteOrderState::Expired => ReconcileAction::MarkCanceled,
+        RemoteOrderState::Rejected => ReconcileAction::MarkRejected,
+        _ => ReconcileAction::QueryOrder,
     }
 }
 
@@ -238,6 +310,32 @@ mod tests {
         assert_eq!(
             reconciler.get("mm-entry-1").unwrap().state,
             RemoteOrderState::Unknown
+        );
+    }
+
+    #[test]
+    fn applies_rest_query_after_unknown_submission() {
+        let now = Utc::now();
+        let mut reconciler = OrderReconciler::new("ETHUSDC".to_string());
+        reconciler
+            .register("mm-entry-1".to_string(), Decimal::ONE, now)
+            .unwrap();
+        reconciler.submit_unknown("mm-entry-1", now);
+        let response = serde_json::json!({
+            "orderId": 12345,
+            "clientOrderId": "mm-entry-1",
+            "status": "PARTIALLY_FILLED",
+            "executedQty": "0.500"
+        });
+        assert_eq!(
+            reconciler
+                .apply_query_response("mm-entry-1", &response, now)
+                .unwrap(),
+            ReconcileAction::QueryOrder
+        );
+        assert_eq!(
+            reconciler.get("mm-entry-1").unwrap().state,
+            RemoteOrderState::PartiallyFilled
         );
     }
 }

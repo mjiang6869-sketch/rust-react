@@ -101,6 +101,21 @@ impl LiveRuntime {
         self.reconciler.on_reconnect()
     }
 
+    pub async fn reconcile_order(
+        &mut self,
+        client_order_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ReconcileAction> {
+        let response = self.execution.query_order(client_order_id).await?;
+        self.reconciler
+            .apply_query_response(client_order_id, &response, now)
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub fn unresolved_order_ids(&self) -> Vec<String> {
+        self.reconciler.unresolved_client_order_ids()
+    }
+
     pub fn order(&self, client_order_id: &str) -> Option<&crate::order_state::TrackedOrder> {
         self.reconciler.get(client_order_id)
     }
