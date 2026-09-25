@@ -31,8 +31,8 @@
 use chrono::Duration;
 use domain::{
     BreakEvenSpec, EnterRequest, MarketView, ParameterSpec, ProtectionPlan, SizeHint,
-    StandDownReason, StopSpec, Strategy, StrategyIntent, TpPlan, TpRung, TrailingSpec,
-    check_entry, reference_range, resolve_size,
+    StandDownReason, StopSpec, Strategy, StrategyIntent, TpPlan, TpRung, TrailingSpec, check_entry,
+    reference_range, resolve_size,
 };
 use rust_decimal::Decimal;
 
@@ -85,7 +85,7 @@ impl Default for RangeMakerParams {
             take_profit_bp: Decimal::new(4, 0),
             stop_buffer_bp: Decimal::new(2, 0),
             side_mode: SideMode::LongOnly,
-            equity_pct: Decimal::new(1, 1),   // 10%
+            equity_pct: Decimal::new(1, 1), // 10%
             leverage: Decimal::from(3),
             valid_minutes: 2,
             break_even: true,
@@ -148,11 +148,10 @@ impl Strategy for RangeMaker {
             ParameterSpec {
                 key: "take_profit_bp".into(),
                 label: "止盈距离".into(),
-                description:
-                    "入场价外多少个基点止盈。零手续费下这就是单笔毛利润，所以不能设得太小\
+                description: "入场价外多少个基点止盈。零手续费下这就是单笔毛利润，所以不能设得太小\
                      （小于一个 tick 会导致量化后无法成交），也不能太大（持仓时间变长会放大\
                      逆向选择的影响）。"
-                        .into(),
+                    .into(),
                 unit: Some("基点".into()),
                 default: Decimal::new(4, 0),
                 min: Decimal::new(1, 0),
@@ -161,10 +160,9 @@ impl Strategy for RangeMaker {
             ParameterSpec {
                 key: "stop_buffer_bp".into(),
                 label: "止损缓冲".into(),
-                description:
-                    "止损放在区间边界外多少个基点，即「价格突破区间就认错」。缓冲太小会被\
+                description: "止损放在区间边界外多少个基点，即「价格突破区间就认错」。缓冲太小会被\
                      正常波动扫掉，太大则单笔亏损过大。"
-                        .into(),
+                    .into(),
                 unit: Some("基点".into()),
                 default: Decimal::new(2, 0),
                 min: Decimal::new(1, 0),
@@ -182,10 +180,9 @@ impl Strategy for RangeMaker {
             ParameterSpec {
                 key: "leverage".into(),
                 label: "杠杆".into(),
-                description:
-                    "仓位计算使用的杠杆倍数。注意维持保证金率 2.5%，杠杆越高止损距强平\
+                description: "仓位计算使用的杠杆倍数。注意维持保证金率 2.5%，杠杆越高止损距强平\
                      越近，风控会据此拒绝过近的止损。"
-                        .into(),
+                    .into(),
                 unit: Some("倍".into()),
                 default: Decimal::from(3),
                 min: Decimal::ONE,
@@ -280,8 +277,13 @@ impl Strategy for RangeMaker {
             pct: p.equity_pct,
             leverage: p.leverage,
         };
-        if resolve_size(size, domain::Price::new(entry), view.equity, &view.instrument.precision)
-            .is_none()
+        if resolve_size(
+            size,
+            domain::Price::new(entry),
+            view.equity,
+            &view.instrument.precision,
+        )
+        .is_none()
         {
             return Some(StrategyIntent::StandDown {
                 reason: StandDownReason::InsufficientEquity,
@@ -440,9 +442,7 @@ impl Strategy for RangeMakerLadder {
 mod tests {
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
-    use domain::{
-        Candle, ContractKind, FeeSchedule, FeeSource, Instrument, Precision,
-    };
+    use domain::{Candle, ContractKind, FeeSchedule, FeeSource, Instrument, Precision};
     use rust_decimal_macros::dec;
 
     fn instrument() -> Instrument {
@@ -472,7 +472,10 @@ mod tests {
     }
 
     fn candles(n: usize, low: Decimal, high: Decimal) -> Vec<Candle> {
-        let t0: DateTime<Utc> = Utc.timestamp_millis_opt(1_785_542_400_000).single().unwrap();
+        let t0: DateTime<Utc> = Utc
+            .timestamp_millis_opt(1_785_542_400_000)
+            .single()
+            .unwrap();
         (0..n)
             .map(|i| Candle {
                 open_time: t0 + Duration::minutes(i as i64),
@@ -486,11 +489,7 @@ mod tests {
             .collect()
     }
 
-    fn view<'a>(
-        candles: &'a [Candle],
-        inst: &'a Instrument,
-        has_position: bool,
-    ) -> MarketView<'a> {
+    fn view<'a>(candles: &'a [Candle], inst: &'a Instrument, has_position: bool) -> MarketView<'a> {
         MarketView {
             instrument: inst,
             candles,
@@ -715,7 +714,11 @@ mod tests {
                 "参数 {} 缺少说明——前端要靠它解释参数含义",
                 p.key
             );
-            assert!(p.min <= p.default && p.default <= p.max, "参数 {} 的默认值超出范围", p.key);
+            assert!(
+                p.min <= p.default && p.default <= p.max,
+                "参数 {} 的默认值超出范围",
+                p.key
+            );
         }
     }
 }
