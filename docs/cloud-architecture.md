@@ -45,8 +45,8 @@ wrangler whoami
 ### 2.1 创建 R2
 
 ```sh
-wrangler r2 bucket create rust-crypto-market-data-prod
-wrangler r2 bucket create rust-crypto-backtests-prod
+wrangler r2 bucket create rust-crypto-market-data
+wrangler r2 bucket create rust-crypto-backtests
 ```
 
 对象路径：
@@ -62,7 +62,7 @@ backtests/v1/{run_id}/trades.parquet
 ### 2.2 创建 D1
 
 ```sh
-wrangler d1 create rust-crypto-meta-prod
+wrangler d1 create rust-crypto-meta
 ```
 
 把返回的 database_id 写入 Worker 的实际部署配置。建议表：
@@ -138,15 +138,15 @@ CREATE INDEX idx_data_jobs_status ON data_jobs (status, created_at);
 初始化迁移：
 
 ```sh
-wrangler d1 execute rust-crypto-meta-prod --remote --file=./infra/d1/001_initial.sql
+wrangler d1 execute rust-crypto-meta --remote --file=./infra/d1/001_initial.sql
 ```
 
 ### 2.3 创建 Queues
 
 ```sh
-wrangler queues create rust-crypto-download-prod
-wrangler queues create rust-crypto-backtest-prod
-wrangler queues create rust-crypto-dead-letter-prod
+wrangler queues create rust-crypto-download
+wrangler queues create rust-crypto-backtest
+wrangler queues create rust-crypto-dead-letter
 ```
 
 队列消息必须包含唯一 job_id。Queues 默认至少一次投递，消费者必须幂等。
@@ -154,33 +154,33 @@ wrangler queues create rust-crypto-dead-letter-prod
 ## 3. Worker 绑定示例
 
 ```toml
-name = "rust-crypto-api-prod"
+name = "rust-crypto-api"
 main = "src/index.ts"
 compatibility_date = "2026-09-25"
 
 [[d1_databases]]
 binding = "META_DB"
-database_name = "rust-crypto-meta-prod"
+database_name = "rust-crypto-meta"
 database_id = "<actual-database-id>"
 
 [[r2_buckets]]
 binding = "MARKET_DATA"
-bucket_name = "rust-crypto-market-data-prod"
+bucket_name = "rust-crypto-market-data"
 
 [[r2_buckets]]
 binding = "BACKTESTS"
-bucket_name = "rust-crypto-backtests-prod"
+bucket_name = "rust-crypto-backtests"
 
 [[queues.producers]]
 binding = "DOWNLOAD_QUEUE"
-queue = "rust-crypto-download-prod"
+queue = "rust-crypto-download"
 
 [[queues.producers]]
 binding = "BACKTEST_QUEUE"
-queue = "rust-crypto-backtest-prod"
+queue = "rust-crypto-backtest"
 
 [vars]
-ENVIRONMENT = "production"
+ENVIRONMENT = "live"
 RUST_API_BASE_URL = "https://trade.example.com"
 ```
 
@@ -193,11 +193,11 @@ Rust 运行在云服务器时，优先使用 AWS Secrets Manager、GCP Secret Ma
 建议密钥名称：
 
 ```text
-rust-crypto/prod/binance/paper/api-key
-rust-crypto/prod/binance/paper/api-secret
-rust-crypto/prod/binance/live/api-key
-rust-crypto/prod/binance/live/api-secret
-rust-crypto/prod/deepseek/api-key
+rust-crypto/binance/paper/api-key
+rust-crypto/binance/paper/api-secret
+rust-crypto/binance/live/api-key
+rust-crypto/binance/live/api-secret
+rust-crypto/deepseek/api-key
 ```
 
 启动流程：实例身份认证 -> Secret Manager -> 仅注入 Rust 内存 -> 检查 PAPER/LIVE 和 endpoint allowlist -> 启动。密钥不能写日志、metrics、HTTP 响应或回测结果；Binance Key 禁止提现权限，LIVE Key 开启 IP 白名单。
@@ -248,6 +248,16 @@ USDT、USDC 的 quote_asset、margin_asset、settlement_asset 必须分开。USD
 
 Rust 服务使用 Docker 或 systemd。服务器磁盘只作为临时缓存，不作为历史数据唯一来源。入站限制 SSH 和必要健康检查，管理端口限制固定 IP 或 VPN；Rust 管理 API 通过 Cloudflare Tunnel 或 Worker 反代；出站只允许 Binance、R2、内部 Worker API 和 Secret Manager。
 
+### 8.1 初期本地电脑连接方式
+
+初期可以从当前 Mac 编写、构建和发布程序，并通过 SSH 管理云服务器。正式交易进程、定时任务和回测 worker 都运行在云服务器上；Mac 仅用于开发、查看日志和管理，不承担交易运行，也不保存正式 API Secret。部署后关闭 Mac，交易进程仍应持续运行。
+
+建议先采购一台通用型 Linux 云主机作为起步节点：Ubuntu 24.04 LTS、4 vCPU、16 GB RAM、100-320 GB SSD/NVMe、固定公网 IPv4、按量或月付、开启每日磁盘快照。云厂商选择 AWS、Google Cloud、Azure 或有稳定网络和售后支持的主流区域厂商，优先选择能够提供实例身份、密钥管理服务、监控和快照的产品。初始不需要 GPU，也不需要 Kubernetes。
+
+机房区域应先验证再定：从目标候选区域分别检查 Binance REST、WebSocket，Cloudflare Worker 和 R2 的连通性、断线恢复与延迟；再综合可用区稳定性、带宽、快照价格和 Secret Manager 能力选机房。不要只按地理距离判断。采购后配置 SSH 公钥登录、禁用密码登录、仅允许个人固定 IP 或 VPN 入站；给实例绑定最小权限身份读取 Secret Manager；打开系统更新、磁盘快照、CPU/内存/磁盘/网络告警。
+
+部署前先以模拟盘或只读 API 连续运行，验证网络中断恢复、WebSocket 重连、订单状态恢复、账户对账、磁盘空间、资源占用和告警。达到稳定运行验收标准后再启用真实下单权限。4 vCPU / 16 GB 是起步建议，不代表未经容量验证即可实盘；高频盘口回放或更高并发时再按监控数据扩容。
+
 ## 9. 实施阶段
 
 1. 创建 R2、D1、Queues，实现 1m 下载、checksum、Parquet、manifest。
@@ -258,6 +268,10 @@ Rust 服务使用 Docker 或 systemd。服务器磁盘只作为临时缓存，�
 ## 10. 上线检查
 
 - [ ] R2 原始和规范化数据都有 checksum 与 manifest。
+- [ ] Cloudflare 资源采用无环境后缀命名：`rust-crypto-meta`、`rust-crypto-market-data`、`rust-crypto-backtests`、`rust-crypto-download`、`rust-crypto-backtest`、`rust-crypto-dead-letter`。
+- [ ] Rust 交易进程部署在云服务器；本地 Mac 关闭后，交易、行情处理和任务消费仍可持续运行。
+- [ ] 已在候选机房验证 Binance REST/WebSocket、Cloudflare Worker/R2 网络连通性和重连行为。
+- [ ] 模拟盘连续运行、订单恢复、账户对账、告警和资源容量验收通过后，才启用真实交易密钥。
 - [ ] D1 只保存索引、任务和结果摘要。
 - [ ] Rust 通过 Secret Manager 获取密钥，React 无法读取。
 - [ ] PAPER/LIVE endpoint allowlist 已启用。
