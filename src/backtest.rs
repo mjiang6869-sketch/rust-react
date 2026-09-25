@@ -7,8 +7,23 @@ use crate::model::{Candle, Side, Signal, quantize_down};
 use crate::signal::{find_reversal_signal, invalid_reason, risk_reason};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FillModel {
     CandleRangeTouch,
+    TopOfBook,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+pub struct OrderBookSnapshot {
+    pub open_time: DateTime<Utc>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub bid_price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub bid_quantity: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub ask_price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub ask_quantity: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -24,6 +39,7 @@ pub struct BacktestConfig {
     pub min_qty: Decimal,
     pub min_notional: Decimal,
     pub fill_model: FillModel,
+    pub order_book: BTreeMap<DateTime<Utc>, OrderBookSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -143,7 +159,13 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
                 || invalid_reason(&entry.signal, Some(candle), &history, now).is_some()
             {
                 pending_expiries += 1;
-            } else if touches_entry(entry.signal.side, entry.signal.entry_price, candle) {
+            } else if touches_entry(
+                entry.signal.side,
+                entry.signal.entry_price,
+                entry.quantity,
+                candle,
+                config,
+            ) {
                 let ratio = config.take_profit_pct / Decimal::from(100);
                 let target_price = match entry.signal.side {
                     Side::Buy => quantize_down(
@@ -205,10 +227,29 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
     }
 }
 
-fn touches_entry(side: Side, price: Decimal, candle: &Candle) -> bool {
-    match side {
+fn touches_entry(
+    side: Side,
+    price: Decimal,
+    quantity: Decimal,
+    candle: &Candle,
+    config: &BacktestConfig,
+) -> bool {
+    let candle_touch = match side {
         Side::Buy => candle.low <= price,
         Side::Sell => candle.high >= price,
+    };
+    if !candle_touch {
+        return false;
+    }
+    match config.fill_model {
+        FillModel::CandleRangeTouch => true,
+        FillModel::TopOfBook => config
+            .order_book
+            .get(&candle.open_time)
+            .is_some_and(|book| match side {
+                Side::Buy => book.bid_price >= price && book.bid_quantity >= quantity,
+                Side::Sell => book.ask_price <= price && book.ask_quantity >= quantity,
+            }),
     }
 }
 
@@ -253,6 +294,7 @@ mod tests {
             min_qty: Decimal::new(1, 3),
             min_notional: Decimal::from(5),
             fill_model: FillModel::CandleRangeTouch,
+            order_book: BTreeMap::new(),
         }
     }
 
@@ -352,5 +394,57 @@ mod tests {
             exit_fill(&mut position, &candle),
             Some((Decimal::from(99), ExitReason::StopLoss))
         );
+    }
+
+    #[test]
+    fn top_of_book_model_requires_maker_side_liquidity() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 24, 7, 0, 0).unwrap();
+        let mut candles = Vec::new();
+        for i in 0..66 {
+            let open_time = start + Duration::minutes(i);
+            candles.push(Candle {
+                open_time,
+                open: Decimal::new(9980, 2),
+                high: if i == 65 {
+                    Decimal::new(10005, 2)
+                } else {
+                    Decimal::from(100)
+                },
+                low: Decimal::new(9940, 2),
+                close: if i == 65 {
+                    Decimal::new(9998, 2)
+                } else {
+                    Decimal::new(9980, 2)
+                },
+                closed: true,
+            });
+        }
+        candles.push(Candle {
+            open_time: start + Duration::minutes(66),
+            open: Decimal::from(100),
+            high: Decimal::from(100),
+            low: Decimal::new(9998, 2),
+            close: Decimal::new(9998, 2),
+            closed: true,
+        });
+        let entry_time = start + Duration::minutes(66);
+        let mut config = config();
+        config.fill_model = FillModel::TopOfBook;
+        config.order_book.insert(
+            entry_time,
+            OrderBookSnapshot {
+                open_time: entry_time,
+                bid_price: Decimal::new(9999, 2),
+                bid_quantity: Decimal::from(100),
+                ask_price: Decimal::from(100),
+                ask_quantity: Decimal::from(100),
+            },
+        );
+        let report = run(&candles, &config);
+        assert_eq!(report.fill_model, FillModel::TopOfBook);
+        assert_eq!(report.trades.len(), 0);
+        let mut blocked = config.clone();
+        blocked.order_book.get_mut(&entry_time).unwrap().ask_price = Decimal::new(10001, 2);
+        assert!(run(&candles, &blocked).trades.is_empty());
     }
 }

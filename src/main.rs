@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use crate::ai::{AnalysisRequest, AnalysisResponse};
 use crate::analysis::TrendAnalysis;
-use crate::backtest::{BacktestConfig, BacktestReport, FillModel};
+use crate::backtest::{BacktestConfig, BacktestReport, FillModel, OrderBookSnapshot};
 use crate::feed::{BinanceFeed, parse_ws_candle};
 use crate::live::{LiveOrderRules, LiveReadiness, LiveRuntime, LiveStatus};
 use crate::model::Candle;
@@ -43,6 +43,8 @@ struct AppState {
 #[derive(serde::Deserialize)]
 struct BacktestRequest {
     candles: Vec<Candle>,
+    #[serde(default)]
+    order_book: Vec<OrderBookSnapshot>,
 }
 
 #[derive(serde::Deserialize)]
@@ -408,6 +410,11 @@ async fn run_backtest(
     }
     let engine = state.engine.lock().await;
     let config = &engine.stored.config;
+    let order_book: std::collections::BTreeMap<chrono::DateTime<Utc>, OrderBookSnapshot> = request
+        .order_book
+        .into_iter()
+        .map(|snapshot| (snapshot.open_time, snapshot))
+        .collect();
     let backtest_config = BacktestConfig {
         initial_equity: engine.available_collateral_for_backtest(),
         margin_pct: config.margin_pct,
@@ -419,7 +426,12 @@ async fn run_backtest(
         step_size: config.step_size,
         min_qty: config.min_qty,
         min_notional: config.min_notional,
-        fill_model: FillModel::CandleRangeTouch,
+        fill_model: if order_book.is_empty() {
+            FillModel::CandleRangeTouch
+        } else {
+            FillModel::TopOfBook
+        },
+        order_book,
     };
     Ok(Json(backtest::run(&request.candles, &backtest_config)))
 }

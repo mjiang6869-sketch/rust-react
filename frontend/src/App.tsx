@@ -93,6 +93,7 @@ interface BacktestTrade {
 }
 
 interface BacktestReport {
+  fill_model: "CANDLE_RANGE_TOUCH" | "TOP_OF_BOOK";
   initial_equity: string;
   final_equity: string;
   trades: BacktestTrade[];
@@ -520,6 +521,7 @@ export default function App() {
                 <article className="metric"><span>最终权益</span><strong>{number(backtest.final_equity)}</strong></article>
                 <article className="metric"><span>完成交易</span><strong>{backtest.trades.length}</strong></article>
                 <article className="metric"><span>数据缺口</span><strong>{backtest.data_gaps.length}</strong></article>
+                <article className="metric"><span>撮合模型</span><strong>{backtest.fill_model === "TOP_OF_BOOK" ? "盘口" : "K 线"}</strong></article>
               </div>
               {backtest.trades.length ? (
                 <div className="table-scroll"><table>
