@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod analysis;
 pub mod backtest;
+pub mod binance;
 pub mod execution;
 mod feed;
 mod model;
