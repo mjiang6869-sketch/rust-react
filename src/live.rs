@@ -354,6 +354,37 @@ impl LiveRuntime {
         Ok(())
     }
 
+    pub async fn cancel_open_entries(&mut self, now: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        let ids: Vec<String> = self
+            .submitted
+            .iter()
+            .filter(|(client_id, order)| {
+                order.purpose == crate::execution::OrderPurpose::Entry
+                    && self
+                        .reconciler
+                        .get(client_id.as_str())
+                        .is_some_and(|tracked| {
+                            !matches!(
+                                tracked.state,
+                                crate::order_state::RemoteOrderState::Filled
+                                    | crate::order_state::RemoteOrderState::Canceled
+                                    | crate::order_state::RemoteOrderState::Rejected
+                                    | crate::order_state::RemoteOrderState::Expired
+                            )
+                        })
+            })
+            .map(|(client_id, _)| client_id.clone())
+            .collect();
+        for client_id in ids {
+            self.execution.cancel_order(&client_id).await?;
+            let action = self.reconcile_order(&client_id, now).await?;
+            if action == ReconcileAction::Alert {
+                bail!("LIVE 开仓单撤单后对账异常：{client_id}");
+            }
+        }
+        Ok(())
+    }
+
     pub async fn submit_protection_for(
         &mut self,
         client_order_id: &str,

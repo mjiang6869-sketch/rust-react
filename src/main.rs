@@ -352,6 +352,15 @@ async fn disarm_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus
         .as_mut()
         .ok_or((StatusCode::CONFLICT, "LIVE runtime 尚未创建".to_string()))?;
     runtime.disarm();
+    runtime
+        .cancel_open_entries(Utc::now())
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("DISARM 后撤销 LIVE 开仓单失败：{error:#}"),
+            )
+        })?;
     Ok(Json(runtime.status()))
 }
 
@@ -535,7 +544,15 @@ async fn kill(State(state): State<AppState>) -> ApiResult<Json<Snapshot>> {
             format!("停用状态保存失败: {error}"),
         ));
     }
-    Ok(Json(engine.snapshot(Utc::now())))
+    let snapshot = engine.snapshot(Utc::now());
+    drop(engine);
+    if let Some(runtime) = state.live.lock().await.as_mut() {
+        runtime.disarm();
+        if let Err(error) = runtime.cancel_open_entries(Utc::now()).await {
+            warn!("LIVE kill 后撤销开仓单失败，保持 DISARM: {error:#}");
+        }
+    }
+    Ok(Json(snapshot))
 }
 
 async fn submit_live_entry_if_ready(state: &AppState, now: chrono::DateTime<Utc>) -> Result<()> {
