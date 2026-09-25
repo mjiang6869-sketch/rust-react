@@ -1,0 +1,20 @@
+[package]
+name = "store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+domain.workspace = true
+
+rust_decimal.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+rust_decimal_macros = "1"
