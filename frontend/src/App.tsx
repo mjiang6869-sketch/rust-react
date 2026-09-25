@@ -90,6 +90,9 @@ interface TrendAnalysis {
     start: { time: string; price: string };
     end: { time: string; price: string };
   }[];
+  chan_strokes: { start: { time: string; price: string }; end: { time: string; price: string } }[];
+  chan_segments: { start: { time: string; price: string }; end: { time: string; price: string } }[];
+  chan_centers: { start_time: string; end_time: string; low: string; high: string }[];
   direction: "UP" | "DOWN" | "SIDEWAYS" | "UNKNOWN";
   method: string;
 }
@@ -158,10 +161,23 @@ function PriceChart({ analysis }: { analysis: TrendAnalysis | null }) {
   const directionLabel = { UP: "上行", DOWN: "下行", SIDEWAYS: "震荡", UNKNOWN: "未知" }[analysis.direction];
   return (
     <>
-      <div className="chart-meta"><span>趋势：{directionLabel}</span><span>方法：{analysis.method}</span><span>拐点：{analysis.pivots.length}</span></div>
+      <div className="chart-meta"><span>趋势：{directionLabel}</span><span>方法：{analysis.method}</span><span>拐点：{analysis.pivots.length}</span><span>笔：{analysis.chan_strokes.length}</span><span>线段：{analysis.chan_segments.length}</span><span>中枢：{analysis.chan_centers.length}</span></div>
       <div className="chart-wrap">
         <svg className="price-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="K 线收盘价与趋势标注">
           <polyline points={closePoints} fill="none" stroke="#8db6ff" strokeWidth="2" />
+          {analysis.chan_centers.map((center) => {
+            const start = indices.get(center.start_time);
+            const end = indices.get(center.end_time);
+            if (start === undefined || end === undefined) return null;
+            const left = x(Math.min(start, end));
+            const right = x(Math.max(start, end));
+            return <rect key={`${center.start_time}-${center.end_time}`} x={left} y={y(Number(center.high))} width={Math.max(right - left, 4)} height={Math.max(y(Number(center.low)) - y(Number(center.high)), 4)} fill="#6d8d9a" fillOpacity=".16" stroke="#8ab4c2" strokeDasharray="4 4" />;
+          })}
+          {analysis.chan_segments.map((segment, index) => {
+            const start = linePoint(segment.start);
+            const end = linePoint(segment.end);
+            return start && end ? <line key={`segment-${index}`} x1={start.split(",")[0]} y1={start.split(",")[1]} x2={end.split(",")[0]} y2={end.split(",")[1]} stroke="#d6a86e" strokeWidth="2.5" /> : null;
+          })}
           {analysis.trend_lines.map((line) => {
             const start = linePoint(line.start);
             const end = linePoint(line.end);
