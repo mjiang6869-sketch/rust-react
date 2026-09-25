@@ -11,6 +11,7 @@
 pub mod error;
 pub mod instrument;
 pub mod market;
+pub mod mode;
 pub mod money;
 pub mod order;
 pub mod position_set;
@@ -23,6 +24,7 @@ pub mod strategy;
 pub use error::{DomainError, ExchangeError, RejectReason};
 pub use instrument::{ContractKind, FeeSchedule, FeeSource, Instrument};
 pub use market::{AggTrade, BookSnapshot, Candle, MarketEvent};
+pub use mode::{LiveSafety, ModeParseError, ServiceMode};
 pub use money::{Price, Qty};
 pub use order::{
     ClientOrderId, Effect, HaltReason, Order, OrderPurpose, OrderState, Side, TimeInForce,
