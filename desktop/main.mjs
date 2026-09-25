@@ -7,6 +7,7 @@ const projectRoot = join(import.meta.dirname, "..");
 const engineCommand = process.env.RUST_CRYPTO_ENGINE ?? join(projectRoot, "target", "debug", "rust-crypto");
 const rendererUrl = process.env.RUST_CRYPTO_RENDERER_URL ?? "http://127.0.0.1:5174";
 let engine;
+let renderer;
 
 function startEngine() {
   if (!existsSync(engineCommand)) {
@@ -22,6 +23,32 @@ function startEngine() {
   engine.on("exit", (code, signal) => {
     if (!app.isPackaged) console.log(`Rust engine 已退出 code=${code} signal=${signal}`);
   });
+}
+
+function startRenderer() {
+  if (process.env.RUST_CRYPTO_RENDERER_URL) return;
+  const pnpm = process.env.RUST_CRYPTO_PNPM ?? "pnpm";
+  renderer = spawn(pnpm, ["--dir", join(projectRoot, "frontend"), "dev", "--host", "127.0.0.1", "--port", "5174"], {
+    cwd: projectRoot,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  renderer.stdout?.on("data", (chunk) => console.log(`[renderer] ${chunk}`));
+  renderer.stderr?.on("data", (chunk) => console.error(`[renderer] ${chunk}`));
+}
+
+async function waitForRenderer() {
+  if (process.env.RUST_CRYPTO_RENDERER_URL) return;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      const response = await fetch(rendererUrl);
+      if (response.ok) return;
+    } catch {
+      // Vite is still starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("Vite renderer 在 15 秒内没有启动");
 }
 
 function createWindow() {
@@ -44,8 +71,10 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   startEngine();
+  startRenderer();
+  await waitForRenderer();
   ipcMain.handle("engine-health", async () => {
     const response = await fetch("http://127.0.0.1:8080/api/health");
     return response.text();
@@ -58,6 +87,7 @@ app.whenReady().then(() => {
 
 app.on("before-quit", () => {
   engine?.kill("SIGTERM");
+  renderer?.kill("SIGTERM");
 });
 
 app.on("window-all-closed", () => {

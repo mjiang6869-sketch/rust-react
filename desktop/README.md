@@ -1,9 +1,10 @@
 # Electron 桌面端
 
-Electron main 进程启动 Rust engine sidecar，renderer 默认加载本地 Vite 页面。开发环境先在仓库根目录启动 Rust 服务，再在 `frontend` 启动 Vite，最后在本目录安装 Electron 依赖并运行：
+Electron main 进程启动 Rust engine sidecar 和 frontend Vite renderer。开发环境只需要先编译 Rust，再在本目录安装 Electron 依赖并运行：
 
 ```sh
 pnpm install
+cargo build
 pnpm dev
 ```
 
