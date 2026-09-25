@@ -1,0 +1,33 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+domain.workspace = true
+data.workspace = true
+sim.workspace = true
+store.workspace = true
+strategies.workspace = true
+engine.workspace = true
+exchange.workspace = true
+
+rust_decimal.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+futures-util.workspace = true
+tracing.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+tempfile = "3"
+tower = "0.5"

@@ -601,22 +601,30 @@ pub fn preview_manual(
         }
     }
 
-    // triggerProtect：币安要求条件单触发价距标记价至少 5%，否则拒绝
-    let tp_distance = (tp_first - mark_price) / mark_price;
-    if tp_distance.abs() < Decimal::new(5, 2) {
-        warnings.push(
-            "止盈触发价距当前标记价不足 5%，币安的条件单触发保护（triggerProtect）\
-             可能拒绝该订单"
-                .into(),
-        );
-    }
-    let stop_distance = (stop.get() - mark_price) / mark_price;
-    if stop_distance.abs() < Decimal::new(5, 2) {
-        warnings.push(
-            "止损触发价距当前标记价不足 5%，币安的条件单触发保护可能拒绝该订单。\
-             做市场景下可考虑改用限价单挂出而非条件单。"
-                .into(),
-        );
+    // triggerProtect 提示。
+    //
+    // 币安的条件单（STOP / TAKE_PROFIT 系列）要求触发价距标记价至少 5%，
+    // 否则直接拒单。但**本系统的出场单全部是 GTX 限价单，不是条件单**，
+    // 所以这条约束通常不适用。
+    //
+    // 唯一需要提示的情形是：当价格已经走到止盈或止损价位附近时，用户若
+    // 想改用条件单（例如为了确保触发后必定成交），会撞上这条限制。所以
+    // 这里只在**有明显偏离**时给一条说明性提示，而不是每次都报警。
+    //
+    // 早先的实现无条件报告"距标记价不足 5%"——在限价单场景下这是误报，
+    // 而且没有实时行情时标记价是默认值，判断本身也不可靠。
+    if mark_price > Decimal::ZERO {
+        const TRIGGER_PROTECT: Decimal = Decimal::from_parts(5, 0, 0, false, 2); // 0.05
+        let tp_distance = ((tp_first - mark_price) / mark_price).abs();
+        let stop_distance = ((stop.get() - mark_price) / mark_price).abs();
+        if tp_distance < TRIGGER_PROTECT || stop_distance < TRIGGER_PROTECT {
+            warnings.push(
+                "止盈或止损价距当前市价较近。本系统的出场单用 GTX 限价单挂出，\
+                 不受币安条件单触发保护（triggerProtect，距标记价需 ≥5%）的约束；\
+                 但若你打算改用条件单，这两个价位会被拒单。"
+                    .into(),
+            );
+        }
     }
 
     Ok(ManualPreview {

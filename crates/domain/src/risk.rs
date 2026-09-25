@@ -28,9 +28,16 @@ pub struct RiskLimits {
     pub max_stop_pct: Decimal,
     /// 止盈与止损的最小比值。低于此值不开仓。
     ///
-    /// maker-only 下止损是挂单、可能不成交，而止盈也是挂单、也可能不成交。
-    /// 所以这个比值不能只看盈亏，还要看**成交概率的不对称**：止损不成交时
-    /// 仓位裸露并持续浮亏，所以我要求盈亏比有额外补偿。
+    /// # 默认值为什么是 1 而不是 2
+    ///
+    /// 做市策略天然是 1:1 ~ 2:1 的盈亏比：止盈只有几个 bp（赚一点就跑），
+    /// 止损「突破就认错」也只能是几个 bp（再宽就不叫突破了）。而方向性
+    /// 交易的直觉是"至少赚两倍"，那个默认值会让绝大多数做市计划被拒——
+    /// 而且是静默拒绝，用户只会看到"盈亏比不达标"而不明白为什么。
+    ///
+    /// maker-only 下**更不该**要求高盈亏比：止损是挂单、可能不成交，
+    /// 所以真正的风险不在单笔亏损幅度，而在裸露时长。要求高盈亏比会逼着
+    /// 用户把止盈拉远，反而增加持仓时间与逆向选择暴露。
     pub min_reward_risk: Decimal,
     /// 行情新鲜度阈值（秒）。超过则暂停开仓。
     pub max_feed_staleness_secs: i64,
@@ -39,8 +46,11 @@ pub struct RiskLimits {
 impl Default for RiskLimits {
     fn default() -> Self {
         Self {
-            max_stop_pct: Decimal::new(5, 3),  // 0.5%
-            min_reward_risk: Decimal::from(2), // 至少 2:1
+            max_stop_pct: Decimal::new(5, 3), // 0.5%
+            // 1:1 而非 2:1。做市的止盈止损都是 bp 级（止盈"赚一点就跑"、
+            // 止损"突破就认错"），要求 2:1 会让绝大多数挂单被静默拒绝。
+            // 需要更严格时应在策略参数或手动面板里显式配置。
+            min_reward_risk: Decimal::ONE,
             max_feed_staleness_secs: 15,
         }
     }
@@ -290,6 +300,45 @@ mod tests {
             volume: dec!(1),
             closed: true,
         }
+    }
+
+    /// 默认盈亏比必须是 1:1 而非 2:1。
+    ///
+    /// 做市的止盈止损都是 bp 级，2:1 会让挂单普遍被静默拒绝。这条测试锁住
+    /// 这个默认值，避免以后有人按"方向性交易的直觉"把它改回去。
+    #[test]
+    fn default_reward_risk_suits_market_making_not_directional_trading() {
+        let l = RiskLimits::default();
+        assert_eq!(
+            l.min_reward_risk,
+            Decimal::ONE,
+            "做市策略的盈亏比天然接近 1:1，默认要求高于此会让挂单普遍被拒"
+        );
+
+        // 典型做市参数：止损 2bp、止盈 4bp —— 盈亏比 2，应当通过
+        let i = instr();
+        let v = check_entry(
+            &i,
+            Side::Buy,
+            dec!(3200),
+            dec!(3199.36), // 2bp
+            dec!(3201.28), // 4bp
+            dec!(3),
+            &l,
+        );
+        assert!(v.is_pass(), "典型做市参数应通过：{v:?}");
+
+        // 1:1 的做市参数（止损止盈都是 4bp）也应当通过
+        let v2 = check_entry(
+            &i,
+            Side::Buy,
+            dec!(3200),
+            dec!(3198.72), // 4bp
+            dec!(3201.28), // 4bp
+            dec!(3),
+            &l,
+        );
+        assert!(v2.is_pass(), "1:1 的做市参数应通过：{v2:?}");
     }
 
     #[test]
