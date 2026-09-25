@@ -198,7 +198,7 @@ async fn list_fill_models() -> impl IntoResponse {
 
 async fn preview_manual(
     State(s): State<Arc<AppState>>,
-    Json(dto): Json<ManualPlanDto>,
+    crate::dto::Json2(dto): crate::dto::Json2<ManualPlanDto>,
 ) -> Result<impl IntoResponse, ApiError> {
     let now = chrono::Utc::now();
     let plan: ManualPlan = parse_manual_plan(&dto, now)?;
@@ -212,7 +212,7 @@ async fn preview_manual(
 async fn submit_manual(
     State(s): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Json(dto): Json<ManualPlanDto>,
+    crate::dto::Json2(dto): crate::dto::Json2<ManualPlanDto>,
 ) -> Result<impl IntoResponse, ApiError> {
     // 幂等保护：手动面板一定会被双击。没有它就会下出两张单。
     let key = headers
@@ -372,7 +372,7 @@ async fn pnl_summary(State(s): State<Arc<AppState>>) -> Result<impl IntoResponse
 
 async fn run_backtest(
     State(s): State<Arc<AppState>>,
-    Json(req): Json<BacktestRequestDto>,
+    crate::dto::Json2(req): crate::dto::Json2<BacktestRequestDto>,
 ) -> Result<impl IntoResponse, ApiError> {
     let from = parse_date(&req.from)?;
     let to = parse_date(&req.to)?;
@@ -521,7 +521,7 @@ async fn data_coverage(State(s): State<Arc<AppState>>) -> Result<impl IntoRespon
 
 async fn start_download(
     State(s): State<Arc<AppState>>,
-    Json(req): Json<DownloadRequestDto>,
+    crate::dto::Json2(req): crate::dto::Json2<DownloadRequestDto>,
 ) -> Result<impl IntoResponse, ApiError> {
     let from = parse_month(&req.from)?;
     let to = parse_month(&req.to)?;
@@ -582,7 +582,7 @@ struct ModeRequest {
 
 async fn set_mode(
     State(s): State<Arc<AppState>>,
-    Json(req): Json<ModeRequest>,
+    crate::dto::Json2(req): crate::dto::Json2<ModeRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mode = ServiceMode::parse(&req.mode).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 

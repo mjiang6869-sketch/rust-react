@@ -104,12 +104,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     .await;
                             }
                             Ok(ClientMessage::Subscribe { .. }) => {
-                                // 订阅语义目前是"全推"——做市的数据量很小，
+                                // 订阅语义目前是「全推」——做市的数据量很小，
                                 // 按频道过滤只会增加复杂度而不减少带宽。
-                                if let Err(e) = send_snapshot(&mut sender, &state).await {
-                                    tracing::warn!("发送订阅快照失败：{e}");
-                                    break;
-                                }
+                                //
+                                // 这里**不重发快照**：连接时已经发过一次，重连
+                                // 时会建立新连接同样会发。重复发只会让界面白白
+                                // 重渲染一次。
+                                //
+                                // 将来若加入按需频道，这里应改为只发新增频道的
+                                // 快照，而不是全部重发。
                             }
                             Err(e) => {
                                 let msg = ServerMessage::Error {

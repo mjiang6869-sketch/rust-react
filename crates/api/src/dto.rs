@@ -16,6 +16,7 @@
 //! 风控拒绝、参数错误、数据缺失都必须返回**面向用户的中文说明**，而不只是
 //! 错误码。静默失败是恶劣的失败模式——用户会以为策略不工作而不知道为什么。
 
+use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use domain::{ManualPlan, ManualPreview, PositionView, ServiceMode, Side, StandDownReason};
 use rust_decimal::Decimal;
@@ -76,6 +77,67 @@ impl axum::response::IntoResponse for ApiError {
             message: self.to_string(),
         };
         (self.status(), axum::Json(body)).into_response()
+    }
+}
+
+/// 把 axum 的提取器拒绝转成统一格式的 JSON。
+///
+/// # 为什么需要这个
+///
+/// axum 的 `Json` 提取器在请求体无法反序列化时，默认返回**纯文本**：
+///
+/// ```text
+/// Failed to deserialize the JSON body into the target type: missing field `side`
+/// ```
+///
+/// 前端按 `{status, code, message}` 解析会直接失败（`JSON.parse` 抛错），
+/// 用户看到的是「后端返回了非 JSON 响应」而不是「缺少字段 side」。
+///
+/// 这个提取器统一了格式，并把技术性的错误描述保留在 message 里——虽然它是
+/// 英文的，但比「解析失败」有用得多。
+pub struct Json2<T>(pub T);
+
+impl<S, T> axum::extract::FromRequest<S> for Json2<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(v)) => Ok(Json2(v)),
+            Err(rejection) => {
+                let status = rejection.status();
+                let (code, detail) = match rejection {
+                    axum::extract::rejection::JsonRejection::JsonDataError(e) => {
+                        ("bad_request", format!("请求体字段不匹配：{e}"))
+                    }
+                    axum::extract::rejection::JsonRejection::JsonSyntaxError(e) => {
+                        ("bad_request", format!("请求体不是合法 JSON：{e}"))
+                    }
+                    axum::extract::rejection::JsonRejection::MissingJsonContentType(_) => (
+                        "bad_request",
+                        "请求头必须包含 Content-Type: application/json".to_string(),
+                    ),
+                    axum::extract::rejection::JsonRejection::BytesRejection(e) => {
+                        ("bad_request", format!("读取请求体失败：{e}"))
+                    }
+                    other => ("bad_request", other.body_text()),
+                };
+
+                let body = ApiResponse::<()>::Error {
+                    code: code.to_string(),
+                    message: detail,
+                };
+                let mut res = (status, axum::Json(body)).into_response();
+                res.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                Err(res)
+            }
+        }
     }
 }
 
