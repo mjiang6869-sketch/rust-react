@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use serde::Serialize;
 use serde_json::Value;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
@@ -23,6 +24,51 @@ pub struct LiveSafety {
     user_stream_connected: bool,
     account_reconciled: bool,
     armed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveReadiness {
+    pub mode: ExecutionMode,
+    pub endpoint: String,
+    pub endpoint_allowed: bool,
+    pub api_key_configured: bool,
+    pub api_secret_configured: bool,
+    pub can_create_runtime: bool,
+    pub message: String,
+}
+
+pub fn readiness(mode: ExecutionMode) -> LiveReadiness {
+    let endpoint = std::env::var("RUST_CRYPTO_BINANCE_BASE_URL")
+        .unwrap_or_else(|_| "https://testnet.binancefuture.com".to_string());
+    let endpoint_allowed = network_for_endpoint(&endpoint).is_ok();
+    let api_key_configured = std::env::var("RUST_CRYPTO_BINANCE_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let api_secret_configured = std::env::var("RUST_CRYPTO_BINANCE_API_SECRET")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let can_create_runtime = mode == ExecutionMode::Live
+        && endpoint_allowed
+        && api_key_configured
+        && api_secret_configured;
+    let message = if mode == ExecutionMode::Paper {
+        "当前为 PAPER 模式，真实执行器未启动".to_string()
+    } else if !endpoint_allowed {
+        "Binance endpoint 不在允许列表中".to_string()
+    } else if !api_key_configured || !api_secret_configured {
+        "LIVE 模式缺少 Binance 凭据".to_string()
+    } else {
+        "可以创建 LIVE runtime，但仍需用户流连接、账户对账和显式 arm".to_string()
+    };
+    LiveReadiness {
+        mode,
+        endpoint,
+        endpoint_allowed,
+        api_key_configured,
+        api_secret_configured,
+        can_create_runtime,
+        message,
+    }
 }
 
 impl LiveSafety {
@@ -232,5 +278,12 @@ mod tests {
         assert!(safety.is_armed());
         safety.disarm();
         assert!(!safety.is_armed());
+    }
+
+    #[test]
+    fn paper_readiness_never_reports_live_creation() {
+        let result = readiness(ExecutionMode::Paper);
+        assert!(!result.can_create_runtime);
+        assert_eq!(result.mode, ExecutionMode::Paper);
     }
 }

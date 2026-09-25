@@ -29,6 +29,7 @@ use crate::ai::{AnalysisRequest, AnalysisResponse};
 use crate::analysis::TrendAnalysis;
 use crate::backtest::{BacktestConfig, BacktestReport, FillModel};
 use crate::feed::{BinanceFeed, parse_ws_candle};
+use crate::live::LiveReadiness;
 use crate::model::Candle;
 use crate::paper::{Config, PaperEngine, Snapshot, Stored};
 
@@ -103,6 +104,7 @@ async fn main() -> Result<()> {
         .route("/api/state", get(get_state))
         .route("/api/history", get(get_history))
         .route("/api/analysis", get(get_analysis))
+        .route("/api/live/readiness", get(get_live_readiness))
         .route("/api/ai/analyze", post(ai_analyze))
         .route("/api/backtest", post(run_backtest))
         .route("/api/config", put(update_config))
@@ -135,6 +137,11 @@ async fn get_analysis(State(state): State<AppState>) -> Json<TrendAnalysis> {
     let engine = state.engine.lock().await;
     let candles: Vec<Candle> = engine.history.values().cloned().collect();
     Json(analysis::analyze(&candles))
+}
+
+async fn get_live_readiness(State(state): State<AppState>) -> Json<LiveReadiness> {
+    let engine = state.engine.lock().await;
+    Json(live::readiness(engine.stored.mode))
 }
 
 async fn ai_analyze(

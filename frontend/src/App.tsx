@@ -61,6 +61,16 @@ interface Snapshot {
   status: string;
 }
 
+interface LiveReadiness {
+  mode: "PAPER" | "LIVE";
+  endpoint: string;
+  endpoint_allowed: boolean;
+  api_key_configured: boolean;
+  api_secret_configured: boolean;
+  can_create_runtime: boolean;
+  message: string;
+}
+
 interface BacktestTrade {
   side: Side;
   entry_time: string;
@@ -207,6 +217,7 @@ export default function App() {
   const [backtest, setBacktest] = useState<BacktestReport | null>(null);
   const [backtestBusy, setBacktestBusy] = useState(false);
   const [analysis, setAnalysis] = useState<TrendAnalysis | null>(null);
+  const [readiness, setReadiness] = useState<LiveReadiness | null>(null);
   const [question, setQuestion] = useState("");
   const [conversation, setConversation] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
@@ -215,13 +226,15 @@ export default function App() {
     let active = true;
     const load = async () => {
       try {
-        const [result, trend] = await Promise.all([
+        const [result, trend, liveReadiness] = await Promise.all([
           request<Snapshot>("/api/state"),
           request<TrendAnalysis>("/api/analysis"),
+          request<LiveReadiness>("/api/live/readiness"),
         ]);
         if (!active) return;
         setSnapshot(result);
         setAnalysis(trend);
+        setReadiness(liveReadiness);
         setDraft((current) => current ?? result.config);
         setError(null);
       } catch (cause) {
@@ -337,6 +350,8 @@ export default function App() {
 
         {error && <div className="error" role="alert">{error}</div>}
         <div className="status-line" role="status">{snapshot?.status ?? "正在连接服务…"}</div>
+
+        {readiness && <div className="readiness-line" role="status">LIVE 状态：{readiness.message}</div>}
 
         <section className="metrics" aria-label="运行概况">
           <article className="metric"><span>最新价格</span><strong>{snapshot?.candle ? number(snapshot.candle.close) : "—"}</strong><small>{snapshot?.candle ? time(snapshot.candle.open_time) : "等待行情"}</small></article>
