@@ -125,6 +125,29 @@ pub struct OrderTradeUpdate {
     pub reduce_only: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountBalanceUpdate {
+    pub asset: String,
+    pub wallet_balance: Decimal,
+    pub cross_wallet_balance: Decimal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountPositionUpdate {
+    pub symbol: String,
+    pub position_amount: Decimal,
+    pub entry_price: Decimal,
+    pub position_side: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountUpdate {
+    pub event_time: DateTime<Utc>,
+    pub reason: String,
+    pub balances: Vec<AccountBalanceUpdate>,
+    pub positions: Vec<AccountPositionUpdate>,
+}
+
 pub fn parse_order_trade_update(text: &str) -> Result<Option<OrderTradeUpdate>> {
     let value: Value = serde_json::from_str(text).context("用户数据事件不是有效 JSON")?;
     if value["e"] != "ORDER_TRADE_UPDATE" {
@@ -146,6 +169,49 @@ pub fn parse_order_trade_update(text: &str) -> Result<Option<OrderTradeUpdate>> 
         cumulative_filled_quantity: decimal_string(order, "z")?,
         average_price: decimal_string(order, "ap")?,
         reduce_only: order["R"].as_bool().context("订单 reduceOnly 标志无效")?,
+    }))
+}
+
+pub fn parse_account_update(text: &str) -> Result<Option<AccountUpdate>> {
+    let value: Value = serde_json::from_str(text).context("用户数据事件不是有效 JSON")?;
+    if value["e"] != "ACCOUNT_UPDATE" {
+        return Ok(None);
+    }
+    let event_ms = value["E"].as_i64().context("账户事件时间无效")?;
+    let event_time =
+        chrono::DateTime::from_timestamp_millis(event_ms).context("账户事件时间越界")?;
+    let account = &value["a"];
+    let reason = required_string(account, "m")?;
+    let balances = account["B"]
+        .as_array()
+        .context("账户事件缺少余额列表")?
+        .iter()
+        .map(|balance| {
+            Ok(AccountBalanceUpdate {
+                asset: required_string(balance, "a")?,
+                wallet_balance: decimal_string(balance, "wb")?,
+                cross_wallet_balance: decimal_string(balance, "cw")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let positions = account["P"]
+        .as_array()
+        .context("账户事件缺少持仓列表")?
+        .iter()
+        .map(|position| {
+            Ok(AccountPositionUpdate {
+                symbol: required_string(position, "s")?,
+                position_amount: decimal_string(position, "pa")?,
+                entry_price: decimal_string(position, "ep")?,
+                position_side: required_string(position, "ps")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(AccountUpdate {
+        event_time,
+        reason,
+        balances,
+        positions,
     }))
 }
 
@@ -237,5 +303,35 @@ mod tests {
                 .is_none()
         );
         assert!(EventDeduper::new(0).is_err());
+    }
+
+    #[test]
+    fn parses_account_update_balances_and_positions() {
+        let event = parse_account_update(
+            r#"{
+              "e":"ACCOUNT_UPDATE","E":1727000000123,
+              "a":{"m":"ORDER","B":[{"a":"USDC","wb":"12.50","cw":"10.25"}],
+              "P":[{"s":"ETHUSDC","pa":"0.010","ep":"100.00","ps":"BOTH"}]}
+            }"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(event.reason, "ORDER");
+        assert_eq!(event.balances[0].asset, "USDC");
+        assert_eq!(
+            event.balances[0].cross_wallet_balance,
+            Decimal::new(1025, 2)
+        );
+        assert_eq!(event.positions[0].position_amount, Decimal::new(10, 3));
+    }
+
+    #[test]
+    fn rejects_malformed_account_update_and_ignores_other_events() {
+        assert!(parse_account_update(r#"{"e":"ACCOUNT_UPDATE"}"#).is_err());
+        assert!(
+            parse_account_update(r#"{"e":"ORDER_TRADE_UPDATE"}"#)
+                .unwrap()
+                .is_none()
+        );
     }
 }

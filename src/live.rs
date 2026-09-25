@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -10,7 +11,22 @@ use crate::binance::BinanceExecution;
 use crate::execution::MakerOrder;
 use crate::order_state::{OrderReconciler, ReconcileAction};
 use crate::paper::ExecutionMode;
-use crate::user_stream::{BinanceNetwork, EventDeduper, UserDataStream, parse_order_trade_update};
+use crate::user_stream::{
+    AccountUpdate, BinanceNetwork, EventDeduper, UserDataStream, parse_account_update,
+    parse_order_trade_update,
+};
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RemotePosition {
+    pub symbol: String,
+    pub side: crate::model::Side,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub entry_price: Decimal,
+    pub margin_asset: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
 
 pub struct LiveRuntime {
     execution: BinanceExecution,
@@ -24,6 +40,10 @@ pub struct LiveRuntime {
     submitted: HashMap<String, MakerOrder>,
     protection_pairs: HashMap<String, String>,
     last_event_client_order_id: Option<String>,
+    symbol: String,
+    margin_asset: String,
+    remote_position: Option<RemotePosition>,
+    position_alert: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +82,8 @@ pub struct LiveStatus {
     pub unresolved_order_ids: Vec<String>,
     #[serde(with = "rust_decimal::serde::str")]
     pub available_collateral: Decimal,
+    pub remote_position: Option<RemotePosition>,
+    pub position_alert: bool,
     pub message: String,
 }
 
@@ -157,7 +179,7 @@ impl LiveRuntime {
             execution: BinanceExecution::from_env(symbol.clone(), mode)?,
             user_stream: UserDataStream::new(api_key, network)?,
             socket: None,
-            reconciler: OrderReconciler::new(symbol),
+            reconciler: OrderReconciler::new(symbol.clone()),
             deduper: EventDeduper::new(4_096)?,
             safety: LiveSafety::default(),
             available_collateral: rust_decimal::Decimal::ZERO,
@@ -165,6 +187,10 @@ impl LiveRuntime {
             submitted: HashMap::new(),
             protection_pairs: HashMap::new(),
             last_event_client_order_id: None,
+            symbol,
+            margin_asset: String::new(),
+            remote_position: None,
+            position_alert: false,
         })
     }
 
@@ -188,6 +214,9 @@ impl LiveRuntime {
     pub async fn reconcile_account(&mut self, symbol: &str, margin_asset: &str) -> Result<()> {
         let account = self.execution.account().await?;
         self.available_collateral = available_asset_balance(&account, margin_asset)?;
+        self.symbol = symbol.to_string();
+        self.margin_asset = margin_asset.to_string();
+        self.remote_position = account_position(&account, symbol, margin_asset)?;
         ensure_flat_position(&account, symbol)?;
         self.safety.mark_account_reconciled();
         Ok(())
@@ -279,6 +308,9 @@ impl LiveRuntime {
         let Message::Text(text) = message else {
             return Ok(None);
         };
+        if let Some(event) = parse_account_update(&text)? {
+            return self.apply_account_update(event);
+        }
         let Some(event) = parse_order_trade_update(&text)? else {
             return Ok(None);
         };
@@ -495,6 +527,8 @@ impl LiveRuntime {
             "用户数据流未连接，LIVE 已停用".to_string()
         } else if !self.safety.account_reconciled() {
             "用户数据流已连接，等待账户对账".to_string()
+        } else if self.position_alert {
+            "远端持仓与本地订单状态不一致，LIVE 已 DISARM".to_string()
         } else if !self.safety.is_armed() {
             "账户已对账，等待显式 arm".to_string()
         } else if !unresolved_order_ids.is_empty() {
@@ -509,8 +543,46 @@ impl LiveRuntime {
             armed: self.safety.is_armed(),
             unresolved_order_ids,
             available_collateral: self.available_collateral,
+            remote_position: self.remote_position.clone(),
+            position_alert: self.position_alert,
             message,
         }
+    }
+
+    fn apply_account_update(&mut self, event: AccountUpdate) -> Result<Option<ReconcileAction>> {
+        if let Some(position) = event.positions.iter().find(|position| {
+            position.symbol == self.symbol && position.position_amount != Decimal::ZERO
+        }) {
+            let side = if position.position_amount > Decimal::ZERO {
+                crate::model::Side::Buy
+            } else {
+                crate::model::Side::Sell
+            };
+            self.remote_position = Some(RemotePosition {
+                symbol: position.symbol.clone(),
+                side,
+                quantity: position.position_amount.abs(),
+                entry_price: position.entry_price,
+                margin_asset: self.margin_asset.clone(),
+                updated_at: event.event_time,
+            });
+            if !self.has_filled_order() {
+                self.position_alert = true;
+                self.safety.disarm();
+                return Ok(Some(ReconcileAction::Alert));
+            }
+        } else {
+            self.remote_position = None;
+        }
+        Ok(None)
+    }
+
+    fn has_filled_order(&self) -> bool {
+        self.submitted.keys().any(|client_order_id| {
+            self.reconciler
+                .get(client_order_id)
+                .is_some_and(|order| order.filled_quantity > Decimal::ZERO)
+        })
     }
 }
 
@@ -553,6 +625,49 @@ fn ensure_flat_position(account: &Value, symbol: &str) -> Result<()> {
         bail!("Binance {symbol} 存在未恢复持仓 {amount}，拒绝 ARM");
     }
     Ok(())
+}
+
+fn account_position(
+    account: &Value,
+    symbol: &str,
+    margin_asset: &str,
+) -> Result<Option<RemotePosition>> {
+    let positions = account["positions"]
+        .as_array()
+        .context("Binance 账户响应缺少 positions")?;
+    let Some(position) = positions
+        .iter()
+        .find(|item| item["symbol"].as_str() == Some(symbol))
+    else {
+        return Ok(None);
+    };
+    let amount = Decimal::from_str_exact(
+        position["positionAmt"]
+            .as_str()
+            .with_context(|| format!("Binance {symbol} positionAmt 无效"))?,
+    )
+    .with_context(|| format!("Binance {symbol} positionAmt 不是 Decimal"))?;
+    if amount == Decimal::ZERO {
+        return Ok(None);
+    }
+    let entry_price = Decimal::from_str_exact(
+        position["entryPrice"]
+            .as_str()
+            .with_context(|| format!("Binance {symbol} entryPrice 无效"))?,
+    )
+    .with_context(|| format!("Binance {symbol} entryPrice 不是 Decimal"))?;
+    Ok(Some(RemotePosition {
+        symbol: symbol.to_string(),
+        side: if amount > Decimal::ZERO {
+            crate::model::Side::Buy
+        } else {
+            crate::model::Side::Sell
+        },
+        quantity: amount.abs(),
+        entry_price,
+        margin_asset: margin_asset.to_string(),
+        updated_at: Utc::now(),
+    }))
 }
 
 fn network_from_env() -> Result<BinanceNetwork> {

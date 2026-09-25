@@ -78,6 +78,15 @@ interface LiveStatus {
   armed: boolean;
   unresolved_order_ids: string[];
   available_collateral: string;
+  remote_position: {
+    symbol: string;
+    side: Side;
+    quantity: string;
+    entry_price: string;
+    margin_asset: string;
+    updated_at: string;
+  } | null;
+  position_alert: boolean;
   message: string;
 }
 
@@ -410,6 +419,15 @@ export default function App() {
             <button className="secondary" disabled={busy || !liveStatus?.runtime_created} onClick={() => { void liveAction("/api/live/close"); }}>关闭 LIVE</button>
           </div>
           <p className="note">LIVE 只有在用户数据流连接、账户对账并显式 ARM 后才允许提交 Maker 限价单；任何未知订单状态都必须先查询。</p>
+          {liveStatus?.remote_position ? (
+            <div className="position live-position">
+              <div><span>交易所远端方向</span><strong>{liveStatus.remote_position.side === "BUY" ? "做多" : "做空"}</strong></div>
+              <div><span>交易所远端数量</span><strong>{number(liveStatus.remote_position.quantity)}</strong></div>
+              <div><span>交易所远端均价</span><strong>{number(liveStatus.remote_position.entry_price)}</strong></div>
+              <div><span>结算资产</span><strong>{liveStatus.remote_position.margin_asset}</strong></div>
+            </div>
+          ) : <p className="empty">交易所远端持仓：空仓</p>}
+          {liveStatus?.position_alert && <div className="error" role="alert">检测到远端持仓与本地订单状态不一致，已自动 DISARM。</div>}
         </section>
 
         <section className="metrics" aria-label="运行概况">
