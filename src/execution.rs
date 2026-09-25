@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::model::{Side, quantize_down};
@@ -25,6 +26,7 @@ pub struct MakerOrder {
     pub quantity: Decimal,
     pub price: Decimal,
     pub stop_price: Option<Decimal>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl MakerOrder {
@@ -104,6 +106,7 @@ mod tests {
             quantity: Decimal::new(5, 2),
             price: Decimal::from(100),
             stop_price: None,
+            expires_at: None,
         }
     }
 

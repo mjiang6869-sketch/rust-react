@@ -287,6 +287,41 @@ impl LiveRuntime {
         self.last_event_client_order_id.as_deref()
     }
 
+    pub async fn cancel_expired_entries(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let ids: Vec<String> = self
+            .submitted
+            .iter()
+            .filter(|(client_id, order)| {
+                order.purpose == crate::execution::OrderPurpose::Entry
+                    && order.expires_at.is_some_and(|expires_at| expires_at <= now)
+                    && self
+                        .reconciler
+                        .get(client_id.as_str())
+                        .is_some_and(|tracked| {
+                            !matches!(
+                                tracked.state,
+                                crate::order_state::RemoteOrderState::Filled
+                                    | crate::order_state::RemoteOrderState::Canceled
+                                    | crate::order_state::RemoteOrderState::Rejected
+                                    | crate::order_state::RemoteOrderState::Expired
+                            )
+                        })
+            })
+            .map(|(client_id, _)| client_id.clone())
+            .collect();
+        for client_id in ids {
+            self.execution.cancel_order(&client_id).await?;
+            let action = self.reconcile_order(&client_id, now).await?;
+            if action == ReconcileAction::Alert {
+                bail!("过期 LIVE 开仓单撤单后对账异常");
+            }
+        }
+        Ok(())
+    }
+
     pub async fn submit_protection_for(
         &mut self,
         client_order_id: &str,
@@ -338,6 +373,7 @@ impl LiveRuntime {
                 quantity: tracked.filled_quantity,
                 price: stop_price,
                 stop_price: None,
+                expires_at: None,
             },
             MakerOrder {
                 client_order_id: target_id.clone(),
@@ -346,6 +382,7 @@ impl LiveRuntime {
                 quantity: tracked.filled_quantity,
                 price: target,
                 stop_price: None,
+                expires_at: None,
             },
         ];
         for order in orders {

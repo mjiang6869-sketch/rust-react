@@ -240,6 +240,10 @@ async fn run_live_supervisor(live: Arc<Mutex<Option<LiveRuntime>>>) {
         };
         let event =
             tokio::time::timeout(Duration::from_secs(1), runtime.next_reconcile_action()).await;
+        if let Err(error) = runtime.cancel_expired_entries(Utc::now()).await {
+            runtime.disarm();
+            warn!("LIVE 过期开仓单撤单或对账失败，已自动 DISARM: {error:#}");
+        }
         match event {
             Ok(Ok(Some(crate::order_state::ReconcileAction::MarkFilled))) => {
                 if let Some(client_order_id) =
