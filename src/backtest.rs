@@ -128,14 +128,15 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
         history.insert(candle.open_time, candle.clone());
         let now = candle.open_time + Duration::minutes(1);
 
+        let mut close_position = false;
         if let Some(open) = position.as_mut()
-            && let Some((exit_price, exit_reason)) = exit_fill(open, candle)
+            && let Some((exit_quantity, exit_price, exit_reason)) = exit_fill(open, candle, config)
         {
             let pnl = match open.side {
-                Side::Buy => (exit_price - open.entry_price) * open.quantity,
-                Side::Sell => (open.entry_price - exit_price) * open.quantity,
+                Side::Buy => (exit_price - open.entry_price) * exit_quantity,
+                Side::Sell => (open.entry_price - exit_price) * exit_quantity,
             };
-            let fees = (open.entry_price + exit_price) * open.quantity * config.maker_fee_pct
+            let fees = (open.entry_price + exit_price) * exit_quantity * config.maker_fee_pct
                 / Decimal::from(100);
             equity += pnl - fees;
             trades.push(BacktestTrade {
@@ -144,11 +145,15 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
                 entry_price: open.entry_price,
                 exit_time: now,
                 exit_price,
-                quantity: open.quantity,
+                quantity: exit_quantity,
                 exit_reason,
                 pnl,
                 fees,
             });
+            open.quantity -= exit_quantity;
+            close_position = open.quantity <= Decimal::ZERO;
+        }
+        if close_position {
             position = None;
         }
 
@@ -264,7 +269,11 @@ fn entry_fill_quantity(
     }
 }
 
-fn exit_fill(position: &mut OpenPosition, candle: &Candle) -> Option<(Decimal, ExitReason)> {
+fn exit_fill(
+    position: &mut OpenPosition,
+    candle: &Candle,
+    config: &BacktestConfig,
+) -> Option<(Decimal, Decimal, ExitReason)> {
     position.stop_triggered |= match position.side {
         Side::Buy => candle.low <= position.stop_price,
         Side::Sell => candle.high >= position.stop_price,
@@ -278,10 +287,41 @@ fn exit_fill(position: &mut OpenPosition, candle: &Candle) -> Option<(Decimal, E
         Side::Buy => candle.high >= position.target_price,
         Side::Sell => candle.low <= position.target_price,
     };
+    let available = |price: Decimal, exit_side: Side| -> Option<Decimal> {
+        match config.fill_model {
+            FillModel::CandleRangeTouch => Some(position.quantity),
+            FillModel::TopOfBook => {
+                config
+                    .order_book
+                    .get(&candle.open_time)
+                    .and_then(|book| match exit_side {
+                        Side::Buy if book.ask_price <= price => Some(book.ask_quantity),
+                        Side::Sell if book.bid_price >= price => Some(book.bid_quantity),
+                        _ => None,
+                    })
+            }
+        }
+    };
+    let exit_side = match position.side {
+        Side::Buy => Side::Sell,
+        Side::Sell => Side::Buy,
+    };
     if stop_filled {
-        Some((position.stop_price, ExitReason::StopLoss))
+        available(position.stop_price, exit_side).map(|quantity| {
+            (
+                quantity.min(position.quantity),
+                position.stop_price,
+                ExitReason::StopLoss,
+            )
+        })
     } else if target_filled {
-        Some((position.target_price, ExitReason::TakeProfit))
+        available(position.target_price, exit_side).map(|quantity| {
+            (
+                quantity.min(position.quantity),
+                position.target_price,
+                ExitReason::TakeProfit,
+            )
+        })
     } else {
         None
     }
@@ -402,8 +442,8 @@ mod tests {
             closed: true,
         };
         assert_eq!(
-            exit_fill(&mut position, &candle),
-            Some((Decimal::from(99), ExitReason::StopLoss))
+            exit_fill(&mut position, &candle, &config()),
+            Some((Decimal::ONE, Decimal::from(99), ExitReason::StopLoss))
         );
     }
 
@@ -499,5 +539,43 @@ mod tests {
             entry_fill_quantity(&entry, &candle, &config),
             Some(Decimal::new(100, 3))
         );
+    }
+
+    #[test]
+    fn top_of_book_model_partially_exits_protection_order() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 24, 7, 0, 0).unwrap();
+        let mut config = config();
+        config.fill_model = FillModel::TopOfBook;
+        config.order_book.insert(
+            start,
+            OrderBookSnapshot {
+                open_time: start,
+                bid_price: Decimal::from(101),
+                bid_quantity: Decimal::new(300, 3),
+                ask_price: Decimal::from(101),
+                ask_quantity: Decimal::new(300, 3),
+            },
+        );
+        let mut position = OpenPosition {
+            side: Side::Buy,
+            quantity: Decimal::ONE,
+            entry_price: Decimal::from(100),
+            stop_price: Decimal::from(99),
+            target_price: Decimal::from(101),
+            opened_at: start,
+            stop_triggered: false,
+        };
+        let candle = Candle {
+            open_time: start,
+            open: Decimal::from(100),
+            high: Decimal::from(101),
+            low: Decimal::from(100),
+            close: Decimal::from(101),
+            closed: true,
+        };
+        let fill = exit_fill(&mut position, &candle, &config).unwrap();
+        assert_eq!(fill.0, Decimal::new(300, 3));
+        position.quantity -= fill.0;
+        assert_eq!(position.quantity, Decimal::new(700, 3));
     }
 }
