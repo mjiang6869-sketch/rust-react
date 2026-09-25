@@ -13,6 +13,7 @@ pub mod instrument;
 pub mod market;
 pub mod money;
 pub mod order;
+pub mod position_set;
 pub mod precision;
 pub mod protection;
 pub mod risk;
@@ -25,6 +26,11 @@ pub use market::{AggTrade, BookSnapshot, Candle, MarketEvent};
 pub use money::{Price, Qty};
 pub use order::{
     ClientOrderId, Effect, HaltReason, Order, OrderPurpose, OrderState, Side, TimeInForce,
+};
+pub use position_set::{
+    ConsistencyReport, ManualPlan, ManualPreview, PositionSet, PositionView, ProtectionFix,
+    ProtectionRole, RungPreview, RungView, check_consistency, fixes_to_effects, on_position_closed,
+    on_stop_filled, on_take_profit_filled, preview_manual,
 };
 pub use precision::{Precision, PriceRole};
 pub use protection::{
