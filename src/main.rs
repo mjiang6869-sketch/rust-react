@@ -197,7 +197,7 @@ async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatu
     if let Some(runtime) = state.live.lock().await.as_ref() {
         return Ok(Json(runtime.status()));
     }
-    let mut runtime = LiveRuntime::from_env(symbol, mode, rules).map_err(|error| {
+    let mut runtime = LiveRuntime::from_env(symbol.clone(), mode, rules).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             format!("创建 LIVE runtime 失败：{error:#}"),
@@ -210,7 +210,7 @@ async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatu
             format!("连接 Binance 用户数据流失败：{error:#}"),
         ));
     }
-    if let Err(error) = runtime.reconcile_account(&margin_asset).await {
+    if let Err(error) = runtime.reconcile_account(&symbol, &margin_asset).await {
         let _ = runtime.close().await;
         return Err((
             StatusCode::BAD_GATEWAY,

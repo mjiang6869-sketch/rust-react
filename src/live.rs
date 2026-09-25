@@ -183,9 +183,10 @@ impl LiveRuntime {
         self.user_stream.close().await
     }
 
-    pub async fn reconcile_account(&mut self, margin_asset: &str) -> Result<()> {
+    pub async fn reconcile_account(&mut self, symbol: &str, margin_asset: &str) -> Result<()> {
         let account = self.execution.account().await?;
         self.available_collateral = available_asset_balance(&account, margin_asset)?;
+        ensure_flat_position(&account, symbol)?;
         self.safety.mark_account_reconciled();
         Ok(())
     }
@@ -426,6 +427,28 @@ fn available_asset_balance(account: &Value, asset: &str) -> Result<rust_decimal:
     Ok(balance)
 }
 
+fn ensure_flat_position(account: &Value, symbol: &str) -> Result<()> {
+    let positions = account["positions"]
+        .as_array()
+        .context("Binance 账户响应缺少 positions，拒绝 LIVE")?;
+    let position = positions
+        .iter()
+        .find(|item| item["symbol"].as_str() == Some(symbol));
+    let Some(position) = position else {
+        bail!("Binance 账户没有交易对 {symbol} 的持仓记录，拒绝 LIVE");
+    };
+    let amount = rust_decimal::Decimal::from_str_exact(
+        position["positionAmt"]
+            .as_str()
+            .with_context(|| format!("Binance {symbol} positionAmt 无效"))?,
+    )
+    .with_context(|| format!("Binance {symbol} positionAmt 不是 Decimal"))?;
+    if amount != rust_decimal::Decimal::ZERO {
+        bail!("Binance {symbol} 存在未恢复持仓 {amount}，拒绝 ARM");
+    }
+    Ok(())
+}
+
 fn network_from_env() -> Result<BinanceNetwork> {
     let endpoint = std::env::var("RUST_CRYPTO_BINANCE_BASE_URL")
         .unwrap_or_else(|_| "https://testnet.binancefuture.com".to_string());
@@ -502,5 +525,19 @@ mod tests {
             rust_decimal::Decimal::new(325, 2)
         );
         assert!(available_asset_balance(&value, "BTC").is_err());
+    }
+
+    #[test]
+    fn account_reconciliation_rejects_unrecovered_position() {
+        let value = serde_json::json!({
+            "assets": [{"asset": "USDC", "availableBalance": "3.25"}],
+            "positions": [{"symbol": "ETHUSDC", "positionAmt": "0.010"}]
+        });
+        assert!(ensure_flat_position(&value, "ETHUSDC").is_err());
+        let flat = serde_json::json!({
+            "assets": [{"asset": "USDC", "availableBalance": "3.25"}],
+            "positions": [{"symbol": "ETHUSDC", "positionAmt": "0"}]
+        });
+        assert!(ensure_flat_position(&flat, "ETHUSDC").is_ok());
     }
 }
