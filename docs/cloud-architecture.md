@@ -49,6 +49,19 @@ wrangler r2 bucket create rust-crypto-market-data
 wrangler r2 bucket create rust-crypto-backtests
 ```
 
+当前账户已创建以下 R2 bucket（Standard 存储类）：
+
+```text
+rust-crypto-market-data
+rust-crypto-backtests
+```
+
+验证命令：
+
+```sh
+wrangler r2 bucket list
+```
+
 对象路径：
 
 ```text
@@ -64,6 +77,9 @@ backtests/v1/{run_id}/trades.parquet
 ```sh
 wrangler d1 create rust-crypto-meta
 ```
+
+当前账户已创建 D1：`rust-crypto-meta`，database_id 为
+`6d05e351-4b93-415c-bee7-5a4fd6a9fa8c`。
 
 把返回的 database_id 写入 Worker 的实际部署配置。建议表：
 
@@ -147,6 +163,14 @@ wrangler d1 execute rust-crypto-meta --remote --file=./infra/d1/001_initial.sql
 wrangler queues create rust-crypto-download
 wrangler queues create rust-crypto-backtest
 wrangler queues create rust-crypto-dead-letter
+```
+
+当前账户已创建以下队列：
+
+```text
+rust-crypto-download
+rust-crypto-backtest
+rust-crypto-dead-letter
 ```
 
 队列消息必须包含唯一 job_id。Queues 默认至少一次投递，消费者必须幂等。
