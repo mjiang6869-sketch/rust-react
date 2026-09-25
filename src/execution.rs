@@ -1,10 +1,12 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{Side, quantize_down};
 
 /// 订单用途。执行层不提供市价订单类型，所有意图都必须是限价单。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrderPurpose {
     Entry,
     TakeProfit,
@@ -18,15 +20,42 @@ impl OrderPurpose {
 }
 
 /// 经过策略和风险检查后交给执行器的 Maker 限价订单。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MakerOrder {
     pub client_order_id: String,
     pub purpose: OrderPurpose,
     pub side: Side,
+    #[serde(with = "rust_decimal::serde::str")]
     pub quantity: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     pub price: Decimal,
+    #[serde(with = "option_decimal_string")]
     pub stop_price: Option<Decimal>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+mod option_decimal_string {
+    use rust_decimal::Decimal;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value
+            .map(|item| item.normalize().to_string())
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?;
+        value
+            .map(|item| Decimal::from_str_exact(&item).map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 impl MakerOrder {

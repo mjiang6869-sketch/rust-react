@@ -195,6 +195,36 @@ impl LiveRuntime {
         self.available_collateral
     }
 
+    pub fn submitted_orders(&self) -> Vec<MakerOrder> {
+        self.submitted.values().cloned().collect()
+    }
+
+    pub async fn restore_orders(
+        &mut self,
+        orders: &[MakerOrder],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        for order in orders {
+            self.reconciler
+                .register(order.client_order_id.clone(), order.quantity, now)
+                .map_err(anyhow::Error::msg)?;
+            self.submitted
+                .insert(order.client_order_id.clone(), order.clone());
+            let action = self.reconcile_order(&order.client_order_id, now).await?;
+            match action {
+                ReconcileAction::MarkFilled => {
+                    self.submit_protection_for(&order.client_order_id, now)
+                        .await?;
+                }
+                ReconcileAction::Alert => {
+                    bail!("LIVE 重启恢复订单对账异常：{}", order.client_order_id);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn arm(&mut self) -> Result<()> {
         self.safety.arm().map_err(anyhow::Error::msg)
     }

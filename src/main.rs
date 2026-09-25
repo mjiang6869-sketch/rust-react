@@ -173,7 +173,7 @@ async fn get_live_status(State(state): State<AppState>) -> Json<LiveStatus> {
 }
 
 async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>> {
-    let (symbol, mode, margin_asset, rules) = {
+    let (symbol, mode, margin_asset, rules, saved_live_orders) = {
         let engine = state.engine.lock().await;
         (
             engine.stored.config.symbol.clone(),
@@ -186,6 +186,7 @@ async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatu
                 min_notional: engine.stored.config.min_notional,
                 take_profit_pct: engine.stored.config.take_profit_pct,
             },
+            engine.stored.live_orders.clone(),
         )
     };
     if mode != ExecutionMode::Live {
@@ -217,6 +218,13 @@ async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatu
             format!("Binance 账户对账失败：{error:#}"),
         ));
     }
+    if let Err(error) = runtime.restore_orders(&saved_live_orders, Utc::now()).await {
+        let _ = runtime.close().await;
+        return Err((
+            StatusCode::CONFLICT,
+            format!("LIVE 重启订单恢复失败：{error:#}"),
+        ));
+    }
     let status = runtime.status();
     let mut live = state.live.lock().await;
     if let Some(existing) = live.as_ref() {
@@ -226,15 +234,14 @@ async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatu
         return Ok(Json(existing_status));
     }
     *live = Some(runtime);
-    let live_for_supervisor = Arc::clone(&state.live);
-    tokio::spawn(run_live_supervisor(live_for_supervisor));
+    tokio::spawn(run_live_supervisor(state.clone()));
     Ok(Json(status))
 }
 
-async fn run_live_supervisor(live: Arc<Mutex<Option<LiveRuntime>>>) {
+async fn run_live_supervisor(state: AppState) {
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
-        let mut guard = live.lock().await;
+        let mut guard = state.live.lock().await;
         let Some(runtime) = guard.as_mut() else {
             return;
         };
@@ -305,7 +312,24 @@ async fn run_live_supervisor(live: Arc<Mutex<Option<LiveRuntime>>>) {
                 warn!("LIVE 用户数据流 keepalive 失败，已自动 DISARM: {error:#}");
             }
         }
+        let submitted = runtime.submitted_orders();
+        drop(guard);
+        if let Err(error) = persist_live_orders(&state, submitted).await {
+            if let Some(runtime) = state.live.lock().await.as_mut() {
+                runtime.disarm();
+            }
+            warn!("LIVE 订单状态持久化失败，已自动 DISARM: {error:#}");
+        }
     }
+}
+
+async fn persist_live_orders(
+    state: &AppState,
+    orders: Vec<crate::execution::MakerOrder>,
+) -> Result<()> {
+    let mut engine = state.engine.lock().await;
+    engine.stored.live_orders = orders;
+    storage::save(&state.path, &engine.stored)
 }
 
 async fn arm_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>> {
@@ -527,6 +551,18 @@ async fn submit_live_entry_if_ready(state: &AppState, now: chrono::DateTime<Utc>
     let Some(intent) = intent else {
         return Ok(());
     };
+    {
+        let mut engine = state.engine.lock().await;
+        if !engine
+            .stored
+            .live_orders
+            .iter()
+            .any(|order| order.client_order_id == intent.client_order_id)
+        {
+            engine.stored.live_orders.push(intent.clone());
+            storage::save(&state.path, &engine.stored)?;
+        }
+    }
     let mut live = state.live.lock().await;
     let Some(runtime) = live.as_mut() else {
         return Ok(());
@@ -538,6 +574,9 @@ async fn submit_live_entry_if_ready(state: &AppState, now: chrono::DateTime<Utc>
         runtime.disarm();
         warn!("LIVE Maker 开仓提交失败，已自动 DISARM: {error:#}");
     }
+    let submitted = runtime.submitted_orders();
+    drop(live);
+    persist_live_orders(state, submitted).await?;
     Ok(())
 }
 

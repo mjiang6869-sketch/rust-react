@@ -56,7 +56,10 @@ pub fn save(path: &Path, state: &Stored) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::{MakerOrder, OrderPurpose};
+    use crate::model::Side;
     use chrono::Utc;
+    use rust_decimal::Decimal;
 
     #[test]
     fn persists_state_and_rejects_corrupt_file() {
@@ -102,5 +105,24 @@ mod tests {
         value["schema_version"] = serde_json::json!(CURRENT_SCHEMA_VERSION + 1);
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(load(&path).is_err());
+    }
+
+    #[test]
+    fn persists_live_order_intent_for_restart_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ETHUSDC.json");
+        let mut state = Stored::initial("ETHUSDC".to_string(), Utc::now());
+        state.live_orders.push(MakerOrder {
+            client_order_id: "mm-entry:restart".to_string(),
+            purpose: OrderPurpose::Entry,
+            side: Side::Buy,
+            quantity: Decimal::new(5, 3),
+            price: Decimal::from(100),
+            stop_price: Some(Decimal::new(99, 0)),
+            expires_at: None,
+        });
+        save(&path, &state).unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.live_orders, state.live_orders);
     }
 }

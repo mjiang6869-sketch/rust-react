@@ -187,6 +187,8 @@ pub struct Stored {
     pub orders: Vec<Order>,
     pub used_signal_at: DateTime<Utc>,
     pub next_order_id: u64,
+    #[serde(default)]
+    pub live_orders: Vec<MakerOrder>,
 }
 
 fn default_schema_version() -> u32 {
@@ -211,6 +213,7 @@ impl Stored {
             orders: Vec::new(),
             used_signal_at: now,
             next_order_id: 1,
+            live_orders: Vec::new(),
         }
     }
 }
