@@ -31,7 +31,10 @@ pub use protection::{
     BreakEvenSpec, EntryFill, MarketSlice, ProtectionAction, ProtectionPlan, ProtectionPlanner,
     StopSpec, TpPlan, TpRung, TrailingSpec, actions_to_effects,
 };
-pub use risk::{RiskLimits, RiskVerdict};
+pub use risk::{
+    LiquidationWarning, PriceRange, RiskLimits, RiskVerdict, check_entry, feed_is_fresh,
+    liquidation_warning, reference_range, resolve_exit_prices,
+};
 pub use state::{ExecEvent, Fill, OrderBookState, Position, QueryOutcome, TrackedOrder};
 pub use strategy::{
     EnterRequest, MarketView, ParameterSpec, SizeHint, StandDownReason, Strategy, StrategyIntent,

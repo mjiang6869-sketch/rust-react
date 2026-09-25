@@ -13,10 +13,14 @@
 //! 回测喂 Parquet，模拟盘喂实时 socket。所以"回测与模拟盘不一致"在结构上
 //! 不可能发生。
 
+pub mod engine;
 pub mod fill;
 pub mod liquidity;
 pub mod metrics;
 
+pub use engine::{
+    BacktestConfig, BacktestResult, EquityPoint, ExitKind, TradeRecord, compare_models, run,
+};
 pub use fill::{
     FillContext, FillModel, FillOutcome, M0WickTouchFull, M1TradeThroughQueue, MODEL_NAMES,
     Optimism, model_by_name,
