@@ -32,6 +32,7 @@
 pub mod fixed;
 pub mod manifest;
 pub mod parquet_writer;
+pub mod replay;
 
 pub use fixed::{decode_price, decode_rate, encode_price, encode_rate, parse_decimal};
 pub use manifest::{
@@ -39,3 +40,7 @@ pub use manifest::{
     PartitionStatus, archive_url_and_name, months_between,
 };
 pub use parquet_writer::{BATCH_ROWS, ConversionStats, convert_csv_to_parquet};
+pub use replay::{
+    DaySlice, MissingDataPolicy, NoProgress, ReplayOutput, ReplayProgress, ReplaySpec,
+    agg_trades_parquet_path, days_in_month, ensure_parquet, klines_parquet_path, load_day,
+};
