@@ -8,6 +8,7 @@ mod model;
 mod paper;
 mod signal;
 mod storage;
+pub mod user_stream;
 
 use anyhow::{Context, Result, bail};
 use axum::{
