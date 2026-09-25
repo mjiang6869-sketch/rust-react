@@ -82,6 +82,18 @@ interface BacktestReport {
   pending_expiries: number;
 }
 
+interface TrendAnalysis {
+  candles: { open_time: string; high: string; low: string; close: string }[];
+  pivots: { time: string; price: string; kind: "HIGH" | "LOW" }[];
+  trend_lines: {
+    kind: "RESISTANCE" | "SUPPORT";
+    start: { time: string; price: string };
+    end: { time: string; price: string };
+  }[];
+  direction: "UP" | "DOWN" | "SIDEWAYS" | "UNKNOWN";
+  method: string;
+}
+
 const kindLabel: Record<OrderKind, string> = {
   entry: "回踩开仓",
   take_profit: "Maker 止盈",
@@ -126,6 +138,45 @@ function Field({
   );
 }
 
+function PriceChart({ analysis }: { analysis: TrendAnalysis | null }) {
+  if (!analysis?.candles.length) return <p className="empty">等待足够的已收盘 K 线绘制趋势。</p>;
+  const width = 920;
+  const height = 320;
+  const padding = 28;
+  const values = analysis.candles.flatMap((candle) => [Number(candle.high), Number(candle.low)]);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const x = (index: number) => padding + index * ((width - padding * 2) / Math.max(analysis.candles.length - 1, 1));
+  const y = (price: number) => height - padding - ((price - min) / span) * (height - padding * 2);
+  const indices = new Map(analysis.candles.map((candle, index) => [candle.open_time, index]));
+  const closePoints = analysis.candles.map((candle, index) => `${x(index)},${y(Number(candle.close))}`).join(" ");
+  const linePoint = (point: { time: string; price: string }) => {
+    const index = indices.get(point.time);
+    return index === undefined ? null : `${x(index)},${y(Number(point.price))}`;
+  };
+  const directionLabel = { UP: "上行", DOWN: "下行", SIDEWAYS: "震荡", UNKNOWN: "未知" }[analysis.direction];
+  return (
+    <>
+      <div className="chart-meta"><span>趋势：{directionLabel}</span><span>方法：{analysis.method}</span><span>拐点：{analysis.pivots.length}</span></div>
+      <div className="chart-wrap">
+        <svg className="price-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="K 线收盘价与趋势标注">
+          <polyline points={closePoints} fill="none" stroke="#8db6ff" strokeWidth="2" />
+          {analysis.trend_lines.map((line) => {
+            const start = linePoint(line.start);
+            const end = linePoint(line.end);
+            return start && end ? <line key={`${line.kind}-${line.start.time}`} x1={start.split(",")[0]} y1={start.split(",")[1]} x2={end.split(",")[0]} y2={end.split(",")[1]} stroke={line.kind === "SUPPORT" ? "#70e0b2" : "#ffc179"} strokeWidth="2" strokeDasharray="6 5" /> : null;
+          })}
+          {analysis.pivots.map((pivot) => {
+            const index = indices.get(pivot.time);
+            return index === undefined ? null : <circle key={`${pivot.kind}-${pivot.time}`} cx={x(index)} cy={y(Number(pivot.price))} r="4" fill={pivot.kind === "LOW" ? "#70e0b2" : "#ffc179"} />;
+          })}
+        </svg>
+      </div>
+    </>
+  );
+}
+
 export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [draft, setDraft] = useState<Config | null>(null);
@@ -133,14 +184,19 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [backtest, setBacktest] = useState<BacktestReport | null>(null);
   const [backtestBusy, setBacktestBusy] = useState(false);
+  const [analysis, setAnalysis] = useState<TrendAnalysis | null>(null);
 
   useEffect(() => {
     let active = true;
     const load = async () => {
       try {
-        const result = await request<Snapshot>("/api/state");
+        const [result, trend] = await Promise.all([
+          request<Snapshot>("/api/state"),
+          request<TrendAnalysis>("/api/analysis"),
+        ]);
         if (!active) return;
         setSnapshot(result);
+        setAnalysis(trend);
         setDraft((current) => current ?? result.config);
         setError(null);
       } catch (cause) {
@@ -241,6 +297,11 @@ export default function App() {
           <article className="metric"><span>可用保证金估值</span><strong>{snapshot ? number(snapshot.available_collateral) : "—"}</strong><small>模拟盘按 USDT/USDC 等值估算</small></article>
           <article className="metric"><span>USDT 余额</span><strong>{snapshot ? number(snapshot.wallet.usdt) : "—"}</strong><small>可在多资产模式下作共享保证金</small></article>
           <article className="metric"><span>USDC 余额</span><strong>{snapshot ? number(snapshot.wallet.usdc) : "—"}</strong><small>USDC 合约盈亏在此结算</small></article>
+        </section>
+
+        <section className="panel chart-panel">
+          <div className="panel-heading"><h2>K 线与趋势</h2><span>确定性拐点标注</span></div>
+          <PriceChart analysis={analysis} />
         </section>
 
         <div className="main-grid">
