@@ -1,0 +1,12 @@
+{
+  "name": "rust-crypto-desktop",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^38.2.0"
+  }
+}

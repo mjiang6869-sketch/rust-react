@@ -6,6 +6,16 @@ use std::collections::BTreeMap;
 use crate::model::{Candle, Side, Signal, quantize_down, quantize_up};
 use crate::signal::{find_reversal_signal, invalid_reason, risk_reason};
 
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExecutionMode {
+    #[default]
+    Paper,
+    Live,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub symbol: String,
@@ -165,6 +175,10 @@ impl AssetBalances {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stored {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub mode: ExecutionMode,
     pub config: Config,
     pub wallet: AssetBalances,
     pub realized_pnl: AssetBalances,
@@ -174,9 +188,15 @@ pub struct Stored {
     pub next_order_id: u64,
 }
 
+fn default_schema_version() -> u32 {
+    CURRENT_SCHEMA_VERSION
+}
+
 impl Stored {
     pub fn initial(symbol: String, now: DateTime<Utc>) -> Self {
         Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            mode: ExecutionMode::Paper,
             config: Config::initial(symbol),
             wallet: AssetBalances {
                 usdt: Decimal::from(10_000),
@@ -196,6 +216,8 @@ impl Stored {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
+    pub schema_version: u32,
+    pub mode: ExecutionMode,
     pub config: Config,
     pub wallet: AssetBalances,
     #[serde(with = "rust_decimal::serde::str")]
@@ -232,6 +254,8 @@ impl PaperEngine {
 
     pub fn snapshot(&self, now: DateTime<Utc>) -> Snapshot {
         Snapshot {
+            schema_version: self.stored.schema_version,
+            mode: self.stored.mode,
             config: self.stored.config.clone(),
             wallet: self.stored.wallet.clone(),
             available_collateral: self.available_collateral(),

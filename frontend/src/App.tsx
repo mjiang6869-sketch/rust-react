@@ -47,6 +47,8 @@ interface Position {
 }
 
 interface Snapshot {
+  schema_version: number;
+  mode: "PAPER" | "LIVE";
   config: Config;
   wallet: Balances;
   available_collateral: string;
@@ -171,7 +173,7 @@ export default function App() {
       <a className="skip-link" href="#main">跳转到主要内容</a>
       <header className="topbar">
         <div className="brand"><span className="brand-mark">RC</span><span>Rust Crypto <b>模拟做市台</b></span></div>
-        <span className="environment">仅模拟盘 · 无真实下单</span>
+        <span className="environment">{snapshot?.mode === "LIVE" ? "实盘模式" : "模拟盘模式"} · Maker-only</span>
       </header>
       <main id="main" className="layout">
         <div className="headline">

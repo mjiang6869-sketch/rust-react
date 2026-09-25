@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-use crate::paper::Stored;
+use crate::paper::{CURRENT_SCHEMA_VERSION, Stored};
 
 pub fn lock(path: &Path) -> Result<File> {
     let parent = path.parent().context("状态路径缺少父目录")?;
@@ -24,9 +24,16 @@ pub fn load(path: &Path) -> Result<Option<Stored>> {
         return Ok(None);
     }
     let bytes = fs::read(path).with_context(|| format!("读取状态失败: {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("状态文件损坏，拒绝重置: {}", path.display()))
-        .map(Some)
+    let state: Stored = serde_json::from_slice(&bytes)
+        .with_context(|| format!("状态文件损坏，拒绝重置: {}", path.display()))?;
+    if state.schema_version != CURRENT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "状态版本 {} 不受当前程序支持，拒绝启动: {}",
+            state.schema_version,
+            path.display()
+        );
+    }
+    Ok(Some(state))
 }
 
 pub fn save(path: &Path, state: &Stored) -> Result<()> {
@@ -70,5 +77,30 @@ mod tests {
         assert!(lock(&path).is_err());
         drop(first);
         assert!(lock(&path).is_ok());
+    }
+
+    #[test]
+    fn accepts_legacy_state_without_version_as_current_paper_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ETHUSDC.json");
+        let mut value = serde_json::to_value(Stored::initial("ETHUSDC".to_string(), Utc::now()))
+            .unwrap();
+        value.as_object_mut().unwrap().remove("schema_version");
+        value.as_object_mut().unwrap().remove("mode");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.mode, crate::paper::ExecutionMode::Paper);
+    }
+
+    #[test]
+    fn rejects_unknown_state_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ETHUSDC.json");
+        let mut value = serde_json::to_value(Stored::initial("ETHUSDC".to_string(), Utc::now()))
+            .unwrap();
+        value["schema_version"] = serde_json::json!(CURRENT_SCHEMA_VERSION + 1);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(load(&path).is_err());
     }
 }
