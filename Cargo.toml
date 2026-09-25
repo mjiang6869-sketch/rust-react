@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/domain", "crates/data", "crates/sim", "crates/store", "crates/strategies", "crates/cli", "crates/exchange"]
+members = ["crates/domain", "crates/data", "crates/sim", "crates/store", "crates/strategies", "crates/cli", "crates/exchange", "crates/engine"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,7 @@ sim = { path = "crates/sim" }
 store = { path = "crates/store" }
 strategies = { path = "crates/strategies" }
 exchange = { path = "crates/exchange" }
+engine = { path = "crates/engine" }
 
 # 领域层（零 I/O）
 rust_decimal = { version = "1", features = ["serde-with-str"] }

@@ -216,22 +216,28 @@ impl FillModel for M1TradeThroughQueue {
         for t in ctx.tape.trades() {
             let price = t.price.get();
 
-            // 判定这笔成交是否发生在我们的价位或"对我们更有利"的一侧。
+            // 判定这笔成交是否打到了我们所在的价位。
             //
-            // 买单：成交价 <= 我们的买价 意味着这笔成交能吃掉我们所在价位的挂单
-            // 卖单：成交价 >= 我们的卖价 同理
-            let at_or_better = match side {
+            // 依据限价单在订单簿里的位置：
+            //   买单挂 L 在**买盘**：卖方主动打下来，成交价 <= L 才碰到我们
+            //   卖单挂 L 在**卖盘**：买方主动打上去，成交价 >= L 才碰到我们
+            //
+            // 注意卖单这里是 `>=`：我们的卖单在 L，买方主动成交在 L 或更高
+            // 都会吃掉它。看着像"价格远高于挂单价也能成交"，但那是订单簿的
+            // 实际行为——买方扫单会一路吃掉 L 及以上的所有卖单。
+            let reaches_our_price = match side {
                 Side::Buy => price <= limit,
                 Side::Sell => price >= limit,
             };
-            if !at_or_better {
+            if !reaches_our_price {
                 continue;
             }
 
-            // 额外的真实性检查：这笔成交必须由**主动卖单**（对我们买单而言）
-            // 驱动。如果成交价在我们买价或更低、却是买方主动的单子，说明那是
-            // 一笔市价买在低位成交——它不会消耗买盘队列，不能算作我们成交的
-            // 证据。
+            // 方向检查：这笔成交必须由**正确方向的主动单**驱动。
+            //
+            // 我们挂买单时需要卖方主动来吃（is_buyer_maker = true）；
+            // 挂卖单时需要买方主动（is_buyer_maker = false）。
+            // 反向的成交不消耗我们这一侧的队列，不能算作成交证据。
             let aggressor_consumes_our_side = match side {
                 // 我们挂买单，需要卖方主动来吃
                 Side::Buy => t.is_buyer_maker,

@@ -57,6 +57,13 @@ pub struct PositionSet {
     pub side: Side,
     /// 当前持仓量（随止盈/止损成交而减少）。
     pub quantity: Qty,
+    /// 入场时的原始持仓量。
+    ///
+    /// **各档止盈的数量基准必须是这个值，不是 `quantity`。**
+    /// 若按递减后的 `quantity` 计算，第二档会基于缩小后的基数再乘比例，
+    /// 导致总平仓量永远到不了 100%，留下无法平掉的残仓。
+    /// 引擎里曾因把 `quantity` 当成基准而实际触发过这个 bug。
+    pub original_quantity: Qty,
     pub entry_price: Price,
     pub opened_at: DateTime<Utc>,
     /// 保护单计划（决定止损与分批止盈的参数）。
@@ -68,6 +75,17 @@ pub struct PositionSet {
     pub stop_price: Option<Price>,
     /// 止损是否已触发但未成交（maker-only 的裸露风险）。
     pub stop_triggered_at: Option<DateTime<Utc>>,
+    /// 保护单挂出的时刻。
+    ///
+    /// 与 `opened_at` 区分：保护单是开仓成交后才挂出去的，成交判定只能看
+    /// 这之后的成交。用开仓时刻作为起点会让止损"成交"在历史成交上，导致
+    /// 它瞬间触发、仓位立即被平掉。
+    pub protection_placed_at: Option<DateTime<Utc>>,
+    /// 各档止盈对应的订单 ID。
+    ///
+    /// 需要它是因为分批止盈的每一档都是一张独立订单，成交回报只能靠 ID
+    /// 对应回档位。空表示尚未挂出（模拟盘在成交后才编译保护单）。
+    pub tp_order_ids: Vec<ClientOrderId>,
 }
 
 impl PositionSet {
@@ -76,6 +94,7 @@ impl PositionSet {
             symbol: position.symbol.clone(),
             side: position.side,
             quantity: position.quantity,
+            original_quantity: position.quantity,
             entry_price: position.entry_price,
             opened_at: position.opened_at,
             plan,
@@ -83,7 +102,14 @@ impl PositionSet {
             completed_rungs: Vec::new(),
             stop_price: position.stop_price,
             stop_triggered_at: None,
+            protection_placed_at: None,
+            tp_order_ids: Vec::new(),
         }
+    }
+
+    /// 记录各档止盈的订单 ID。
+    pub fn set_tp_order_ids(&mut self, ids: Vec<ClientOrderId>) {
+        self.tp_order_ids = ids;
     }
 
     /// 下一档待成交的止盈档位序号。
@@ -97,10 +123,10 @@ impl PositionSet {
     /// 注意：数量基准是**入场时的原始持仓量**，而不是当前持仓量——否则
     /// 第一档成交后，第二档的比例会基于缩小后的基数计算，导致总平仓量
     /// 不足（永远平不完）。
-    pub fn rung_quantity(&self, rung: usize, original_quantity: Qty) -> Qty {
+    pub fn rung_quantity(&self, rung: usize) -> Qty {
         let rungs = self.tp.rungs();
         match rungs.get(rung) {
-            Some((_, fraction)) => Qty::new(original_quantity.get() * fraction),
+            Some((_, fraction)) => Qty::new(self.original_quantity.get() * fraction),
             None => Qty::ZERO,
         }
     }
@@ -180,7 +206,6 @@ pub fn on_take_profit_filled(
     set: &mut PositionSet,
     rung: usize,
     filled_qty: Qty,
-    original_quantity: Qty,
     working: &[&TrackedOrder],
 ) -> Result<Vec<ProtectionFix>, DomainError> {
     if set.completed_rungs.contains(&rung) {
@@ -253,7 +278,6 @@ pub fn on_take_profit_filled(
         }
     }
 
-    let _ = original_quantity;
     Ok(fixes)
 }
 
@@ -458,6 +482,7 @@ pub fn preview_manual(
     plan: &ManualPlan,
     equity: Decimal,
     mark_price: Decimal,
+    limits: &crate::risk::RiskLimits,
 ) -> Result<ManualPreview, DomainError> {
     use crate::precision::PriceRole;
 
@@ -556,7 +581,7 @@ pub fn preview_manual(
         stop.get(),
         tp_first,
         plan.leverage,
-        &crate::risk::RiskLimits::default(),
+        limits,
     );
     let (accepted, reject_reason) = match verdict {
         crate::risk::RiskVerdict::Pass => (true, None),
@@ -737,9 +762,7 @@ mod tests {
         let working = vec![&stop];
 
         // 第一档止盈成交 40%
-        let fixes =
-            on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), Qty::new(dec!(1)), &working)
-                .unwrap();
+        let fixes = on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), &working).unwrap();
 
         assert_eq!(s.quantity.get(), dec!(0.6), "持仓应减少到 60%");
         let replaced = fixes
@@ -765,12 +788,12 @@ mod tests {
     #[test]
     fn rung_quantities_use_original_quantity_as_base() {
         let s = set();
-        let original = Qty::new(dec!(1));
-        assert_eq!(s.rung_quantity(0, original).get(), dec!(0.4));
-        assert_eq!(s.rung_quantity(1, original).get(), dec!(0.3));
-        assert_eq!(s.rung_quantity(2, original).get(), dec!(0.3));
+        assert_eq!(s.original_quantity.get(), dec!(1), "原始持仓量必须被记录");
+        assert_eq!(s.rung_quantity(0).get(), dec!(0.4));
+        assert_eq!(s.rung_quantity(1).get(), dec!(0.3));
+        assert_eq!(s.rung_quantity(2).get(), dec!(0.3));
 
-        let total: Decimal = (0..3).map(|i| s.rung_quantity(i, original).get()).sum();
+        let total: Decimal = (0..3).map(|i| s.rung_quantity(i).get()).sum();
         assert_eq!(total, dec!(1), "三档合计必须等于原始持仓，否则平不完");
     }
 
@@ -789,11 +812,9 @@ mod tests {
         let working = vec![&stop, &tp3];
 
         // 模拟三档全部成交
-        on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), Qty::new(dec!(1)), &working).unwrap();
-        on_take_profit_filled(&mut s, 1, Qty::new(dec!(0.3)), Qty::new(dec!(1)), &working).unwrap();
-        let fixes =
-            on_take_profit_filled(&mut s, 2, Qty::new(dec!(0.3)), Qty::new(dec!(1)), &working)
-                .unwrap();
+        on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), &working).unwrap();
+        on_take_profit_filled(&mut s, 1, Qty::new(dec!(0.3)), &working).unwrap();
+        let fixes = on_take_profit_filled(&mut s, 2, Qty::new(dec!(0.3)), &working).unwrap();
 
         assert_eq!(s.quantity.get(), Decimal::ZERO);
         let cancels = fixes
@@ -850,13 +871,11 @@ mod tests {
         let stop = tracked("stop", OrderPurpose::StopLoss, Side::Sell, dec!(1), dec!(0));
         let working = vec![&stop];
 
-        on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), Qty::new(dec!(1)), &working).unwrap();
+        on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), &working).unwrap();
         let qty_after_first = s.quantity.get();
 
         // 同一档再来一次
-        let fixes =
-            on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), Qty::new(dec!(1)), &working)
-                .unwrap();
+        let fixes = on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), &working).unwrap();
         assert_eq!(s.quantity.get(), qty_after_first, "重复事件不应再次扣减");
         assert_eq!(fixes, vec![ProtectionFix::Nothing]);
     }
@@ -865,17 +884,14 @@ mod tests {
     #[test]
     fn take_profit_exceeding_position_is_rejected() {
         let mut s = set();
-        let err = on_take_profit_filled(&mut s, 0, Qty::new(dec!(5)), Qty::new(dec!(1)), &[])
-            .unwrap_err();
+        let err = on_take_profit_filled(&mut s, 0, Qty::new(dec!(5)), &[]).unwrap_err();
         assert!(matches!(err, DomainError::IllegalTransition(_)));
     }
 
     #[test]
     fn out_of_range_rung_is_rejected() {
         let mut s = set();
-        assert!(
-            on_take_profit_filled(&mut s, 9, Qty::new(dec!(0.1)), Qty::new(dec!(1)), &[]).is_err()
-        );
+        assert!(on_take_profit_filled(&mut s, 9, Qty::new(dec!(0.1)), &[]).is_err());
     }
 
     /// 一致性检查必须能发现"挂单总量超过持仓"这个危险状态。
@@ -949,7 +965,7 @@ mod tests {
         let stop = tracked("stop", OrderPurpose::StopLoss, Side::Sell, dec!(1), dec!(0));
         // 第一档 4bp = 3200*0.0004 = 1.28；止损距离 10 点，trigger_r=1 需要 10 点
         // 1.28 < 10，所以不应触发保本
-        on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), Qty::new(dec!(1)), &[&stop]).unwrap();
+        on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), &[&stop]).unwrap();
         assert_eq!(
             s.stop_price.unwrap().get(),
             dec!(3190),
@@ -982,7 +998,14 @@ mod tests {
     fn preview_produces_quantized_prices() {
         let i = instrument();
         let p = manual(Side::Buy, dec!(3200), dec!(3190));
-        let pv = preview_manual(&i, &p, dec!(10000), dec!(3200)).unwrap();
+        let pv = preview_manual(
+            &i,
+            &p,
+            dec!(10000),
+            dec!(3200),
+            &crate::risk::RiskLimits::default(),
+        )
+        .unwrap();
 
         assert_eq!(pv.entry.get(), dec!(3200));
         assert_eq!(pv.quantity.get(), dec!(0.1));
@@ -1001,7 +1024,14 @@ mod tests {
         let i = instrument();
         let mut p = manual(Side::Buy, dec!(3200), dec!(3190));
         p.quantity = Some(Qty::new(dec!(0.00001)));
-        let pv = preview_manual(&i, &p, dec!(10000), dec!(3200)).unwrap();
+        let pv = preview_manual(
+            &i,
+            &p,
+            dec!(10000),
+            dec!(3200),
+            &crate::risk::RiskLimits::default(),
+        )
+        .unwrap();
         assert!(!pv.accepted);
         assert!(pv.reject_reason.is_some());
     }
@@ -1012,7 +1042,14 @@ mod tests {
         let i = instrument();
         // 多头但止损放在入场价上方
         let p = manual(Side::Buy, dec!(3200), dec!(3210));
-        let pv = preview_manual(&i, &p, dec!(10000), dec!(3200)).unwrap();
+        let pv = preview_manual(
+            &i,
+            &p,
+            dec!(10000),
+            dec!(3200),
+            &crate::risk::RiskLimits::default(),
+        )
+        .unwrap();
         assert!(!pv.accepted, "止损方向错误应被拒绝");
         assert!(pv.reject_reason.is_some());
     }
@@ -1022,7 +1059,14 @@ mod tests {
     fn preview_warns_about_trigger_protect() {
         let i = instrument();
         let p = manual(Side::Buy, dec!(3200), dec!(3190));
-        let pv = preview_manual(&i, &p, dec!(10000), dec!(3200)).unwrap();
+        let pv = preview_manual(
+            &i,
+            &p,
+            dec!(10000),
+            dec!(3200),
+            &crate::risk::RiskLimits::default(),
+        )
+        .unwrap();
         assert!(
             pv.warnings.iter().any(|w| w.contains("triggerProtect")),
             "应警告条件单触发保护：{:?}",
@@ -1035,7 +1079,14 @@ mod tests {
     fn preview_computes_margin_requirement() {
         let i = instrument();
         let p = manual(Side::Buy, dec!(3200), dec!(3190));
-        let pv = preview_manual(&i, &p, dec!(10000), dec!(3200)).unwrap();
+        let pv = preview_manual(
+            &i,
+            &p,
+            dec!(10000),
+            dec!(3200),
+            &crate::risk::RiskLimits::default(),
+        )
+        .unwrap();
         assert_eq!(pv.notional, dec!(320), "0.1 * 3200");
         // 320 / 3 是循环小数，按显示精度比较
         assert_eq!(
@@ -1050,7 +1101,14 @@ mod tests {
     fn preview_reports_liquidation_buffer() {
         let i = instrument();
         let p = manual(Side::Buy, dec!(3200), dec!(3190));
-        let pv = preview_manual(&i, &p, dec!(10000), dec!(3200)).unwrap();
+        let pv = preview_manual(
+            &i,
+            &p,
+            dec!(10000),
+            dec!(3200),
+            &crate::risk::RiskLimits::default(),
+        )
+        .unwrap();
         assert!(pv.liquidation_buffer_pct.is_some());
     }
 
@@ -1062,7 +1120,14 @@ mod tests {
         p.quantity = None;
         p.size_pct = Some(dec!(0.1));
         p.leverage = Decimal::from(3);
-        let pv = preview_manual(&i, &p, dec!(10000), dec!(3200)).unwrap();
+        let pv = preview_manual(
+            &i,
+            &p,
+            dec!(10000),
+            dec!(3200),
+            &crate::risk::RiskLimits::default(),
+        )
+        .unwrap();
         // 10000 * 0.1 * 3 / 3200 = 0.9375 -> 向下量化 0.937
         assert_eq!(pv.quantity.get(), dec!(0.937));
     }

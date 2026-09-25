@@ -63,6 +63,28 @@ impl TradeTape {
         &self.trades
     }
 
+    /// 追加一笔成交（模拟盘实时喂入用）。
+    ///
+    /// 币安的 `agg_trade_id` 单调递增，所以直接 push 通常已保持有序。
+    /// 但重连补数据时可能乱序，所以这里做一次插入位置查找而非盲目 push。
+    pub fn push(&mut self, trade: Trade) {
+        let pos = self
+            .trades
+            .partition_point(|t| (t.at, t.trade_id) <= (trade.at, trade.trade_id));
+        self.trades.insert(pos, trade);
+    }
+
+    /// 丢弃早于给定时点的成交，限制内存占用。
+    ///
+    /// 模拟盘长跑时成交带会无限增长（一天 45 万笔），必须定期裁剪。
+    /// 裁剪窗口要大于任何合理的挂单有效期。
+    pub fn prune_before(&mut self, cutoff: DateTime<Utc>) {
+        let keep_from = self.trades.partition_point(|t| t.at < cutoff);
+        if keep_from > 0 {
+            self.trades.drain(0..keep_from);
+        }
+    }
+
     /// 时间区间 `[from, to)` 内的成交切片。
     ///
     /// 用二分查找定位起点，避免每个 tick 都从头扫描整条带——回测里这个函数

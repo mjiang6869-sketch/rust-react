@@ -302,13 +302,10 @@ fn list_strategies() -> Result<()> {
             let unit = p.unit.as_deref().unwrap_or("");
             println!("      {}  {}", pad_display(&p.key, key_width), p.label);
             println!(
-                "        默认 {}{}   范围 {}{} ~ {}{}",
+                "        默认 {}   范围 {} ~ {}",
                 display_value(p.default, unit),
-                "",
                 display_value(p.min, unit),
-                "",
-                display_value(p.max, unit),
-                ""
+                display_value(p.max, unit)
             );
             for line in wrap(&p.description, 64) {
                 println!("        {line}");
