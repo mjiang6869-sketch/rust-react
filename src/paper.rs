@@ -287,6 +287,64 @@ impl PaperEngine {
         self.available_collateral()
     }
 
+    pub fn live_entry_intent(
+        &mut self,
+        now: DateTime<Utc>,
+        available_collateral: Decimal,
+    ) -> Option<MakerOrder> {
+        if self.stored.mode != ExecutionMode::Live
+            || !self.stored.config.enabled
+            || !self.fresh(now)
+            || self.stored.position.is_some()
+            || self.stored.orders.iter().any(|order| order.active())
+        {
+            return None;
+        }
+        let signal = find_reversal_signal(&self.history, now, self.stored.config.tick_size)?;
+        if signal.confirmed_at <= self.stored.used_signal_at
+            || invalid_reason(&signal, self.live.as_ref(), &self.history, now).is_some()
+            || risk_reason(
+                &signal,
+                self.stored.config.stop_pct,
+                self.stored.config.take_profit_pct,
+            )
+            .is_some()
+            || !stop_before_liquidation(&signal, self.stored.config.leverage)
+        {
+            return None;
+        }
+        let config = &self.stored.config;
+        let quantity = quantize_down(
+            available_collateral * config.margin_pct * config.leverage
+                / Decimal::from(100)
+                / signal.entry_price,
+            config.step_size,
+        );
+        if quantity < config.min_qty || quantity * signal.entry_price < config.min_notional {
+            return None;
+        }
+        let order = MakerOrder {
+            client_order_id: signal.id(),
+            purpose: OrderPurpose::Entry,
+            side: signal.side,
+            quantity,
+            price: signal.entry_price,
+        };
+        if order
+            .validate(
+                config.tick_size,
+                config.step_size,
+                config.min_qty,
+                config.min_notional,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        self.stored.used_signal_at = signal.confirmed_at;
+        Some(order)
+    }
+
     pub fn fresh(&self, now: DateTime<Utc>) -> bool {
         self.feed_connected
             && self

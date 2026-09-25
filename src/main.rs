@@ -173,9 +173,13 @@ async fn get_live_status(State(state): State<AppState>) -> Json<LiveStatus> {
 }
 
 async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>> {
-    let (symbol, mode) = {
+    let (symbol, mode, margin_asset) = {
         let engine = state.engine.lock().await;
-        (engine.stored.config.symbol.clone(), engine.stored.mode)
+        (
+            engine.stored.config.symbol.clone(),
+            engine.stored.mode,
+            engine.stored.config.margin_asset.clone(),
+        )
     };
     if mode != ExecutionMode::Live {
         return Err((
@@ -199,7 +203,7 @@ async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatu
             format!("连接 Binance 用户数据流失败：{error:#}"),
         ));
     }
-    if let Err(error) = runtime.reconcile_account().await {
+    if let Err(error) = runtime.reconcile_account(&margin_asset).await {
         let _ = runtime.close().await;
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -455,6 +459,45 @@ async fn kill(State(state): State<AppState>) -> ApiResult<Json<Snapshot>> {
     Ok(Json(engine.snapshot(Utc::now())))
 }
 
+async fn submit_live_entry_if_ready(state: &AppState, now: chrono::DateTime<Utc>) -> Result<()> {
+    let collateral = {
+        let live = state.live.lock().await;
+        let Some(runtime) = live.as_ref() else {
+            return Ok(());
+        };
+        if !runtime.status().armed {
+            return Ok(());
+        }
+        runtime.available_collateral()
+    };
+    if collateral <= rust_decimal::Decimal::ZERO {
+        return Ok(());
+    }
+    let intent = {
+        let mut engine = state.engine.lock().await;
+        let intent = engine.live_entry_intent(now, collateral);
+        if intent.is_some() {
+            storage::save(&state.path, &engine.stored)?;
+        }
+        intent
+    };
+    let Some(intent) = intent else {
+        return Ok(());
+    };
+    let mut live = state.live.lock().await;
+    let Some(runtime) = live.as_mut() else {
+        return Ok(());
+    };
+    if runtime.tracks_order(&intent.client_order_id) {
+        return Ok(());
+    }
+    if let Err(error) = runtime.submit(intent, now).await {
+        runtime.disarm();
+        warn!("LIVE Maker 开仓提交失败，已自动 DISARM: {error:#}");
+    }
+    Ok(())
+}
+
 async fn run_feed(feed: BinanceFeed, state: AppState) -> Result<()> {
     let mut retry = 1;
     loop {
@@ -487,6 +530,8 @@ async fn run_feed(feed: BinanceFeed, state: AppState) -> Result<()> {
                                     if engine.on_candle(candle, Utc::now()) {
                                         storage::save(&state.path, &engine.stored)?;
                                     }
+                                    drop(engine);
+                                    submit_live_entry_if_ready(&state, Utc::now()).await?;
                                 }
                                 Err(error) => warn!("REST K 线兜底失败: {error:#}"),
                             }
@@ -499,6 +544,8 @@ async fn run_feed(feed: BinanceFeed, state: AppState) -> Result<()> {
                         if engine.drive(Utc::now()) {
                             storage::save(&state.path, &engine.stored)?;
                         }
+                        drop(engine);
+                        submit_live_entry_if_ready(&state, Utc::now()).await?;
                     }
                     message = socket.next() => match message {
                         Some(Ok(message)) => {
@@ -511,6 +558,8 @@ async fn run_feed(feed: BinanceFeed, state: AppState) -> Result<()> {
                                         if engine.on_candle(candle, Utc::now()) {
                                             storage::save(&state.path, &engine.stored)?;
                                         }
+                                        drop(engine);
+                                        submit_live_entry_if_ready(&state, Utc::now()).await?;
                                     }
                                     Ok(None) => {},
                                     Err(error) => warn!("忽略无效 K 线消息: {error:#}"),

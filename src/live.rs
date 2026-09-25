@@ -17,6 +17,7 @@ pub struct LiveRuntime {
     reconciler: OrderReconciler,
     deduper: EventDeduper,
     safety: LiveSafety,
+    available_collateral: rust_decimal::Decimal,
 }
 
 #[derive(Default)]
@@ -142,6 +143,7 @@ impl LiveRuntime {
             reconciler: OrderReconciler::new(symbol),
             deduper: EventDeduper::new(4_096)?,
             safety: LiveSafety::default(),
+            available_collateral: rust_decimal::Decimal::ZERO,
         })
     }
 
@@ -162,10 +164,15 @@ impl LiveRuntime {
         self.user_stream.close().await
     }
 
-    pub async fn reconcile_account(&mut self) -> Result<()> {
-        self.execution.account().await?;
+    pub async fn reconcile_account(&mut self, margin_asset: &str) -> Result<()> {
+        let account = self.execution.account().await?;
+        self.available_collateral = available_asset_balance(&account, margin_asset)?;
         self.safety.mark_account_reconciled();
         Ok(())
+    }
+
+    pub fn available_collateral(&self) -> rust_decimal::Decimal {
+        self.available_collateral
     }
 
     pub fn arm(&mut self) -> Result<()> {
@@ -247,6 +254,10 @@ impl LiveRuntime {
         self.reconciler.unresolved_client_order_ids()
     }
 
+    pub fn tracks_order(&self, client_order_id: &str) -> bool {
+        self.reconciler.get(client_order_id).is_some()
+    }
+
     pub fn order(&self, client_order_id: &str) -> Option<&crate::order_state::TrackedOrder> {
         self.reconciler.get(client_order_id)
     }
@@ -273,6 +284,25 @@ impl LiveRuntime {
             message,
         }
     }
+}
+
+fn available_asset_balance(account: &Value, asset: &str) -> Result<rust_decimal::Decimal> {
+    let assets = account["assets"]
+        .as_array()
+        .context("Binance 账户响应缺少 assets")?;
+    let item = assets
+        .iter()
+        .find(|item| item["asset"].as_str() == Some(asset))
+        .with_context(|| format!("Binance 账户没有结算资产 {asset}"))?;
+    let value = item["availableBalance"]
+        .as_str()
+        .with_context(|| format!("Binance 账户 {asset} availableBalance 无效"))?;
+    let balance = rust_decimal::Decimal::from_str_exact(value)
+        .with_context(|| format!("Binance 账户 {asset} availableBalance 不是 Decimal"))?;
+    if balance < rust_decimal::Decimal::ZERO {
+        bail!("Binance 账户 {asset} availableBalance 为负数");
+    }
+    Ok(balance)
 }
 
 fn network_from_env() -> Result<BinanceNetwork> {
@@ -326,5 +356,20 @@ mod tests {
         let result = readiness(ExecutionMode::Paper);
         assert!(!result.can_create_runtime);
         assert_eq!(result.mode, ExecutionMode::Paper);
+    }
+
+    #[test]
+    fn account_reconciliation_keeps_settlement_asset_explicit() {
+        let value = serde_json::json!({
+            "assets": [
+                {"asset": "USDT", "availableBalance": "12.50"},
+                {"asset": "USDC", "availableBalance": "3.25"}
+            ]
+        });
+        assert_eq!(
+            available_asset_balance(&value, "USDC").unwrap(),
+            rust_decimal::Decimal::new(325, 2)
+        );
+        assert!(available_asset_balance(&value, "BTC").is_err());
     }
 }
