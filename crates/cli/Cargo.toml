@@ -1,0 +1,33 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rc"
+path = "src/main.rs"
+
+[dependencies]
+domain.workspace = true
+data.workspace = true
+sim.workspace = true
+store.workspace = true
+strategies.workspace = true
+
+rust_decimal.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros = "1"

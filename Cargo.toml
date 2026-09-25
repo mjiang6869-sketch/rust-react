@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/domain", "crates/data", "crates/sim", "crates/store"]
+members = ["crates/domain", "crates/data", "crates/sim", "crates/store", "crates/strategies", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,10 @@ rust-version = "1.85"
 [workspace.dependencies]
 # 内部 crate
 domain = { path = "crates/domain" }
+data = { path = "crates/data" }
+sim = { path = "crates/sim" }
+store = { path = "crates/store" }
+strategies = { path = "crates/strategies" }
 
 # 领域层（零 I/O）
 rust_decimal = { version = "1", features = ["serde-with-str"] }

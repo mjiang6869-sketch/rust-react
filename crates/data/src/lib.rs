@@ -29,11 +29,15 @@
 //! 2. **缺口必须阻断回测。** 跨越缺口会凭空发明不可能的成交。缺口记录在台账里，
 //!    回测必须在存在缺口时拒绝运行。
 
+pub mod download;
 pub mod fixed;
 pub mod manifest;
 pub mod parquet_writer;
 pub mod replay;
 
+pub use download::{
+    DEFAULT_ARCHIVE_BASE, DownloadOutcome, DownloadProgress, Layout, QuietProgress, fetch_partition,
+};
 pub use fixed::{decode_price, decode_rate, encode_price, encode_rate, parse_decimal};
 pub use manifest::{
     CURRENT_SCHEMA_VERSION, DatasetKind, Gap, Manifest, PartitionEntry, PartitionKey,

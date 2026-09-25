@@ -258,6 +258,15 @@ pub fn run(
                     equity -= fee;
                     used_signals.push(entry.placed_at);
 
+                    // markout 观测点：**入场成交**，不是出场。
+                    //
+                    // 逆向选择要回答的问题是"我们被动挂单接住的是不是聪明钱"，
+                    // 那发生在入场那一刻。出场是我们主动决定的时机，测它没有
+                    // 诊断意义——只会把"我们选的出场时机好坏"混进来。
+                    if let Some(m) = compute_markout(tape, now, px, entry.order.side) {
+                        markouts.push(m);
+                    }
+
                     position = Some(OpenPosition {
                         symbol: config.instrument.symbol.clone(),
                         side: entry.order.side,
@@ -381,11 +390,6 @@ pub fn run(
                         exit_reason: kind,
                         pnl,
                     });
-
-                    // markout 观测
-                    if let Some(m) = compute_markout(tape, now, fill_px, pos.side) {
-                        markouts.push(m);
-                    }
 
                     // 若之前止损曾触发但未成交，记录这段裸露
                     if let Some(triggered) = pos.stop_triggered_at {
@@ -675,7 +679,10 @@ pub fn run(
     }
 }
 
-/// 计算一笔成交的 markout。
+/// 计算一笔**被动成交**的 markout。
+///
+/// 调用点是入场成交那一刻——逆向选择要回答的是"我们挂单接住的是不是
+/// 聪明钱"。出场成交的 markout 测不出这个，因为出场时机是我们自己选的。
 ///
 /// 口径：成交后 +1s/+5s/+30s/+5m 的**参考价**相对成交价的变化，已按持仓
 /// 方向取符号（正数 = 对我们有利）。

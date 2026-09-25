@@ -38,17 +38,18 @@ pub fn klines_parquet_path(
         .join("data.parquet")
 }
 
-pub fn agg_trades_parquet_path(
-    root: &Path,
-    symbol: &str,
-    year: i32,
-    month: u32,
-    day: u32,
-) -> PathBuf {
+/// 逐笔成交的 Parquet 路径。
+///
+/// **按月分区**，与下载器的落盘粒度一致（归档本身就是按月提供的 ZIP）。
+/// 按天切分文件会让同一份数据被复制 31 次，浪费磁盘。
+/// 读取时用时间戳过滤行——Parquet 的列统计能让它只解码命中的行组，
+/// 不需要把整月数据都读进内存。
+pub fn agg_trades_parquet_path(root: &Path, symbol: &str, year: i32, month: u32) -> PathBuf {
     root.join("lake")
         .join("agg_trades")
         .join(format!("symbol={symbol}"))
-        .join(format!("date={year}-{month:02}-{day:02}"))
+        .join(format!("year={year}"))
+        .join(format!("month={month:02}"))
         .join("data.parquet")
 }
 
@@ -213,9 +214,9 @@ pub fn load_day(
     }
 
     // 逐笔成交按天分片
-    let tpath = agg_trades_parquet_path(root, symbol, year, month, day);
+    let tpath = agg_trades_parquet_path(root, symbol, year, month);
     if tpath.exists() {
-        slice.trades = read_trades(&tpath)?;
+        slice.trades = read_trades_for_day(&tpath, year, month, day)?;
     }
 
     Ok(slice)
@@ -228,8 +229,8 @@ fn read_candles_for_day(path: &Path, year: i32, month: u32, day: u32) -> Result<
     parquet_reader::read_candles(path, year, month, day)
 }
 
-fn read_trades(path: &Path) -> Result<Vec<AggTrade>> {
-    parquet_reader::read_trades(path)
+fn read_trades_for_day(path: &Path, year: i32, month: u32, day: u32) -> Result<Vec<AggTrade>> {
+    parquet_reader::read_trades(path, year, month, day)
 }
 
 // ---------------------------------------------------------------------------
@@ -316,12 +317,25 @@ mod parquet_reader {
         Ok(out)
     }
 
-    pub fn read_trades(path: &Path) -> Result<Vec<AggTrade>> {
+    /// 读某一天的逐笔成交。
+    ///
+    /// 文件是按月分区的，所以这里读整个月的文件但在行级别过滤到目标日期。
+    /// 逐行过滤（而非依赖 Parquet 的组级跳过）是必要的：一天 45 万行会跨越
+    /// 很多行组，组级统计只能跳过大段不相邻的数据。
+    pub fn read_trades(path: &Path, year: i32, month: u32, day: u32) -> Result<Vec<AggTrade>> {
         let builder = open_reader(path)?;
         let reader = builder
             .with_batch_size(8192)
             .build()
             .context("构造 Parquet reader 失败")?;
+
+        let day_start = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .with_context(|| format!("非法日期 {year}-{month}-{day}"))?
+            .and_hms_opt(0, 0, 0)
+            .with_context(|| format!("非法时间 {year}-{month}-{day}"))?
+            .and_utc()
+            .timestamp_millis();
+        let day_end = day_start + 86_400_000;
 
         let mut out = Vec::new();
         for batch in reader {
@@ -333,6 +347,9 @@ mod parquet_reader {
                 .cloned();
             for row in 0..batch.num_rows() {
                 let ts = i64_at(&batch, trade_cols::TIME, row);
+                if ts < day_start || ts >= day_end {
+                    continue;
+                }
                 let id = i64_at(&batch, trade_cols::TRADE_ID, row);
                 out.push(AggTrade {
                     trade_id: id.max(0) as u64,
@@ -388,9 +405,9 @@ mod tests {
             "{k:?}"
         );
 
-        let t = agg_trades_parquet_path(root, "ETHUSDC", 2026, 8, 15);
+        let t = agg_trades_parquet_path(root, "ETHUSDC", 2026, 8);
         assert!(
-            t.ends_with("lake/agg_trades/symbol=ETHUSDC/date=2026-08-15/data.parquet"),
+            t.ends_with("lake/agg_trades/symbol=ETHUSDC/year=2026/month=08/data.parquet"),
             "{t:?}"
         );
     }
