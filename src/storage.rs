@@ -83,8 +83,8 @@ mod tests {
     fn accepts_legacy_state_without_version_as_current_paper_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ETHUSDC.json");
-        let mut value = serde_json::to_value(Stored::initial("ETHUSDC".to_string(), Utc::now()))
-            .unwrap();
+        let mut value =
+            serde_json::to_value(Stored::initial("ETHUSDC".to_string(), Utc::now())).unwrap();
         value.as_object_mut().unwrap().remove("schema_version");
         value.as_object_mut().unwrap().remove("mode");
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -97,8 +97,8 @@ mod tests {
     fn rejects_unknown_state_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ETHUSDC.json");
-        let mut value = serde_json::to_value(Stored::initial("ETHUSDC".to_string(), Utc::now()))
-            .unwrap();
+        let mut value =
+            serde_json::to_value(Stored::initial("ETHUSDC".to_string(), Utc::now())).unwrap();
         value["schema_version"] = serde_json::json!(CURRENT_SCHEMA_VERSION + 1);
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(load(&path).is_err());
