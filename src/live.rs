@@ -566,7 +566,7 @@ impl LiveRuntime {
                 margin_asset: self.margin_asset.clone(),
                 updated_at: event.event_time,
             });
-            if !self.has_filled_order() {
+            if !self.matches_local_position(side, position.position_amount.abs()) {
                 self.position_alert = true;
                 self.safety.disarm();
                 return Ok(Some(ReconcileAction::Alert));
@@ -577,11 +577,13 @@ impl LiveRuntime {
         Ok(None)
     }
 
-    fn has_filled_order(&self) -> bool {
-        self.submitted.keys().any(|client_order_id| {
-            self.reconciler
-                .get(client_order_id)
-                .is_some_and(|order| order.filled_quantity > Decimal::ZERO)
+    fn matches_local_position(&self, side: crate::model::Side, quantity: Decimal) -> bool {
+        self.submitted.iter().any(|(client_order_id, order)| {
+            order.purpose == crate::execution::OrderPurpose::Entry
+                && order.side == side
+                && self.reconciler.get(client_order_id).is_some_and(|tracked| {
+                    tracked.filled_quantity > Decimal::ZERO && tracked.filled_quantity == quantity
+                })
         })
     }
 }

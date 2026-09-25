@@ -434,6 +434,7 @@ async fn run_backtest(
         .map(|snapshot| (snapshot.open_time, snapshot))
         .collect();
     let backtest_config = BacktestConfig {
+        strategy: config.strategy,
         initial_equity: engine.available_collateral_for_backtest(),
         margin_pct: config.margin_pct,
         leverage: config.leverage,

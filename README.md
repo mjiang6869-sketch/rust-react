@@ -1,6 +1,8 @@
-# Rust Crypto 模拟做市台
+# Rust Crypto 自动交易研究桌面端
 
-独立的 Rust + React 项目。第一阶段复现原 Python 模拟盘的“15 分钟区间突破失败后回踩挂单”策略：用币安公开 1 分钟 K 线生成信号，本地模拟开仓、Maker 止盈与限价止损。**当前不连接交易账户，也不会提交真实订单。**
+Rust + React + Electron 的币安 USDⓈ-M 永续合约交易研究平台。默认使用 PAPER 模式，支持失败突破回踩和缠论中枢回踩策略、K 线/盘口回测、趋势与笔线段中枢标注、只读 AI 会话分析，以及经过账户对账和显式 ARM 的 LIVE Maker-only 执行。
+
+LIVE 真实订单只允许 `LIMIT + GTX` Maker-only，止盈和止损使用 reduce-only 限价保护单；任何超时、断线、未知订单状态或远端持仓不一致都会进入查询、只减仓或 DISARM。不会使用市价单兜底，也不会从 PAPER 自动切换 LIVE。
 
 后续 AI 修改本项目时必须遵守根目录的 [`AGENTS.md`](./AGENTS.md)，其中记录了项目目的、USDT/USDC/TradFi 资产语义、交易安全边界、代码规范、测试和 Git 提交要求。
 
@@ -69,4 +71,4 @@ D1 初始表结构已执行到远端 `rust-crypto-meta`，迁移文件为 `cloud
 
 当前数据契约同时覆盖两类产品：USDC 本位加密永续（例如 `ETHUSDC`）和 TradFi 美股合约（`contract_type = TRADIFI_PERPETUAL`）。两者在 `instruments` 中分别保存 `quote_asset`、`margin_asset`、`settlement_asset`、交易时段与 Maker/Taker 费率；Worker 可通过 `GET /internal/instruments?product_type=crypto_usdc_perpetual` 或 `GET /internal/instruments?product_type=tradfi_equity_perpetual` 查询。USDT 余额对 USDC 合约的共享保证金仍只属于显式多资产模式，不能把两种结算资产写成一个余额。
 
-当前撮合基于最新 K 线价格，尚无真实订单簿、部分成交或交易所排队位置模型。接入真实交易前，需要实现用户数据流、账户保证金与实际费率核验、超时订单对账、完整的订单簿回放及连续纸盘验证。API 目前只绑定本机回环地址且未加登录认证，不能直接对外开放。
+PAPER 撮合支持 K 线触价和可选的最优盘口部分成交模型；它仍不代表真实队列位置、资金费、抵押品折算或强平撮合。LIVE 适配器已实现用户数据流、账户可用余额核验、订单查询恢复和远端持仓对账，但必须使用允许的 endpoint、独立凭据和显式 ARM。API 只绑定本机回环地址且未加登录认证，不能直接对外开放。

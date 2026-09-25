@@ -3,8 +3,8 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-use crate::model::{Candle, Side, Signal, quantize_down};
-use crate::signal::{find_reversal_signal, invalid_reason, risk_reason};
+use crate::model::{Candle, Side, Signal, StrategyKind, quantize_down};
+use crate::signal::{find_strategy_signal, invalid_reason, risk_reason};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -28,6 +28,7 @@ pub struct OrderBookSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct BacktestConfig {
+    pub strategy: StrategyKind,
     pub initial_equity: Decimal,
     pub margin_pct: Decimal,
     pub leverage: Decimal,
@@ -75,6 +76,7 @@ pub struct EquityPoint {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BacktestReport {
+    pub strategy: StrategyKind,
     pub fill_model: FillModel,
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
@@ -203,7 +205,8 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
 
         if position.is_none()
             && pending.is_none()
-            && let Some(signal) = find_reversal_signal(&history, now, config.tick_size)
+            && let Some(signal) =
+                find_strategy_signal(config.strategy, &history, now, config.tick_size)
             && used_signal_at.is_none_or(|used| signal.confirmed_at > used)
         {
             used_signal_at = Some(signal.confirmed_at);
@@ -227,6 +230,7 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
     }
 
     BacktestReport {
+        strategy: config.strategy,
         fill_model: config.fill_model,
         start_time: candles.first().map(|c| c.open_time),
         end_time: candles.last().map(|c| c.open_time),
@@ -334,6 +338,7 @@ mod tests {
 
     fn config() -> BacktestConfig {
         BacktestConfig {
+            strategy: StrategyKind::Retest,
             initial_equity: Decimal::from(10_000),
             margin_pct: Decimal::from(25),
             leverage: Decimal::ONE,
@@ -503,6 +508,7 @@ mod tests {
     fn top_of_book_model_returns_partial_entry_quantity() {
         let start = Utc.with_ymd_and_hms(2026, 9, 24, 7, 0, 0).unwrap();
         let signal = Signal {
+            strategy: StrategyKind::Retest,
             side: Side::Sell,
             entry_price: Decimal::from(100),
             stop_price: Decimal::new(10006, 2),

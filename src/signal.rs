@@ -2,7 +2,20 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 
-use crate::model::{Candle, Side, Signal, quantize_down, quantize_up, quarter_start};
+use crate::analysis::analyze;
+use crate::model::{Candle, Side, Signal, StrategyKind, quantize_down, quantize_up, quarter_start};
+
+pub fn find_strategy_signal(
+    strategy: StrategyKind,
+    candles: &BTreeMap<DateTime<Utc>, Candle>,
+    now: DateTime<Utc>,
+    tick_size: Decimal,
+) -> Option<Signal> {
+    match strategy {
+        StrategyKind::Retest => find_reversal_signal(candles, now, tick_size),
+        StrategyKind::ChanCenter => find_chan_center_signal(candles, now, tick_size),
+    }
+}
 
 pub fn find_reversal_signal(
     candles: &BTreeMap<DateTime<Utc>, Candle>,
@@ -71,6 +84,7 @@ pub fn find_reversal_signal(
                 ),
             };
             signal = Some(Signal {
+                strategy: StrategyKind::Retest,
                 side: direction,
                 entry_price,
                 stop_price,
@@ -83,6 +97,55 @@ pub fn find_reversal_signal(
         }
     }
     signal.filter(|s| now < s.expires_at())
+}
+
+fn find_chan_center_signal(
+    candles: &BTreeMap<DateTime<Utc>, Candle>,
+    _now: DateTime<Utc>,
+    tick_size: Decimal,
+) -> Option<Signal> {
+    if tick_size <= Decimal::ZERO {
+        return None;
+    }
+    let closed: Vec<Candle> = candles
+        .values()
+        .filter(|candle| candle.closed)
+        .cloned()
+        .collect();
+    let latest = closed.last()?;
+    let context = analyze(&closed);
+    let center = context.chan_centers.last()?;
+    let (side, entry_price, stop_price) = match context.direction {
+        crate::analysis::TrendDirection::Up if latest.close > center.high => (
+            Side::Buy,
+            quantize_down(center.high, tick_size),
+            quantize_down(center.low, tick_size) - tick_size,
+        ),
+        crate::analysis::TrendDirection::Down if latest.close < center.low => (
+            Side::Sell,
+            quantize_up(center.low, tick_size),
+            quantize_up(center.high, tick_size) + tick_size,
+        ),
+        _ => return None,
+    };
+    if entry_price <= Decimal::ZERO || stop_price <= Decimal::ZERO {
+        return None;
+    }
+    if matches!(side, Side::Buy) && entry_price >= latest.close
+        || matches!(side, Side::Sell) && entry_price <= latest.close
+    {
+        return None;
+    }
+    Some(Signal {
+        strategy: StrategyKind::ChanCenter,
+        side,
+        entry_price,
+        stop_price,
+        confirmed_at: latest.open_time + Duration::minutes(1),
+        range_start: quarter_start(latest.open_time),
+        range_low: center.low,
+        range_high: center.high,
+    })
 }
 
 pub fn invalid_reason(
@@ -99,6 +162,20 @@ pub fn invalid_reason(
             Some(candle) => candle,
             None => return Some("当前行情不可用，撤销开仓挂单"),
         };
+    if signal.strategy == StrategyKind::ChanCenter {
+        if history
+            .values()
+            .filter(|c| c.open_time >= signal.confirmed_at)
+            .chain(std::iter::once(candle))
+            .any(|c| match signal.side {
+                Side::Buy => c.low <= signal.stop_price || c.close < signal.range_low,
+                Side::Sell => c.high >= signal.stop_price || c.close > signal.range_high,
+            })
+        {
+            return Some("缠论中枢回踩结构已失效");
+        }
+        return None;
+    }
     if history
         .values()
         .filter(|c| c.open_time >= signal.confirmed_at)
@@ -167,6 +244,7 @@ mod tests {
         last.close = Decimal::new(9998, 2);
         let signal = find_reversal_signal(&candles, now, Decimal::new(1, 2)).unwrap();
         assert_eq!(signal.side, Side::Sell);
+        assert_eq!(signal.strategy, StrategyKind::Retest);
         assert_eq!(signal.entry_price, Decimal::from(100));
         assert_eq!(signal.stop_price, Decimal::new(10006, 2));
         assert_eq!(signal.confirmed_at, now);
@@ -195,5 +273,39 @@ mod tests {
         last.close = Decimal::new(9998, 2);
         let signal = find_reversal_signal(&candles, now, Decimal::new(1, 2)).unwrap();
         assert!(invalid_reason(&signal, None, &candles, now).is_some());
+    }
+
+    #[test]
+    fn chan_center_strategy_returns_a_maker_retest_signal() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 24, 8, 0, 0).unwrap();
+        let closes = [
+            100, 102, 110, 102, 100, 90, 100, 105, 115, 105, 100, 95, 105, 110, 120, 110, 105, 100,
+            110, 115, 125, 120, 125,
+        ];
+        let mut candles = BTreeMap::new();
+        for (index, close) in closes.into_iter().enumerate() {
+            let open_time = start + Duration::minutes(index as i64);
+            candles.insert(
+                open_time,
+                Candle {
+                    open_time,
+                    open: Decimal::from(close),
+                    high: Decimal::from(close + 1),
+                    low: Decimal::from(close - 1),
+                    close: Decimal::from(close),
+                    closed: true,
+                },
+            );
+        }
+        let signal = find_strategy_signal(
+            StrategyKind::ChanCenter,
+            &candles,
+            start + Duration::minutes(23),
+            Decimal::new(1, 2),
+        )
+        .expect("synthetic center should produce a signal");
+        assert_eq!(signal.strategy, StrategyKind::ChanCenter);
+        assert_eq!(signal.side, Side::Buy);
+        assert!(signal.entry_price < Decimal::from(125));
     }
 }

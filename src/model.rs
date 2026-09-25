@@ -23,6 +23,14 @@ pub enum Side {
     Sell,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StrategyKind {
+    #[default]
+    Retest,
+    ChanCenter,
+}
+
 impl Side {
     pub fn label(self) -> &'static str {
         match self {
@@ -34,6 +42,8 @@ impl Side {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Signal {
+    #[serde(default)]
+    pub strategy: StrategyKind,
     pub side: Side,
     #[serde(with = "rust_decimal::serde::str")]
     pub entry_price: Decimal,

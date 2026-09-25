@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, shell } from "electron";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 const projectRoot = join(import.meta.dirname, "..");
@@ -9,17 +9,25 @@ const engineCommand = process.env.RUST_CRYPTO_ENGINE ?? (app.isPackaged
   ? packagedEngine
   : join(projectRoot, "target", "debug", "rust-crypto"));
 const rendererUrl = process.env.RUST_CRYPTO_RENDERER_URL ?? "http://127.0.0.1:5174";
-const packagedRenderer = join(projectRoot, "frontend", "dist", "index.html");
 let engine;
 let renderer;
+
+function packagedRenderer() {
+  return join(process.resourcesPath, "frontend", "dist", "index.html");
+}
 
 function startEngine() {
   if (!existsSync(engineCommand)) {
     throw new Error(`Rust engine 不存在：${engineCommand}`);
   }
   engine = spawn(engineCommand, [], {
-    cwd: projectRoot,
-    env: { ...process.env, RUST_CRYPTO_BIND: "127.0.0.1:8080" },
+    cwd: app.isPackaged ? process.resourcesPath : projectRoot,
+    env: {
+      ...process.env,
+      RUST_CRYPTO_BIND: "127.0.0.1:8080",
+      RUST_CRYPTO_STATE_PATH: process.env.RUST_CRYPTO_STATE_PATH
+        ?? join(app.getPath("userData"), "state", "default.json"),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   engine.stdout?.on("data", (chunk) => console.log(`[rust-engine] ${chunk}`));
@@ -69,7 +77,7 @@ function createWindow() {
     },
   });
   if (app.isPackaged) {
-    void window.loadFile(packagedRenderer);
+    void window.loadFile(packagedRenderer());
   } else {
     void window.loadURL(rendererUrl);
   }
@@ -80,9 +88,10 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  if (app.isPackaged && !existsSync(packagedRenderer)) {
-    throw new Error(`打包后的 renderer 不存在：${packagedRenderer}`);
+  if (app.isPackaged && !existsSync(packagedRenderer())) {
+    throw new Error(`打包后的 renderer 不存在：${packagedRenderer()}`);
   }
+  if (app.isPackaged) mkdirSync(join(app.getPath("userData"), "state"), { recursive: true });
   startEngine();
   startRenderer();
   await waitForRenderer();

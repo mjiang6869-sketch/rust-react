@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::execution::{MakerOrder, OrderPurpose};
-use crate::model::{Candle, Side, Signal, quantize_down, quantize_up};
-use crate::signal::{find_reversal_signal, invalid_reason, risk_reason};
+use crate::model::{Candle, Side, Signal, StrategyKind, quantize_down, quantize_up};
+use crate::signal::{find_strategy_signal, invalid_reason, risk_reason};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
@@ -25,6 +25,8 @@ pub struct Config {
     pub contract_type: String,
     pub multi_assets_mode: bool,
     pub enabled: bool,
+    #[serde(default)]
+    pub strategy: StrategyKind,
     #[serde(with = "rust_decimal::serde::str")]
     pub margin_pct: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -54,6 +56,7 @@ impl Config {
             contract_type: "PERPETUAL".to_string(),
             multi_assets_mode: true,
             enabled: false,
+            strategy: StrategyKind::Retest,
             margin_pct: Decimal::from(25),
             leverage: Decimal::ONE,
             stop_pct: Decimal::ONE,
@@ -303,7 +306,12 @@ impl PaperEngine {
         {
             return None;
         }
-        let signal = find_reversal_signal(&self.history, now, self.stored.config.tick_size)?;
+        let signal = find_strategy_signal(
+            self.stored.config.strategy,
+            &self.history,
+            now,
+            self.stored.config.tick_size,
+        )?;
         if signal.confirmed_at <= self.stored.used_signal_at
             || invalid_reason(&signal, self.live.as_ref(), &self.history, now).is_some()
             || risk_reason(
@@ -470,8 +478,12 @@ impl PaperEngine {
             self.status = "策略已关闭".to_string();
             return changed;
         }
-        let Some(signal) = find_reversal_signal(&self.history, now, self.stored.config.tick_size)
-        else {
+        let Some(signal) = find_strategy_signal(
+            self.stored.config.strategy,
+            &self.history,
+            now,
+            self.stored.config.tick_size,
+        ) else {
             self.status = "等待突破失败及一分钟收盘确认".to_string();
             return changed;
         };

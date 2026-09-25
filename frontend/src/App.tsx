@@ -11,6 +11,7 @@ interface Config {
   contract_type: string;
   multi_assets_mode: boolean;
   enabled: boolean;
+  strategy: "RETEST" | "CHAN_CENTER";
   margin_pct: string;
   leverage: string;
   stop_pct: string;
@@ -103,6 +104,7 @@ interface BacktestTrade {
 }
 
 interface BacktestReport {
+  strategy: "RETEST" | "CHAN_CENTER";
   fill_model: "CANDLE_RANGE_TOUCH" | "TOP_OF_BOOK";
   initial_equity: string;
   final_equity: string;
@@ -495,6 +497,10 @@ export default function App() {
                     onChange={(event) => update("multi_assets_mode", event.target.checked)} />
                 </label>
                 <div className="fields">
+                  <label className="field"><span>运行策略</span><select value={draft.strategy} onChange={(event) => update("strategy", event.target.value as Config["strategy"])}>
+                    <option value="RETEST">失败突破回踩</option>
+                    <option value="CHAN_CENTER">缠论中枢回踩</option>
+                  </select><small>两种策略都只生成 Maker 限价订单意图</small></label>
                   <Field label="仓位比例 %" value={draft.margin_pct} onChange={(v) => update("margin_pct", v)} />
                   <Field label="杠杆倍数" value={draft.leverage} onChange={(v) => update("leverage", v)} step="1" />
                   <Field label="止损距离上限 %" value={draft.stop_pct} onChange={(v) => update("stop_pct", v)} />
@@ -540,6 +546,7 @@ export default function App() {
                 <article className="metric"><span>最终权益</span><strong>{number(backtest.final_equity)}</strong></article>
                 <article className="metric"><span>完成交易</span><strong>{backtest.trades.length}</strong></article>
                 <article className="metric"><span>数据缺口</span><strong>{backtest.data_gaps.length}</strong></article>
+                <article className="metric"><span>策略</span><strong>{backtest.strategy === "CHAN_CENTER" ? "缠论中枢" : "失败突破回踩"}</strong></article>
                 <article className="metric"><span>撮合模型</span><strong>{backtest.fill_model === "TOP_OF_BOOK" ? "盘口" : "K 线"}</strong></article>
               </div>
               {backtest.trades.length ? (
