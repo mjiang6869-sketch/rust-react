@@ -159,13 +159,9 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
                 || invalid_reason(&entry.signal, Some(candle), &history, now).is_some()
             {
                 pending_expiries += 1;
-            } else if touches_entry(
-                entry.signal.side,
-                entry.signal.entry_price,
-                entry.quantity,
-                candle,
-                config,
-            ) {
+            } else if let Some(filled_quantity) = entry_fill_quantity(&entry, candle, config)
+                .filter(|quantity| *quantity > Decimal::ZERO)
+            {
                 let ratio = config.take_profit_pct / Decimal::from(100);
                 let target_price = match entry.signal.side {
                     Side::Buy => quantize_down(
@@ -179,13 +175,24 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
                 };
                 position = Some(OpenPosition {
                     side: entry.signal.side,
-                    quantity: entry.quantity,
+                    quantity: filled_quantity,
                     entry_price: entry.signal.entry_price,
                     stop_price: entry.signal.stop_price,
                     target_price,
                     opened_at: now,
                     stop_triggered: false,
                 });
+                let remaining = entry.quantity - filled_quantity;
+                if remaining >= config.min_qty
+                    && remaining * entry.signal.entry_price >= config.min_notional
+                {
+                    pending = Some(PendingEntry {
+                        signal: entry.signal,
+                        quantity: remaining,
+                    });
+                }
+            } else {
+                pending = Some(entry);
             }
         }
 
@@ -227,29 +234,33 @@ pub fn run(candles: &[Candle], config: &BacktestConfig) -> BacktestReport {
     }
 }
 
-fn touches_entry(
-    side: Side,
-    price: Decimal,
-    quantity: Decimal,
+fn entry_fill_quantity(
+    entry: &PendingEntry,
     candle: &Candle,
     config: &BacktestConfig,
-) -> bool {
+) -> Option<Decimal> {
+    let side = entry.signal.side;
+    let price = entry.signal.entry_price;
+    let quantity = entry.quantity;
     let candle_touch = match side {
         Side::Buy => candle.low <= price,
         Side::Sell => candle.high >= price,
     };
     if !candle_touch {
-        return false;
+        return None;
     }
     match config.fill_model {
-        FillModel::CandleRangeTouch => true,
-        FillModel::TopOfBook => config
-            .order_book
-            .get(&candle.open_time)
-            .is_some_and(|book| match side {
-                Side::Buy => book.bid_price >= price && book.bid_quantity >= quantity,
-                Side::Sell => book.ask_price <= price && book.ask_quantity >= quantity,
-            }),
+        FillModel::CandleRangeTouch => Some(quantity),
+        FillModel::TopOfBook => {
+            config
+                .order_book
+                .get(&candle.open_time)
+                .and_then(|book| match side {
+                    Side::Buy if book.bid_price >= price => Some(book.bid_quantity.min(quantity)),
+                    Side::Sell if book.ask_price <= price => Some(book.ask_quantity.min(quantity)),
+                    _ => None,
+                })
+        }
     }
 }
 
@@ -446,5 +457,47 @@ mod tests {
         let mut blocked = config.clone();
         blocked.order_book.get_mut(&entry_time).unwrap().ask_price = Decimal::new(10001, 2);
         assert!(run(&candles, &blocked).trades.is_empty());
+    }
+
+    #[test]
+    fn top_of_book_model_returns_partial_entry_quantity() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 24, 7, 0, 0).unwrap();
+        let signal = Signal {
+            side: Side::Sell,
+            entry_price: Decimal::from(100),
+            stop_price: Decimal::new(10006, 2),
+            confirmed_at: start,
+            range_start: start,
+            range_low: Decimal::new(9940, 2),
+            range_high: Decimal::from(100),
+        };
+        let entry = PendingEntry {
+            signal,
+            quantity: Decimal::new(250, 3),
+        };
+        let candle = Candle {
+            open_time: start,
+            open: Decimal::from(100),
+            high: Decimal::new(10005, 2),
+            low: Decimal::new(9998, 2),
+            close: Decimal::new(9998, 2),
+            closed: true,
+        };
+        let mut config = config();
+        config.fill_model = FillModel::TopOfBook;
+        config.order_book.insert(
+            start,
+            OrderBookSnapshot {
+                open_time: start,
+                bid_price: Decimal::new(9999, 2),
+                bid_quantity: Decimal::new(100, 3),
+                ask_price: Decimal::from(100),
+                ask_quantity: Decimal::new(100, 3),
+            },
+        );
+        assert_eq!(
+            entry_fill_quantity(&entry, &candle, &config),
+            Some(Decimal::new(100, 3))
+        );
     }
 }
