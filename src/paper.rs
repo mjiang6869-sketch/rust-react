@@ -856,6 +856,19 @@ mod tests {
     }
 
     #[test]
+    fn live_entry_intent_uses_explicit_account_collateral() {
+        let (mut engine, now) = setup();
+        engine.stored.mode = ExecutionMode::Live;
+        engine.on_candle(live(now, Decimal::new(9998, 2)), now);
+        let intent = engine
+            .live_entry_intent(now, Decimal::from(100))
+            .expect("fixture should produce a live entry intent");
+        assert_eq!(intent.stop_price, Some(Decimal::new(10006, 2)));
+        assert!(intent.quantity > Decimal::ZERO);
+        assert_eq!(engine.stored.used_signal_at, now);
+    }
+
+    #[test]
     fn single_asset_mode_does_not_use_usdt_for_usdc_contract() {
         let (mut engine, now) = setup();
         engine.stored.config.multi_assets_mode = false;
