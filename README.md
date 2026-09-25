@@ -6,7 +6,21 @@ LIVE 真实订单只允许 `LIMIT + GTX` Maker-only，止盈和止损使用 redu
 
 后续 AI 修改本项目时必须遵守根目录的 [`AGENTS.md`](./AGENTS.md)，其中记录了项目目的、USDT/USDC/TradFi 资产语义、交易安全边界、代码规范、测试和 Git 提交要求。
 
-## 运行
+## 一键运行
+
+需要 Rust 稳定版、Node.js 20+、pnpm 和 curl。首次运行会按需安装前端/Electron 依赖并编译 Rust sidecar：
+
+```sh
+./scripts/run.sh              # 启动 Electron、Rust API 和 Vite
+./scripts/run.sh restart      # 重启全部本地进程
+./scripts/run.sh status       # 查看进程和 API 健康状态
+./scripts/run.sh logs         # 查看 Electron/Rust/Vite 日志
+./scripts/run.sh stop         # 停止本脚本启动的进程
+```
+
+运行目录是 `.runtime/`，不会写入 Git；默认状态文件仍按交易对保存到 `data/`。脚本只停止自己记录的 Electron 进程及其子进程，不会杀掉其他项目或端口上的进程。
+
+## 手动运行
 
 需要 Rust 稳定版、Node.js 20+ 和 pnpm。两个终端分别运行：
 
@@ -67,7 +81,15 @@ pnpm typecheck
 pnpm exec wrangler deploy
 ```
 
-D1 初始表结构已执行到远端 `rust-crypto-meta`，迁移文件为 `cloudflare/d1/001_initial.sql`。Worker 的内部接口需要 `x-rust-crypto-internal-token` 请求头；正式部署前应使用 Wrangler Secret 配置实际令牌，不能写入代码或前端。
+D1 资源、R2 绑定和队列生产者已写入 `cloudflare/worker/wrangler.toml`。本地可运行 `./scripts/run.sh cloudflare-check` 做 Worker 类型检查；远端迁移和部署是显式操作：
+
+```sh
+wrangler secret put RUST_CRYPTO_INTERNAL_TOKEN --config cloudflare/worker/wrangler.toml
+./scripts/run.sh cloudflare-migrate
+./scripts/run.sh cloudflare-deploy
+```
+
+Worker 会把请求头与 `RUST_CRYPTO_INTERNAL_TOKEN` Secret 比对，不能只设置请求头。`cloudflare/d1/002_operational_tables.sql` 补齐了数据缺口和回测运行表。当前 Cloudflare 部分仍是元数据/任务入口：队列消费者、R2 数据下载归档和远端回测 worker 尚未在本仓库实现，因此不能宣称云端历史数据和异步回测链路已全部上线。
 
 当前数据契约同时覆盖两类产品：USDC 本位加密永续（例如 `ETHUSDC`）和 TradFi 美股合约（`contract_type = TRADIFI_PERPETUAL`）。两者在 `instruments` 中分别保存 `quote_asset`、`margin_asset`、`settlement_asset`、交易时段与 Maker/Taker 费率；Worker 可通过 `GET /internal/instruments?product_type=crypto_usdc_perpetual` 或 `GET /internal/instruments?product_type=tradfi_equity_perpetual` 查询。USDT 余额对 USDC 合约的共享保证金仍只属于显式多资产模式，不能把两种结算资产写成一个余额。
 

@@ -4,6 +4,7 @@ interface Env {
   BACKTESTS: R2Bucket;
   DOWNLOAD_QUEUE: Queue<DownloadJob>;
   BACKTEST_QUEUE: Queue<BacktestJob>;
+  RUST_CRYPTO_INTERNAL_TOKEN?: string;
 }
 
 interface DownloadJob {
@@ -21,9 +22,10 @@ interface BacktestJob {
 const json = (body: unknown, status = 200): Response =>
   Response.json(body, { status, headers: { "cache-control": "no-store" } });
 
-const internalTokenMatches = (request: Request): boolean => {
-  const configured = request.headers.get("x-rust-crypto-internal-token");
-  return configured !== null && configured.length > 0;
+const internalTokenMatches = (request: Request, env: Env): boolean => {
+  const provided = request.headers.get("x-rust-crypto-internal-token");
+  const configured = env.RUST_CRYPTO_INTERNAL_TOKEN?.trim();
+  return configured !== undefined && configured.length > 0 && provided === configured;
 };
 
 export default {
@@ -32,8 +34,8 @@ export default {
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ status: "ok", service: "rust-crypto-api" });
     }
-    if (!internalTokenMatches(request)) {
-      return json({ error: "缺少内部服务令牌" }, 401);
+    if (!internalTokenMatches(request, env)) {
+      return json({ error: "内部服务令牌无效" }, 401);
     }
     if (request.method === "GET" && url.pathname === "/internal/datasets") {
       const symbol = url.searchParams.get("symbol");
@@ -62,6 +64,10 @@ export default {
       if (!body.job_id || !body.symbol || !body.interval) {
         return json({ error: "任务字段不完整" }, 400);
       }
+      const existing = await env.META_DB.prepare(
+        "SELECT job_id, status FROM data_jobs WHERE job_id = ?",
+      ).bind(body.job_id).first<{ job_id: string; status: string }>();
+      if (existing) return json(existing, 200);
       await env.META_DB.prepare(
         "INSERT INTO data_jobs (job_id, job_type, status, request_json, created_at, updated_at) VALUES (?, 'download', 'queued', ?, datetime('now'), datetime('now'))",
       ).bind(body.job_id, JSON.stringify(body)).run();
