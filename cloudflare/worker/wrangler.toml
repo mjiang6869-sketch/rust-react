@@ -1,0 +1,27 @@
+name = "rust-crypto-api"
+main = "src/index.ts"
+compatibility_date = "2026-09-25"
+
+[[d1_databases]]
+binding = "META_DB"
+database_name = "rust-crypto-meta"
+database_id = "6d05e351-4b93-415c-bee7-5a4fd6a9fa8c"
+
+[[r2_buckets]]
+binding = "MARKET_DATA"
+bucket_name = "rust-crypto-market-data"
+
+[[r2_buckets]]
+binding = "BACKTESTS"
+bucket_name = "rust-crypto-backtests"
+
+[[queues.producers]]
+binding = "DOWNLOAD_QUEUE"
+queue = "rust-crypto-download"
+
+[[queues.producers]]
+binding = "BACKTEST_QUEUE"
+queue = "rust-crypto-backtest"
+
+[vars]
+ENVIRONMENT = "live"

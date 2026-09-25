@@ -1,6 +1,7 @@
 /target/
 /data/
 /frontend/node_modules/
+/cloudflare/worker/node_modules/
 /frontend/dist/
 /.DS_Store
 **/.DS_Store

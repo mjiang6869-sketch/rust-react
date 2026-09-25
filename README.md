@@ -54,4 +54,17 @@ pnpm build
 
 ## 后续阶段
 
+## Cloudflare 配置
+
+Cloudflare Worker 配置位于 `cloudflare/worker`，绑定当前账户的 D1、R2 和下载队列。首次部署前在 Node.js 22+ 环境执行：
+
+```sh
+cd /Users/mingjiangliu/dev/cryptocurrency/rust-crypto/cloudflare/worker
+pnpm install
+pnpm typecheck
+pnpm exec wrangler deploy
+```
+
+D1 初始表结构已执行到远端 `rust-crypto-meta`，迁移文件为 `cloudflare/d1/001_initial.sql`。Worker 的内部接口需要 `x-rust-crypto-internal-token` 请求头；正式部署前应使用 Wrangler Secret 配置实际令牌，不能写入代码或前端。
+
 当前撮合基于最新 K 线价格，尚无真实订单簿、部分成交或交易所排队位置模型。接入真实交易前，需要实现用户数据流、账户保证金与实际费率核验、超时订单对账、完整的订单簿回放及连续纸盘验证。API 目前只绑定本机回环地址且未加登录认证，不能直接对外开放。
