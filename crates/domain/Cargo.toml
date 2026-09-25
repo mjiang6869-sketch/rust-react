@@ -1,0 +1,16 @@
+[package]
+name = "domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# 领域层硬约束：这里不允许出现 tokio、reqwest、duckdb、axum 或任何 I/O 依赖。
+# CI 会用 `cargo tree -p core` 校验。见 crates/core/README.md。
+[dependencies]
+rust_decimal.workspace = true
+chrono.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros = "1"

@@ -1,0 +1,8 @@
+# 交易数值禁止用浮点。
+#
+# `f32`/`f64` 承载价格、数量、费率或保证金会丢精度，而做市的止盈目标是 bp 级，
+# 浮点误差足以翻转结论。这条规则用编译期检查强制，不依赖代码评审记得检查。
+disallowed-types = [
+  { path = "f32", reason = "交易数值必须用 rust_decimal::Decimal，见 AGENTS.md" },
+  { path = "f64", reason = "交易数值必须用 rust_decimal::Decimal，见 AGENTS.md" },
+]
