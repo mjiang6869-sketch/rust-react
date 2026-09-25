@@ -32,6 +32,7 @@ pub struct TrackedOrder {
     pub exchange_order_id: Option<String>,
     pub expected_quantity: Decimal,
     pub filled_quantity: Decimal,
+    pub average_price: Decimal,
     pub state: RemoteOrderState,
     pub updated_at: DateTime<Utc>,
 }
@@ -79,6 +80,7 @@ impl OrderReconciler {
                 exchange_order_id: None,
                 expected_quantity,
                 filled_quantity: Decimal::ZERO,
+                average_price: Decimal::ZERO,
                 state: RemoteOrderState::PendingSubmit,
                 updated_at: now,
             },
@@ -171,6 +173,8 @@ impl OrderReconciler {
         let state = state_from_binance_status(status).ok_or("订单查询返回未知状态")?;
         order.exchange_order_id = Some(exchange_order_id);
         order.filled_quantity = executed_quantity;
+        order.average_price = Decimal::from_str_exact(response["avgPrice"].as_str().unwrap_or("0"))
+            .unwrap_or(Decimal::ZERO);
         order.updated_at = now;
         order.state = state;
         Ok(action_for_state(state))
@@ -210,6 +214,7 @@ impl OrderReconciler {
             return Ok(Some(ReconcileAction::Alert));
         }
         order.filled_quantity = event.cumulative_filled_quantity;
+        order.average_price = event.average_price;
         order.updated_at = event.event_time;
         order.state = match event.status.as_str() {
             "NEW" => RemoteOrderState::New,

@@ -29,7 +29,7 @@ use crate::ai::{AnalysisRequest, AnalysisResponse};
 use crate::analysis::TrendAnalysis;
 use crate::backtest::{BacktestConfig, BacktestReport, FillModel};
 use crate::feed::{BinanceFeed, parse_ws_candle};
-use crate::live::{LiveReadiness, LiveRuntime, LiveStatus};
+use crate::live::{LiveOrderRules, LiveReadiness, LiveRuntime, LiveStatus};
 use crate::model::Candle;
 use crate::paper::{Config, ExecutionMode, PaperEngine, Snapshot, Stored};
 
@@ -173,12 +173,19 @@ async fn get_live_status(State(state): State<AppState>) -> Json<LiveStatus> {
 }
 
 async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>> {
-    let (symbol, mode, margin_asset) = {
+    let (symbol, mode, margin_asset, rules) = {
         let engine = state.engine.lock().await;
         (
             engine.stored.config.symbol.clone(),
             engine.stored.mode,
             engine.stored.config.margin_asset.clone(),
+            LiveOrderRules {
+                tick_size: engine.stored.config.tick_size,
+                step_size: engine.stored.config.step_size,
+                min_qty: engine.stored.config.min_qty,
+                min_notional: engine.stored.config.min_notional,
+                take_profit_pct: engine.stored.config.take_profit_pct,
+            },
         )
     };
     if mode != ExecutionMode::Live {
@@ -190,7 +197,7 @@ async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatu
     if let Some(runtime) = state.live.lock().await.as_ref() {
         return Ok(Json(runtime.status()));
     }
-    let mut runtime = LiveRuntime::from_env(symbol, mode).map_err(|error| {
+    let mut runtime = LiveRuntime::from_env(symbol, mode, rules).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             format!("创建 LIVE runtime 失败：{error:#}"),
@@ -234,6 +241,24 @@ async fn run_live_supervisor(live: Arc<Mutex<Option<LiveRuntime>>>) {
         let event =
             tokio::time::timeout(Duration::from_secs(1), runtime.next_reconcile_action()).await;
         match event {
+            Ok(Ok(Some(crate::order_state::ReconcileAction::MarkFilled))) => {
+                if let Some(client_order_id) =
+                    runtime.last_event_client_order_id().map(str::to_owned)
+                {
+                    if let Err(error) = runtime
+                        .submit_protection_for(&client_order_id, Utc::now())
+                        .await
+                    {
+                        runtime.disarm();
+                        warn!("LIVE 成交后保护单提交失败，已自动 DISARM: {error:#}");
+                    } else if let Err(error) =
+                        runtime.cancel_protection_sibling(&client_order_id).await
+                    {
+                        runtime.disarm();
+                        warn!("LIVE 保护单互斥撤单失败，已自动 DISARM: {error:#}");
+                    }
+                }
+            }
             Ok(Ok(Some(crate::order_state::ReconcileAction::Alert))) => {
                 runtime.disarm();
                 warn!("LIVE 订单对账异常，已自动 DISARM");
@@ -241,11 +266,25 @@ async fn run_live_supervisor(live: Arc<Mutex<Option<LiveRuntime>>>) {
             Ok(Ok(Some(crate::order_state::ReconcileAction::QueryOrder))) => {
                 let ids = runtime.unresolved_order_ids();
                 for client_order_id in ids {
-                    if let Err(error) = runtime.reconcile_order(&client_order_id, Utc::now()).await
-                    {
-                        runtime.disarm();
-                        warn!("LIVE 订单查询失败，已自动 DISARM: {error:#}");
-                        break;
+                    match runtime.reconcile_order(&client_order_id, Utc::now()).await {
+                        Ok(crate::order_state::ReconcileAction::MarkFilled) => {
+                            if let Err(error) = runtime
+                                .submit_protection_for(&client_order_id, Utc::now())
+                                .await
+                            {
+                                runtime.disarm();
+                                warn!(
+                                    "LIVE 查询确认成交后保护单提交失败，已自动 DISARM: {error:#}"
+                                );
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            runtime.disarm();
+                            warn!("LIVE 订单查询失败，已自动 DISARM: {error:#}");
+                            break;
+                        }
                     }
                 }
             }

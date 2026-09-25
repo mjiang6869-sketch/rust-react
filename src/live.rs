@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::binance::BinanceExecution;
@@ -18,6 +20,19 @@ pub struct LiveRuntime {
     deduper: EventDeduper,
     safety: LiveSafety,
     available_collateral: rust_decimal::Decimal,
+    rules: LiveOrderRules,
+    submitted: HashMap<String, MakerOrder>,
+    protection_pairs: HashMap<String, String>,
+    last_event_client_order_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveOrderRules {
+    pub tick_size: Decimal,
+    pub step_size: Decimal,
+    pub min_qty: Decimal,
+    pub min_notional: Decimal,
+    pub take_profit_pct: Decimal,
 }
 
 #[derive(Default)]
@@ -129,7 +144,7 @@ impl LiveSafety {
 }
 
 impl LiveRuntime {
-    pub fn from_env(symbol: String, mode: ExecutionMode) -> Result<Self> {
+    pub fn from_env(symbol: String, mode: ExecutionMode, rules: LiveOrderRules) -> Result<Self> {
         if mode != ExecutionMode::Live {
             bail!("LIVE runtime 只能在显式 LIVE 模式创建");
         }
@@ -144,6 +159,10 @@ impl LiveRuntime {
             deduper: EventDeduper::new(4_096)?,
             safety: LiveSafety::default(),
             available_collateral: rust_decimal::Decimal::ZERO,
+            rules,
+            submitted: HashMap::new(),
+            protection_pairs: HashMap::new(),
+            last_event_client_order_id: None,
         })
     }
 
@@ -204,6 +223,7 @@ impl LiveRuntime {
                 self.reconciler
                     .submit_ack(&order.client_order_id, exchange_order_id, now)
                     .map_err(anyhow::Error::msg)?;
+                self.submitted.insert(order.client_order_id.clone(), order);
                 Ok(response)
             }
             Err(error) => {
@@ -230,6 +250,7 @@ impl LiveRuntime {
         if !self.deduper.accept(&event) {
             return Ok(None);
         }
+        self.last_event_client_order_id = Some(event.client_order_id.clone());
         self.reconciler
             .apply_event(&event)
             .map_err(anyhow::Error::msg)
@@ -245,9 +266,12 @@ impl LiveRuntime {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ReconcileAction> {
         let response = self.execution.query_order(client_order_id).await?;
-        self.reconciler
+        let action = self
+            .reconciler
             .apply_query_response(client_order_id, &response, now)
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::msg)?;
+        self.last_event_client_order_id = Some(client_order_id.to_string());
+        Ok(action)
     }
 
     pub fn unresolved_order_ids(&self) -> Vec<String> {
@@ -256,6 +280,103 @@ impl LiveRuntime {
 
     pub fn tracks_order(&self, client_order_id: &str) -> bool {
         self.reconciler.get(client_order_id).is_some()
+    }
+
+    pub fn last_event_client_order_id(&self) -> Option<&str> {
+        self.last_event_client_order_id.as_deref()
+    }
+
+    pub async fn submit_protection_for(
+        &mut self,
+        client_order_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let entry = self
+            .submitted
+            .get(client_order_id)
+            .cloned()
+            .context("成交订单不在 LIVE runtime 记录中")?;
+        if entry.purpose != crate::execution::OrderPurpose::Entry {
+            return Ok(());
+        }
+        let tracked = self
+            .reconciler
+            .get(client_order_id)
+            .context("成交订单未登记")?;
+        if tracked.state != crate::order_state::RemoteOrderState::Filled {
+            return Ok(());
+        }
+        let entry_price = if tracked.average_price > Decimal::ZERO {
+            tracked.average_price
+        } else {
+            entry.price
+        };
+        let stop_price = entry.stop_price.context("LIVE 入场订单缺少冻结止损价")?;
+        let ratio = self.rules.take_profit_pct / Decimal::from(100);
+        let target = match entry.side {
+            crate::model::Side::Buy => crate::model::quantize_up(
+                entry_price * (Decimal::ONE + ratio),
+                self.rules.tick_size,
+            ),
+            crate::model::Side::Sell => crate::model::quantize_down(
+                entry_price * (Decimal::ONE - ratio),
+                self.rules.tick_size,
+            ),
+        };
+        let exit_side = match entry.side {
+            crate::model::Side::Buy => crate::model::Side::Sell,
+            crate::model::Side::Sell => crate::model::Side::Buy,
+        };
+        let stop_id = format!("{}:stop", client_order_id);
+        let target_id = format!("{}:tp", client_order_id);
+        let orders = [
+            MakerOrder {
+                client_order_id: stop_id.clone(),
+                purpose: crate::execution::OrderPurpose::StopLoss,
+                side: exit_side,
+                quantity: tracked.filled_quantity,
+                price: stop_price,
+                stop_price: None,
+            },
+            MakerOrder {
+                client_order_id: target_id.clone(),
+                purpose: crate::execution::OrderPurpose::TakeProfit,
+                side: exit_side,
+                quantity: tracked.filled_quantity,
+                price: target,
+                stop_price: None,
+            },
+        ];
+        for order in orders {
+            order
+                .validate(
+                    self.rules.tick_size,
+                    self.rules.step_size,
+                    self.rules.min_qty,
+                    self.rules.min_notional,
+                )
+                .map_err(anyhow::Error::msg)?;
+            self.submit(order, now).await?;
+        }
+        self.protection_pairs.insert(stop_id, target_id);
+        Ok(())
+    }
+
+    pub async fn cancel_protection_sibling(&mut self, client_order_id: &str) -> Result<()> {
+        let sibling = self
+            .protection_pairs
+            .get(client_order_id)
+            .cloned()
+            .or_else(|| {
+                self.protection_pairs
+                    .iter()
+                    .find_map(|(left, right)| (right == client_order_id).then(|| left.clone()))
+            });
+        let Some(sibling) = sibling else {
+            return Ok(());
+        };
+        self.execution.cancel_order(&sibling).await?;
+        Ok(())
     }
 
     pub fn order(&self, client_order_id: &str) -> Option<&crate::order_state::TrackedOrder> {
@@ -325,7 +446,17 @@ mod tests {
 
     #[test]
     fn rejects_paper_mode_before_reading_credentials() {
-        let result = LiveRuntime::from_env("ETHUSDC".to_string(), ExecutionMode::Paper);
+        let result = LiveRuntime::from_env(
+            "ETHUSDC".to_string(),
+            ExecutionMode::Paper,
+            LiveOrderRules {
+                tick_size: Decimal::ONE,
+                step_size: Decimal::ONE,
+                min_qty: Decimal::ONE,
+                min_notional: Decimal::ONE,
+                take_profit_pct: Decimal::ONE,
+            },
+        );
         assert!(result.is_err());
     }
 

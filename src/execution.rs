@@ -24,6 +24,7 @@ pub struct MakerOrder {
     pub side: Side,
     pub quantity: Decimal,
     pub price: Decimal,
+    pub stop_price: Option<Decimal>,
 }
 
 impl MakerOrder {
@@ -102,6 +103,7 @@ mod tests {
             side: Side::Buy,
             quantity: Decimal::new(5, 2),
             price: Decimal::from(100),
+            stop_price: None,
         }
     }
 

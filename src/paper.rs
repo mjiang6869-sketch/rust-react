@@ -329,6 +329,7 @@ impl PaperEngine {
             side: signal.side,
             quantity,
             price: signal.entry_price,
+            stop_price: Some(signal.stop_price),
         };
         if order
             .validate(
@@ -519,6 +520,7 @@ impl PaperEngine {
             side,
             quantity,
             price,
+            stop_price: None,
         };
         if let Err(error) = intent.validate(
             config.tick_size,
@@ -613,6 +615,7 @@ impl PaperEngine {
                 side: exit_side,
                 quantity: position.quantity,
                 price,
+                stop_price: None,
             };
             if let Err(error) = intent.validate(
                 config.tick_size,
