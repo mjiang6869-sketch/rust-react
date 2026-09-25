@@ -6,6 +6,12 @@ RUNTIME_DIR="${RUST_CRYPTO_RUNTIME_DIR:-$ROOT_DIR/.runtime}"
 PID_FILE="$RUNTIME_DIR/electron.pid"
 LOG_FILE="$RUNTIME_DIR/desktop.log"
 
+# macOS 的 rustup 默认把 cargo 放在这里，但 GUI/IDE 启动的 shell 不一定继承该 PATH。
+if [[ -d "$HOME/.cargo/bin" ]]; then
+  PATH="$HOME/.cargo/bin:$PATH"
+  export PATH
+fi
+
 usage() {
   cat <<'EOF'
 用法：scripts/run.sh [start|restart|stop|status|logs|cloudflare-check|cloudflare-migrate|cloudflare-deploy]
