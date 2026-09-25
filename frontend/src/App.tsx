@@ -61,6 +61,27 @@ interface Snapshot {
   status: string;
 }
 
+interface BacktestTrade {
+  side: Side;
+  entry_time: string;
+  entry_price: string;
+  exit_time: string;
+  exit_price: string;
+  quantity: string;
+  exit_reason: "TakeProfit" | "StopLoss";
+  pnl: string;
+  fees: string;
+}
+
+interface BacktestReport {
+  initial_equity: string;
+  final_equity: string;
+  trades: BacktestTrade[];
+  equity_curve: { time: string; equity: string }[];
+  data_gaps: string[];
+  pending_expiries: number;
+}
+
 const kindLabel: Record<OrderKind, string> = {
   entry: "回踩开仓",
   take_profit: "Maker 止盈",
@@ -110,6 +131,8 @@ export default function App() {
   const [draft, setDraft] = useState<Config | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [backtest, setBacktest] = useState<BacktestReport | null>(null);
+  const [backtestBusy, setBacktestBusy] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -163,6 +186,24 @@ export default function App() {
       setError(cause instanceof Error ? cause.message : "停用失败");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const runBacktest = async () => {
+    setBacktestBusy(true);
+    try {
+      const candles = await request<{ open_time: string; open: string; high: string; low: string; close: string; closed: boolean }[]>("/api/history");
+      const result = await request<BacktestReport>("/api/backtest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ candles }),
+      });
+      setBacktest(result);
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "回测失败");
+    } finally {
+      setBacktestBusy(false);
     }
   };
 
@@ -269,6 +310,40 @@ export default function App() {
               </tr>)}</tbody>
             </table></div>
           ) : <p className="empty">暂无模拟订单。</p>}
+        </section>
+
+        <section className="panel backtest-panel">
+          <div className="panel-heading">
+            <h2>最近行情回测</h2>
+            <button className="secondary" disabled={backtestBusy} onClick={() => { void runBacktest(); }}>
+              {backtestBusy ? "计算中…" : "运行回测"}
+            </button>
+          </div>
+          {backtest ? (
+            <>
+              <div className="metrics compact-metrics">
+                <article className="metric"><span>初始权益</span><strong>{number(backtest.initial_equity)}</strong></article>
+                <article className="metric"><span>最终权益</span><strong>{number(backtest.final_equity)}</strong></article>
+                <article className="metric"><span>完成交易</span><strong>{backtest.trades.length}</strong></article>
+                <article className="metric"><span>数据缺口</span><strong>{backtest.data_gaps.length}</strong></article>
+              </div>
+              {backtest.trades.length ? (
+                <div className="table-scroll"><table>
+                  <thead><tr><th>方向</th><th>开仓</th><th>平仓</th><th>原因</th><th>盈亏</th><th>手续费</th></tr></thead>
+                  <tbody>{backtest.trades.map((trade, index) => (
+                    <tr key={`${trade.entry_time}-${index}`}>
+                      <td>{trade.side === "BUY" ? "做多" : "做空"}</td>
+                      <td>{number(trade.entry_price)}</td>
+                      <td>{number(trade.exit_price)}</td>
+                      <td>{trade.exit_reason === "TakeProfit" ? "Maker 止盈" : "限价止损"}</td>
+                      <td>{number(trade.pnl)}</td>
+                      <td>{number(trade.fees)}</td>
+                    </tr>
+                  ))}</tbody>
+                </table></div>
+              ) : <p className="empty">当前历史窗口没有完成交易。</p>}
+            </>
+          ) : <p className="empty">运行回测后显示最近 120 根 K 线的结果。</p>}
         </section>
       </main>
     </div>

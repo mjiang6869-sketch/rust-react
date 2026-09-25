@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
     let router = Router::new()
         .route("/api/health", get(health))
         .route("/api/state", get(get_state))
+        .route("/api/history", get(get_history))
         .route("/api/backtest", post(run_backtest))
         .route("/api/config", put(update_config))
         .route("/api/kill", post(kill))
@@ -113,6 +114,11 @@ async fn health() -> &'static str {
 
 async fn get_state(State(state): State<AppState>) -> Json<Snapshot> {
     Json(state.engine.lock().await.snapshot(Utc::now()))
+}
+
+async fn get_history(State(state): State<AppState>) -> Json<Vec<Candle>> {
+    let engine = state.engine.lock().await;
+    Json(engine.history.values().cloned().collect())
 }
 
 async fn run_backtest(
