@@ -210,6 +210,8 @@ impl LiveRuntime {
                 .map_err(anyhow::Error::msg)?;
             self.submitted
                 .insert(order.client_order_id.clone(), order.clone());
+        }
+        for order in orders {
             let action = self.reconcile_order(&order.client_order_id, now).await?;
             match action {
                 ReconcileAction::MarkFilled => {
@@ -395,8 +397,9 @@ impl LiveRuntime {
         };
         let stop_id = format!("{}:stop", client_order_id);
         let target_id = format!("{}:tp", client_order_id);
-        let orders = [
-            MakerOrder {
+        let mut orders = Vec::new();
+        if !self.submitted.contains_key(&stop_id) {
+            orders.push(MakerOrder {
                 client_order_id: stop_id.clone(),
                 purpose: crate::execution::OrderPurpose::StopLoss,
                 side: exit_side,
@@ -404,8 +407,10 @@ impl LiveRuntime {
                 price: stop_price,
                 stop_price: None,
                 expires_at: None,
-            },
-            MakerOrder {
+            });
+        }
+        if !self.submitted.contains_key(&target_id) {
+            orders.push(MakerOrder {
                 client_order_id: target_id.clone(),
                 purpose: crate::execution::OrderPurpose::TakeProfit,
                 side: exit_side,
@@ -413,8 +418,8 @@ impl LiveRuntime {
                 price: target,
                 stop_price: None,
                 expires_at: None,
-            },
-        ];
+            });
+        }
         for order in orders {
             order
                 .validate(
