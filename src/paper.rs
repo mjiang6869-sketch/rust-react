@@ -283,6 +283,10 @@ impl PaperEngine {
         (gross - reserved).max(Decimal::ZERO)
     }
 
+    pub(crate) fn available_collateral_for_backtest(&self) -> Decimal {
+        self.available_collateral()
+    }
+
     pub fn fresh(&self, now: DateTime<Utc>) -> bool {
         self.feed_connected
             && self

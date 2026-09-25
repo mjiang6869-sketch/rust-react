@@ -1,3 +1,4 @@
+pub mod backtest;
 pub mod execution;
 mod feed;
 mod model;
@@ -18,13 +19,20 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::backtest::{BacktestConfig, BacktestReport, FillModel};
 use crate::feed::{BinanceFeed, parse_ws_candle};
+use crate::model::Candle;
 use crate::paper::{Config, PaperEngine, Snapshot, Stored};
 
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     path: Arc<PathBuf>,
+}
+
+#[derive(serde::Deserialize)]
+struct BacktestRequest {
+    candles: Vec<Candle>,
 }
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
@@ -85,6 +93,7 @@ async fn main() -> Result<()> {
     let router = Router::new()
         .route("/api/health", get(health))
         .route("/api/state", get(get_state))
+        .route("/api/backtest", post(run_backtest))
         .route("/api/config", put(update_config))
         .route("/api/kill", post(kill))
         .with_state(state.clone());
@@ -104,6 +113,34 @@ async fn health() -> &'static str {
 
 async fn get_state(State(state): State<AppState>) -> Json<Snapshot> {
     Json(state.engine.lock().await.snapshot(Utc::now()))
+}
+
+async fn run_backtest(
+    State(state): State<AppState>,
+    Json(request): Json<BacktestRequest>,
+) -> ApiResult<Json<BacktestReport>> {
+    if request.candles.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "回测至少需要一根已收盘 K 线".to_string(),
+        ));
+    }
+    let engine = state.engine.lock().await;
+    let config = &engine.stored.config;
+    let backtest_config = BacktestConfig {
+        initial_equity: engine.available_collateral_for_backtest(),
+        margin_pct: config.margin_pct,
+        leverage: config.leverage,
+        stop_pct: config.stop_pct,
+        take_profit_pct: config.take_profit_pct,
+        maker_fee_pct: config.maker_fee_pct,
+        tick_size: config.tick_size,
+        step_size: config.step_size,
+        min_qty: config.min_qty,
+        min_notional: config.min_notional,
+        fill_model: FillModel::CandleRangeTouch,
+    };
+    Ok(Json(backtest::run(&request.candles, &backtest_config)))
 }
 
 async fn update_config(
