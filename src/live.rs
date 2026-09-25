@@ -37,6 +37,16 @@ pub struct LiveReadiness {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveStatus {
+    pub runtime_created: bool,
+    pub user_stream_connected: bool,
+    pub account_reconciled: bool,
+    pub armed: bool,
+    pub unresolved_order_ids: Vec<String>,
+    pub message: String,
+}
+
 pub fn readiness(mode: ExecutionMode) -> LiveReadiness {
     let endpoint = std::env::var("RUST_CRYPTO_BINANCE_BASE_URL")
         .unwrap_or_else(|_| "https://testnet.binancefuture.com".to_string());
@@ -106,6 +116,14 @@ impl LiveSafety {
 
     pub fn is_armed(&self) -> bool {
         self.armed
+    }
+
+    pub fn user_stream_connected(&self) -> bool {
+        self.user_stream_connected
+    }
+
+    pub fn account_reconciled(&self) -> bool {
+        self.account_reconciled
     }
 }
 
@@ -231,6 +249,29 @@ impl LiveRuntime {
 
     pub fn order(&self, client_order_id: &str) -> Option<&crate::order_state::TrackedOrder> {
         self.reconciler.get(client_order_id)
+    }
+
+    pub fn status(&self) -> LiveStatus {
+        let unresolved_order_ids = self.unresolved_order_ids();
+        let message = if !self.safety.user_stream_connected() {
+            "用户数据流未连接，LIVE 已停用".to_string()
+        } else if !self.safety.account_reconciled() {
+            "用户数据流已连接，等待账户对账".to_string()
+        } else if !self.safety.is_armed() {
+            "账户已对账，等待显式 arm".to_string()
+        } else if !unresolved_order_ids.is_empty() {
+            "LIVE 已 arm，存在待对账订单".to_string()
+        } else {
+            "LIVE 已 arm，当前没有待对账订单".to_string()
+        };
+        LiveStatus {
+            runtime_created: true,
+            user_stream_connected: self.safety.user_stream_connected(),
+            account_reconciled: self.safety.account_reconciled(),
+            armed: self.safety.is_armed(),
+            unresolved_order_ids,
+            message,
+        }
     }
 }
 

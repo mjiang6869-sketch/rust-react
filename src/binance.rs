@@ -107,11 +107,13 @@ impl BinanceExecution {
             "timestamp",
             chrono::Utc::now().timestamp_millis().to_string(),
         ));
-        let mut serializer = Serializer::new(String::new());
-        for (name, value) in &params {
-            serializer.append_pair(name, value);
-        }
-        let query = serializer.finish();
+        let query = {
+            let mut serializer = Serializer::new(String::new());
+            for (name, value) in &params {
+                serializer.append_pair(name, value);
+            }
+            serializer.finish()
+        };
         let signature = sign(&self.api_secret, &query)?;
         let url = format!("{}{path}?{query}&signature={signature}", self.base_url);
         let request = self

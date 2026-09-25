@@ -29,19 +29,25 @@ use crate::ai::{AnalysisRequest, AnalysisResponse};
 use crate::analysis::TrendAnalysis;
 use crate::backtest::{BacktestConfig, BacktestReport, FillModel};
 use crate::feed::{BinanceFeed, parse_ws_candle};
-use crate::live::LiveReadiness;
+use crate::live::{LiveReadiness, LiveRuntime, LiveStatus};
 use crate::model::Candle;
-use crate::paper::{Config, PaperEngine, Snapshot, Stored};
+use crate::paper::{Config, ExecutionMode, PaperEngine, Snapshot, Stored};
 
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     path: Arc<PathBuf>,
+    live: Arc<Mutex<Option<LiveRuntime>>>,
 }
 
 #[derive(serde::Deserialize)]
 struct BacktestRequest {
     candles: Vec<Candle>,
+}
+
+#[derive(serde::Deserialize)]
+struct ModeRequest {
+    mode: ExecutionMode,
 }
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
@@ -98,6 +104,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         engine: Arc::new(Mutex::new(PaperEngine::new(stored))),
         path: Arc::new(path),
+        live: Arc::new(Mutex::new(None)),
     };
     let router = Router::new()
         .route("/api/health", get(health))
@@ -105,9 +112,15 @@ async fn main() -> Result<()> {
         .route("/api/history", get(get_history))
         .route("/api/analysis", get(get_analysis))
         .route("/api/live/readiness", get(get_live_readiness))
+        .route("/api/live/status", get(get_live_status))
+        .route("/api/live/connect", post(connect_live))
+        .route("/api/live/arm", post(arm_live))
+        .route("/api/live/disarm", post(disarm_live))
+        .route("/api/live/close", post(close_live))
         .route("/api/ai/analyze", post(ai_analyze))
         .route("/api/backtest", post(run_backtest))
         .route("/api/config", put(update_config))
+        .route("/api/mode", put(update_mode))
         .route("/api/kill", post(kill))
         .with_state(state.clone());
     let bind = std::env::var("RUST_CRYPTO_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
@@ -142,6 +155,160 @@ async fn get_analysis(State(state): State<AppState>) -> Json<TrendAnalysis> {
 async fn get_live_readiness(State(state): State<AppState>) -> Json<LiveReadiness> {
     let engine = state.engine.lock().await;
     Json(live::readiness(engine.stored.mode))
+}
+
+async fn get_live_status(State(state): State<AppState>) -> Json<LiveStatus> {
+    let live = state.live.lock().await;
+    Json(live.as_ref().map_or_else(
+        || LiveStatus {
+            runtime_created: false,
+            user_stream_connected: false,
+            account_reconciled: false,
+            armed: false,
+            unresolved_order_ids: Vec::new(),
+            message: "LIVE runtime 尚未创建".to_string(),
+        },
+        LiveRuntime::status,
+    ))
+}
+
+async fn connect_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>> {
+    let (symbol, mode) = {
+        let engine = state.engine.lock().await;
+        (engine.stored.config.symbol.clone(), engine.stored.mode)
+    };
+    if mode != ExecutionMode::Live {
+        return Err((
+            StatusCode::CONFLICT,
+            "当前仍是 PAPER 模式，请先显式切换到 LIVE".to_string(),
+        ));
+    }
+    if let Some(runtime) = state.live.lock().await.as_ref() {
+        return Ok(Json(runtime.status()));
+    }
+    let mut runtime = LiveRuntime::from_env(symbol, mode).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("创建 LIVE runtime 失败：{error:#}"),
+        )
+    })?;
+    if let Err(error) = runtime.connect().await {
+        let _ = runtime.close().await;
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("连接 Binance 用户数据流失败：{error:#}"),
+        ));
+    }
+    if let Err(error) = runtime.reconcile_account().await {
+        let _ = runtime.close().await;
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Binance 账户对账失败：{error:#}"),
+        ));
+    }
+    let status = runtime.status();
+    let mut live = state.live.lock().await;
+    if let Some(existing) = live.as_ref() {
+        let existing_status = existing.status();
+        drop(live);
+        let _ = runtime.close().await;
+        return Ok(Json(existing_status));
+    }
+    *live = Some(runtime);
+    let live_for_supervisor = Arc::clone(&state.live);
+    tokio::spawn(run_live_supervisor(live_for_supervisor));
+    Ok(Json(status))
+}
+
+async fn run_live_supervisor(live: Arc<Mutex<Option<LiveRuntime>>>) {
+    let mut last_keepalive = tokio::time::Instant::now();
+    loop {
+        let mut guard = live.lock().await;
+        let Some(runtime) = guard.as_mut() else {
+            return;
+        };
+        let event =
+            tokio::time::timeout(Duration::from_secs(1), runtime.next_reconcile_action()).await;
+        match event {
+            Ok(Ok(Some(crate::order_state::ReconcileAction::Alert))) => {
+                runtime.disarm();
+                warn!("LIVE 订单对账异常，已自动 DISARM");
+            }
+            Ok(Ok(Some(crate::order_state::ReconcileAction::QueryOrder))) => {
+                let ids = runtime.unresolved_order_ids();
+                for client_order_id in ids {
+                    if let Err(error) = runtime.reconcile_order(&client_order_id, Utc::now()).await
+                    {
+                        runtime.disarm();
+                        warn!("LIVE 订单查询失败，已自动 DISARM: {error:#}");
+                        break;
+                    }
+                }
+            }
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(error)) => {
+                runtime.disarm();
+                warn!("LIVE 用户数据流异常，已自动 DISARM: {error:#}");
+            }
+        }
+        if last_keepalive.elapsed() >= Duration::from_secs(20 * 60) {
+            last_keepalive = tokio::time::Instant::now();
+            if let Err(error) = runtime.keepalive().await {
+                runtime.disarm();
+                warn!("LIVE 用户数据流 keepalive 失败，已自动 DISARM: {error:#}");
+            }
+        }
+    }
+}
+
+async fn arm_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>> {
+    let mut live = state.live.lock().await;
+    let runtime = live.as_mut().ok_or((
+        StatusCode::CONFLICT,
+        "LIVE runtime 尚未创建，不能 arm".to_string(),
+    ))?;
+    runtime
+        .arm()
+        .map_err(|error| (StatusCode::CONFLICT, format!("LIVE arm 被拒绝：{error:#}")))?;
+    Ok(Json(runtime.status()))
+}
+
+async fn disarm_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>> {
+    let mut live = state.live.lock().await;
+    let runtime = live
+        .as_mut()
+        .ok_or((StatusCode::CONFLICT, "LIVE runtime 尚未创建".to_string()))?;
+    runtime.disarm();
+    Ok(Json(runtime.status()))
+}
+
+async fn close_live(State(state): State<AppState>) -> ApiResult<Json<LiveStatus>> {
+    let runtime = state.live.lock().await.take();
+    let Some(mut runtime) = runtime else {
+        return Ok(Json(LiveStatus {
+            runtime_created: false,
+            user_stream_connected: false,
+            account_reconciled: false,
+            armed: false,
+            unresolved_order_ids: Vec::new(),
+            message: "LIVE runtime 尚未创建".to_string(),
+        }));
+    };
+    runtime.disarm();
+    runtime.close().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("关闭 LIVE runtime 失败：{error:#}"),
+        )
+    })?;
+    Ok(Json(LiveStatus {
+        runtime_created: false,
+        user_stream_connected: false,
+        account_reconciled: false,
+        armed: false,
+        unresolved_order_ids: Vec::new(),
+        message: "LIVE runtime 已关闭".to_string(),
+    }))
 }
 
 async fn ai_analyze(
@@ -200,6 +367,75 @@ async fn update_config(
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("保存配置失败: {error}"),
+        ));
+    }
+    Ok(Json(engine.snapshot(Utc::now())))
+}
+
+async fn update_mode(
+    State(state): State<AppState>,
+    Json(request): Json<ModeRequest>,
+) -> ApiResult<Json<Snapshot>> {
+    let current_mode = state.engine.lock().await.stored.mode;
+    if current_mode == request.mode {
+        return Ok(Json(state.engine.lock().await.snapshot(Utc::now())));
+    }
+    if request.mode == ExecutionMode::Live
+        && !live::readiness(ExecutionMode::Live).can_create_runtime
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "LIVE 未就绪：请检查允许的 Binance endpoint 和凭据配置".to_string(),
+        ));
+    }
+    let engine = state.engine.lock().await;
+    if engine.stored.position.is_some()
+        || engine.stored.orders.iter().any(|order| {
+            matches!(
+                order.status,
+                crate::paper::OrderStatus::Open | crate::paper::OrderStatus::Triggered
+            )
+        })
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "存在持仓或活动订单，不能切换执行模式".to_string(),
+        ));
+    }
+    drop(engine);
+    if request.mode == ExecutionMode::Paper {
+        let unresolved = state
+            .live
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| runtime.unresolved_order_ids())
+            .unwrap_or_default();
+        if !unresolved.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                "仍有未对账 LIVE 订单，不能切回 PAPER".to_string(),
+            ));
+        }
+        let runtime = state.live.lock().await.take();
+        if let Some(mut runtime) = runtime {
+            runtime.disarm();
+            runtime.close().await.map_err(|error| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("关闭 LIVE runtime 失败：{error:#}"),
+                )
+            })?;
+        }
+    }
+    let mut engine = state.engine.lock().await;
+    let previous = engine.stored.mode;
+    engine.stored.mode = request.mode;
+    if let Err(error) = storage::save(&state.path, &engine.stored) {
+        engine.stored.mode = previous;
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保存执行模式失败：{error}"),
         ));
     }
     Ok(Json(engine.snapshot(Utc::now())))

@@ -71,6 +71,15 @@ interface LiveReadiness {
   message: string;
 }
 
+interface LiveStatus {
+  runtime_created: boolean;
+  user_stream_connected: boolean;
+  account_reconciled: boolean;
+  armed: boolean;
+  unresolved_order_ids: string[];
+  message: string;
+}
+
 interface BacktestTrade {
   side: Side;
   entry_time: string;
@@ -218,6 +227,7 @@ export default function App() {
   const [backtestBusy, setBacktestBusy] = useState(false);
   const [analysis, setAnalysis] = useState<TrendAnalysis | null>(null);
   const [readiness, setReadiness] = useState<LiveReadiness | null>(null);
+  const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
   const [question, setQuestion] = useState("");
   const [conversation, setConversation] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
@@ -226,15 +236,17 @@ export default function App() {
     let active = true;
     const load = async () => {
       try {
-        const [result, trend, liveReadiness] = await Promise.all([
+        const [result, trend, liveReadiness, currentLiveStatus] = await Promise.all([
           request<Snapshot>("/api/state"),
           request<TrendAnalysis>("/api/analysis"),
           request<LiveReadiness>("/api/live/readiness"),
+          request<LiveStatus>("/api/live/status"),
         ]);
         if (!active) return;
         setSnapshot(result);
         setAnalysis(trend);
         setReadiness(liveReadiness);
+        setLiveStatus(currentLiveStatus);
         setDraft((current) => current ?? result.config);
         setError(null);
       } catch (cause) {
@@ -245,6 +257,37 @@ export default function App() {
     const timer = window.setInterval(() => { void load(); }, 2_000);
     return () => { active = false; window.clearInterval(timer); };
   }, []);
+
+  const liveAction = async (path: string) => {
+    setBusy(true);
+    try {
+      const result = await request<LiveStatus>(path, { method: "POST" });
+      setLiveStatus(result);
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "LIVE 操作失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const switchMode = async (mode: "PAPER" | "LIVE") => {
+    setBusy(true);
+    try {
+      const result = await request<Snapshot>("/api/mode", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      setSnapshot(result);
+      setDraft(result.config);
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "切换执行模式失败");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const update = (field: keyof Config, value: string | boolean) => {
     setDraft((current) => current ? { ...current, [field]: value } : current);
@@ -352,6 +395,18 @@ export default function App() {
         <div className="status-line" role="status">{snapshot?.status ?? "正在连接服务…"}</div>
 
         {readiness && <div className="readiness-line" role="status">LIVE 状态：{readiness.message}</div>}
+        <section className="panel live-panel">
+          <div className="panel-heading"><h2>执行模式与 LIVE 安全闸门</h2><span>{liveStatus?.message ?? "尚未读取 LIVE 状态"}</span></div>
+          <div className="live-controls">
+            <button className="secondary" disabled={busy || snapshot?.mode === "PAPER"} onClick={() => { void switchMode("PAPER"); }}>切换 PAPER</button>
+            <button className="secondary" disabled={busy || snapshot?.mode === "LIVE"} onClick={() => { void switchMode("LIVE"); }}>切换 LIVE</button>
+            <button className="secondary" disabled={busy || snapshot?.mode !== "LIVE" || liveStatus?.runtime_created} onClick={() => { void liveAction("/api/live/connect"); }}>连接并对账</button>
+            <button className="primary" disabled={busy || !liveStatus?.runtime_created || liveStatus.armed} onClick={() => { void liveAction("/api/live/arm"); }}>显式 ARM</button>
+            <button className="danger" disabled={busy || !liveStatus?.runtime_created || !liveStatus.armed} onClick={() => { void liveAction("/api/live/disarm"); }}>DISARM</button>
+            <button className="secondary" disabled={busy || !liveStatus?.runtime_created} onClick={() => { void liveAction("/api/live/close"); }}>关闭 LIVE</button>
+          </div>
+          <p className="note">LIVE 只有在用户数据流连接、账户对账并显式 ARM 后才允许提交 Maker 限价单；任何未知订单状态都必须先查询。</p>
+        </section>
 
         <section className="metrics" aria-label="运行概况">
           <article className="metric"><span>最新价格</span><strong>{snapshot?.candle ? number(snapshot.candle.close) : "—"}</strong><small>{snapshot?.candle ? time(snapshot.candle.open_time) : "等待行情"}</small></article>
