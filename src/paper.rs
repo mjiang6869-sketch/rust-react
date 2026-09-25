@@ -3,6 +3,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::execution::{MakerOrder, OrderPurpose};
 use crate::model::{Candle, Side, Signal, quantize_down, quantize_up};
 use crate::signal::{find_reversal_signal, invalid_reason, risk_reason};
 
@@ -93,7 +94,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderKind {
     Entry,
@@ -445,6 +446,22 @@ impl PaperEngine {
         let side = signal.side;
         let price = signal.entry_price;
         let id = signal.id();
+        let intent = MakerOrder {
+            client_order_id: id.clone(),
+            purpose: OrderPurpose::Entry,
+            side,
+            quantity,
+            price,
+        };
+        if let Err(error) = intent.validate(
+            config.tick_size,
+            config.step_size,
+            config.min_qty,
+            config.min_notional,
+        ) {
+            self.status = format!("Maker 开仓订单校验失败：{error}");
+            return changed;
+        }
         self.stored.orders.push(Order {
             id,
             kind: OrderKind::Entry,
@@ -513,10 +530,35 @@ impl PaperEngine {
             Side::Buy => Side::Sell,
             Side::Sell => Side::Buy,
         };
-        for (kind, price) in [
+        let protection = [
             (OrderKind::StopLimit, position.stop_price),
             (OrderKind::TakeProfit, target),
-        ] {
+        ];
+        for &(kind, price) in &protection {
+            let purpose = match kind {
+                OrderKind::StopLimit => OrderPurpose::StopLoss,
+                OrderKind::TakeProfit => OrderPurpose::TakeProfit,
+                OrderKind::Entry => unreachable!("entry is not a protection order"),
+            };
+            let intent = MakerOrder {
+                client_order_id: format!("mm-exit:{}", self.stored.next_order_id),
+                purpose,
+                side: exit_side,
+                quantity: position.quantity,
+                price,
+            };
+            if let Err(error) = intent.validate(
+                config.tick_size,
+                config.step_size,
+                config.min_qty,
+                config.min_notional,
+            ) {
+                self.stored.config.enabled = false;
+                self.status = format!("保护单 Maker 校验失败，已停用策略：{error}");
+                return;
+            }
+        }
+        for &(kind, price) in &protection {
             let id = format!("mm-exit:{}", self.stored.next_order_id);
             self.stored.next_order_id += 1;
             self.stored.orders.push(Order {
