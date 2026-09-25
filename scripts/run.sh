@@ -253,7 +253,7 @@ check_port_free() {
   local owner
   owner="$(port_owner "$port")"
   if [[ -n "$owner" ]]; then
-    bad "$name 端口 $port 已被占用（PID $owner）"
+    bad "$name 端口 $port 已被占用（PID ${owner}）"
     info "  查看占用者：lsof -nP -iTCP:$port -sTCP:LISTEN"
     info "  或换个端口：RUST_CRYPTO_BIND / RUST_CRYPTO_FRONTEND_PORT"
     return 1
@@ -311,7 +311,7 @@ start_rust() {
   local pid
   pid="$(read_pid rust)"
   if is_alive "$pid"; then
-    ok "Rust 服务已在运行（PID $pid）"
+    ok "Rust 服务已在运行（PID ${pid}）"
     return 0
   fi
   clear_pid rust
@@ -323,7 +323,7 @@ start_rust() {
   mkdir -p "$DATA_ROOT"
   local log="$LOG_DIR/rust.log"
 
-  info "启动 Rust 服务（$SYMBOL / $MODE / $BIND）"
+  info "启动 Rust 服务（$SYMBOL / $MODE / ${BIND}）"
   pid="$(spawn_service rust "$log" env \
     RUST_CRYPTO_SYMBOL="$SYMBOL" \
     RUST_CRYPTO_MODE="$MODE" \
@@ -340,14 +340,14 @@ start_rust() {
     clear_pid rust
     return 1
   fi
-  ok "Rust 服务就绪（PID $pid，$API_URL）"
+  ok "Rust 服务就绪（PID ${pid}，${API_URL}）"
 }
 
 start_frontend() {
   local pid
   pid="$(read_pid frontend)"
   if is_alive "$pid"; then
-    ok "前端已在运行（PID $pid）"
+    ok "前端已在运行（PID ${pid}）"
     return 0
   fi
   clear_pid frontend
@@ -356,8 +356,13 @@ start_frontend() {
 
   local log="$LOG_DIR/frontend.log"
 
-  info "启动前端开发服务器（$FRONTEND_URL）"
-  pid="$(spawn_service frontend "$log" \
+  # 把后端地址传给 Vite，而不是让它用硬编码的 8080。
+  #
+  # 端口被占用时用户会换端口（RUST_CRYPTO_BIND），硬编码会让代理指向错的
+  # 地方，而界面上只显示「无法连接后端」——原因看不出来。
+  info "启动前端开发服务器（${FRONTEND_URL} → 代理到 ${API_URL}）"
+  pid="$(spawn_service frontend "$log" env \
+    RUST_CRYPTO_API_URL="$API_URL" \
     pnpm --dir "$ROOT_DIR/frontend" dev --port "$FRONTEND_PORT")"
 
   if ! wait_for_frontend; then
@@ -368,7 +373,7 @@ start_frontend() {
     clear_pid frontend
     return 1
   fi
-  ok "前端就绪（PID $pid，$FRONTEND_URL）"
+  ok "前端就绪（PID ${pid}，${FRONTEND_URL}）"
 }
 
 cmd_build() {
@@ -439,7 +444,7 @@ cmd_stop() {
   for name in frontend rust; do
     pid="$(read_pid "$name")"
     if is_alive "$pid"; then
-      info "  停止 $name（PID $pid）"
+      info "  停止 ${name}（PID ${pid}）"
       kill_group "$pid"
       stopped=$((stopped + 1))
     fi
@@ -459,7 +464,7 @@ cmd_status() {
   for name in rust frontend; do
     pid="$(read_pid "$name")"
     if is_alive "$pid"; then
-      ok "$name 运行中（PID $pid）"
+      ok "$name 运行中（PID ${pid}）"
     else
       bad "$name 未运行"
     fi
@@ -467,7 +472,7 @@ cmd_status() {
 
   step "健康检查"
   if curl -fsS --max-time 2 "$API_URL/api/v1/health" >/dev/null 2>&1; then
-    ok "API 正常（$API_URL）"
+    ok "API 正常（${API_URL}）"
     if curl -fsS --max-time 2 "$API_URL/api/v1/state" 2>/dev/null | python3 -c '
 import json, sys
 d = json.load(sys.stdin)["data"]
@@ -487,9 +492,9 @@ print(f"  成交模型  {d[\"fill_model\"]}")
   fi
 
   if curl -fsS --max-time 2 "$FRONTEND_URL/" >/dev/null 2>&1; then
-    ok "前端可访问（$FRONTEND_URL）"
+    ok "前端可访问（${FRONTEND_URL}）"
   else
-    bad "前端无响应（$FRONTEND_URL）"
+    bad "前端无响应（${FRONTEND_URL}）"
   fi
 
   step "日志文件"
