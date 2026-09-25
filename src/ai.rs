@@ -17,6 +17,7 @@ pub struct AnalysisResponse {
     pub answer: String,
     pub source: &'static str,
     pub generated_at: DateTime<Utc>,
+    pub chart: TrendAnalysis,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +53,7 @@ pub async fn analyze(question: String, context: &TrendAnalysis) -> Result<Analys
             answer: deterministic_answer(question, context),
             source: "local-deterministic",
             generated_at,
+            chart: context.clone(),
         });
     };
     let base_url = std::env::var("RUST_CRYPTO_AI_BASE_URL")
@@ -94,6 +96,7 @@ pub async fn analyze(question: String, context: &TrendAnalysis) -> Result<Analys
         answer,
         source: "openai-compatible",
         generated_at,
+        chart: context.clone(),
     })
 }
 

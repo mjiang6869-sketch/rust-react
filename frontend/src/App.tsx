@@ -120,6 +120,7 @@ interface AiReply {
   answer: string;
   source: string;
   generated_at: string;
+  chart: TrendAnalysis;
 }
 
 const kindLabel: Record<OrderKind, string> = {
@@ -356,6 +357,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: prompt }),
       });
+      setAnalysis(reply.chart);
       setConversation((current) => [...current, { role: "assistant", text: reply.answer }]);
       setError(null);
     } catch (cause) {
