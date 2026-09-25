@@ -4,8 +4,12 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 const projectRoot = join(import.meta.dirname, "..");
-const engineCommand = process.env.RUST_CRYPTO_ENGINE ?? join(projectRoot, "target", "debug", "rust-crypto");
+const packagedEngine = join(process.resourcesPath, "rust-crypto-engine");
+const engineCommand = process.env.RUST_CRYPTO_ENGINE ?? (app.isPackaged
+  ? packagedEngine
+  : join(projectRoot, "target", "debug", "rust-crypto"));
 const rendererUrl = process.env.RUST_CRYPTO_RENDERER_URL ?? "http://127.0.0.1:5174";
+const packagedRenderer = join(projectRoot, "frontend", "dist", "index.html");
 let engine;
 let renderer;
 
@@ -26,7 +30,7 @@ function startEngine() {
 }
 
 function startRenderer() {
-  if (process.env.RUST_CRYPTO_RENDERER_URL) return;
+  if (app.isPackaged || process.env.RUST_CRYPTO_RENDERER_URL) return;
   const pnpm = process.env.RUST_CRYPTO_PNPM ?? "pnpm";
   renderer = spawn(pnpm, ["--dir", join(projectRoot, "frontend"), "dev", "--host", "127.0.0.1", "--port", "5174"], {
     cwd: projectRoot,
@@ -38,7 +42,7 @@ function startRenderer() {
 }
 
 async function waitForRenderer() {
-  if (process.env.RUST_CRYPTO_RENDERER_URL) return;
+  if (app.isPackaged || process.env.RUST_CRYPTO_RENDERER_URL) return;
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
       const response = await fetch(rendererUrl);
@@ -64,7 +68,11 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
-  void window.loadURL(rendererUrl);
+  if (app.isPackaged) {
+    void window.loadFile(packagedRenderer);
+  } else {
+    void window.loadURL(rendererUrl);
+  }
   window.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
     return { action: "deny" };
@@ -72,6 +80,9 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  if (app.isPackaged && !existsSync(packagedRenderer)) {
+    throw new Error(`打包后的 renderer 不存在：${packagedRenderer}`);
+  }
   startEngine();
   startRenderer();
   await waitForRenderer();
