@@ -15,6 +15,52 @@ pub struct LiveRuntime {
     socket: Option<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
     reconciler: OrderReconciler,
     deduper: EventDeduper,
+    safety: LiveSafety,
+}
+
+#[derive(Default)]
+pub struct LiveSafety {
+    user_stream_connected: bool,
+    account_reconciled: bool,
+    armed: bool,
+}
+
+impl LiveSafety {
+    pub fn mark_user_stream_connected(&mut self) {
+        self.user_stream_connected = true;
+        self.account_reconciled = false;
+        self.armed = false;
+    }
+
+    pub fn mark_account_reconciled(&mut self) {
+        self.account_reconciled = true;
+        self.armed = false;
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    pub fn mark_disconnected(&mut self) {
+        self.user_stream_connected = false;
+        self.account_reconciled = false;
+        self.armed = false;
+    }
+
+    pub fn arm(&mut self) -> Result<(), &'static str> {
+        if !self.user_stream_connected {
+            return Err("用户数据流尚未连接，不能进入 LIVE");
+        }
+        if !self.account_reconciled {
+            return Err("账户尚未对账，不能进入 LIVE");
+        }
+        self.armed = true;
+        Ok(())
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
 }
 
 impl LiveRuntime {
@@ -31,12 +77,14 @@ impl LiveRuntime {
             socket: None,
             reconciler: OrderReconciler::new(symbol),
             deduper: EventDeduper::new(4_096)?,
+            safety: LiveSafety::default(),
         })
     }
 
     pub async fn connect(&mut self) -> Result<()> {
         self.user_stream.open().await?;
         self.socket = Some(self.user_stream.connect().await?);
+        self.safety.mark_user_stream_connected();
         Ok(())
     }
 
@@ -46,7 +94,22 @@ impl LiveRuntime {
 
     pub async fn close(&mut self) -> Result<()> {
         self.socket = None;
+        self.safety.mark_disconnected();
         self.user_stream.close().await
+    }
+
+    pub async fn reconcile_account(&mut self) -> Result<()> {
+        self.execution.account().await?;
+        self.safety.mark_account_reconciled();
+        Ok(())
+    }
+
+    pub fn arm(&mut self) -> Result<()> {
+        self.safety.arm().map_err(anyhow::Error::msg)
+    }
+
+    pub fn disarm(&mut self) {
+        self.safety.disarm();
     }
 
     pub async fn submit(
@@ -54,6 +117,9 @@ impl LiveRuntime {
         order: MakerOrder,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Value> {
+        if !self.safety.is_armed() {
+            bail!("LIVE 安全闸门未 arm，拒绝提交订单");
+        }
         self.reconciler
             .register(order.client_order_id.clone(), order.quantity, now)
             .map_err(anyhow::Error::msg)?;
@@ -80,6 +146,7 @@ impl LiveRuntime {
         let socket = self.socket.as_mut().context("LIVE 用户数据流尚未连接")?;
         let Some(message) = socket.next().await else {
             self.socket = None;
+            self.safety.mark_disconnected();
             return Ok(Some(ReconcileAction::Alert));
         };
         let message = message?;
@@ -152,5 +219,18 @@ mod tests {
             network_for_endpoint("https://testnet.binancefuture.com").unwrap(),
             BinanceNetwork::Testnet
         );
+    }
+
+    #[test]
+    fn live_safety_requires_stream_and_account_reconciliation() {
+        let mut safety = LiveSafety::default();
+        assert!(safety.arm().is_err());
+        safety.mark_user_stream_connected();
+        assert!(safety.arm().is_err());
+        safety.mark_account_reconciled();
+        safety.arm().unwrap();
+        assert!(safety.is_armed());
+        safety.disarm();
+        assert!(!safety.is_armed());
     }
 }
