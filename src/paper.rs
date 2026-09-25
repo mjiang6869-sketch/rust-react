@@ -359,6 +359,11 @@ impl PaperEngine {
 
     pub fn drive(&mut self, now: DateTime<Utc>) -> bool {
         let mut changed = false;
+        if self.stored.mode == ExecutionMode::Live {
+            changed |= self.cancel_entries(now);
+            self.status = "LIVE 模式等待独立 runtime 对账，不运行模拟成交".to_string();
+            return changed;
+        }
         if !self.fresh(now) {
             changed |= self.cancel_entries(now);
             self.status = "行情断开或超过 15 秒未更新，暂停开仓".to_string();
@@ -774,6 +779,19 @@ mod tests {
         restarted.seed_history(engine.history.values().cloned().collect());
         restarted.on_candle(live(now, Decimal::new(9998, 2)), now);
         assert_eq!(restarted.stored.orders.len(), 1);
+    }
+
+    #[test]
+    fn live_mode_never_runs_paper_fill_logic() {
+        let (mut engine, now) = setup();
+        engine.stored.mode = ExecutionMode::Live;
+        engine.stored.config.enabled = true;
+        engine.on_candle(live(now, Decimal::from(100)), now);
+        assert!(engine.stored.position.is_none());
+        assert_eq!(
+            engine.status,
+            "LIVE 模式等待独立 runtime 对账，不运行模拟成交"
+        );
     }
 
     #[test]
