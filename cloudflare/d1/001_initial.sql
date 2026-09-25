@@ -1,3 +1,22 @@
+CREATE TABLE IF NOT EXISTS instruments (
+  instrument_id TEXT PRIMARY KEY,
+  venue TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  product_type TEXT NOT NULL,
+  base_asset TEXT NOT NULL,
+  quote_asset TEXT NOT NULL,
+  margin_asset TEXT NOT NULL,
+  settlement_asset TEXT NOT NULL,
+  contract_type TEXT NOT NULL,
+  trading_session_json TEXT NOT NULL,
+  maker_fee_bps TEXT NOT NULL,
+  taker_fee_bps TEXT NOT NULL,
+  status TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS market_datasets (
   dataset_id TEXT PRIMARY KEY,
   venue TEXT NOT NULL,
@@ -29,3 +48,5 @@ CREATE INDEX IF NOT EXISTS idx_market_datasets_lookup
   ON market_datasets (venue, product_type, symbol, interval, start_time_utc);
 CREATE INDEX IF NOT EXISTS idx_data_jobs_status
   ON data_jobs (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_instruments_lookup
+  ON instruments (venue, product_type, symbol, status);

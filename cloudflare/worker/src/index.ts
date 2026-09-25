@@ -46,6 +46,17 @@ export default {
           );
       return json(await query.all());
     }
+    if (request.method === "GET" && url.pathname === "/internal/instruments") {
+      const productType = url.searchParams.get("product_type");
+      const query = productType
+        ? env.META_DB.prepare(
+            "SELECT * FROM instruments WHERE product_type = ? AND status = 'TRADING' ORDER BY symbol",
+          ).bind(productType)
+        : env.META_DB.prepare(
+            "SELECT * FROM instruments WHERE status = 'TRADING' ORDER BY product_type, symbol",
+          );
+      return json(await query.all());
+    }
     if (request.method === "POST" && url.pathname === "/internal/jobs") {
       const body = (await request.json()) as DownloadJob;
       if (!body.job_id || !body.symbol || !body.interval) {

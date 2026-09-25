@@ -67,4 +67,6 @@ pnpm exec wrangler deploy
 
 D1 初始表结构已执行到远端 `rust-crypto-meta`，迁移文件为 `cloudflare/d1/001_initial.sql`。Worker 的内部接口需要 `x-rust-crypto-internal-token` 请求头；正式部署前应使用 Wrangler Secret 配置实际令牌，不能写入代码或前端。
 
+当前数据契约同时覆盖两类产品：USDC 本位加密永续（例如 `ETHUSDC`）和 TradFi 美股合约（`contract_type = TRADIFI_PERPETUAL`）。两者在 `instruments` 中分别保存 `quote_asset`、`margin_asset`、`settlement_asset`、交易时段与 Maker/Taker 费率；Worker 可通过 `GET /internal/instruments?product_type=crypto_usdc_perpetual` 或 `GET /internal/instruments?product_type=tradfi_equity_perpetual` 查询。USDT 余额对 USDC 合约的共享保证金仍只属于显式多资产模式，不能把两种结算资产写成一个余额。
+
 当前撮合基于最新 K 线价格，尚无真实订单簿、部分成交或交易所排队位置模型。接入真实交易前，需要实现用户数据流、账户保证金与实际费率核验、超时订单对账、完整的订单簿回放及连续纸盘验证。API 目前只绑定本机回环地址且未加登录认证，不能直接对外开放。
