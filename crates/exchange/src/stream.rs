@@ -51,11 +51,11 @@ use std::time::{Duration, Instant};
 
 use crate::market::Interval;
 use chrono::{TimeZone, Utc};
-use domain::{AggTrade, BookSnapshot, Candle, Price, Qty};
+use domain::{AggTrade, BookSnapshot, Candle, MarketEvent, Price, Qty};
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::cooldown::{
@@ -74,6 +74,13 @@ pub const DEPTH_LEVELS: u32 = 20;
 
 /// 最近成交保留的笔数。与界面成交流的行数一致（原 REST 轮询也是 30 笔）。
 pub const RECENT_TRADES_CAP: usize = 30;
+
+/// 逐笔事件广播通道的容量。
+///
+/// 活跃交易对每秒大约几十笔成交，4096 条给慢消费者留出数十秒的处理余量；
+/// 超过这个量还跟不上，说明消费者本身卡住了，广播会让它收到
+/// `RecvError::Lagged` 而不是无限占内存。
+pub const EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 /// 推送验证：主机必须在白名单内，且必须是加密连接。
 pub fn stream_endpoint_allowed(url: &str) -> Result<(), ExchangeError> {
@@ -559,6 +566,9 @@ struct Hub {
     config: StreamConfig,
     cooldown: Cooldown,
     feeds: Mutex<HashMap<String, watch::Sender<MarketView>>>,
+    /// 按大写交易对索引的逐笔事件广播。与 `feeds`（按流 key 索引的视图）分开：
+    /// 一个交易对可能有多个周期的 K 线 key，但逐笔事件只需要一份广播。
+    events: Mutex<HashMap<String, broadcast::Sender<MarketEvent>>>,
 }
 
 impl Hub {
@@ -578,6 +588,24 @@ impl Hub {
             feeds.remove(symbol);
         }
         true
+        // 注意：这里不清理 `events` 里对应交易对的广播条目。
+        // 每个交易对最多一个 `broadcast::Sender`，哪怕退役后一直留着，内存开销
+        // 也可忽略；而"该交易对是否还有任何 feed"要跨 kline 各周期 key 判断，
+        // 增加的复杂度换不回什么好处。留空条目由下次 `subscribe_events` 复用。
+    }
+
+    /// 取得（或创建）某个交易对的逐笔事件广播发送端。
+    fn event_sender(&self, symbol: &str) -> broadcast::Sender<MarketEvent> {
+        let Ok(mut events) = self.events.lock() else {
+            // 锁中毒：返回一个孤立的发送端——广播不出去，但不会 panic。
+            tracing::error!(symbol, "行情事件广播表锁中毒");
+            let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+            return tx;
+        };
+        events
+            .entry(symbol.to_string())
+            .or_insert_with(|| broadcast::channel(EVENT_CHANNEL_CAPACITY).0)
+            .clone()
     }
 }
 
@@ -601,6 +629,7 @@ impl MarketStreams {
                 config,
                 cooldown,
                 feeds: Mutex::new(HashMap::new()),
+                events: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -682,6 +711,53 @@ impl MarketStreams {
     pub fn active_feeds(&self) -> usize {
         self.hub.feeds.lock().map(|f| f.len()).unwrap_or(0)
     }
+
+    /// 常驻订阅某个交易对的逐笔事件（成交 + 收盘 K 线），供撮合引擎使用。
+    ///
+    /// 只要返回的 [`EventFeed`] 没被丢弃，`Depth`/`Trades`/`Kline` 三条上游
+    /// 连接就不会因为"没有 watch 订阅者"而被 [`Hub::retire`]：`EventFeed`
+    /// 内部持有对应的 `watch::Receiver`。
+    ///
+    /// 顺序很关键：内部先拿 broadcast 接收端，再启动上游连接，这样"启动完成
+    /// 到调用方真正开始接收"之间不会有事件被丢——broadcast 通道在接收端存在
+    /// 期间会一直缓冲，不像 watch 那样只留最新值。
+    pub fn subscribe_events(&self, symbol: &str, interval: Interval) -> EventFeed {
+        let key = symbol.to_ascii_uppercase();
+        let events = self.hub.event_sender(&key).subscribe();
+        let trades = self.subscribe(symbol);
+        let klines = self.subscribe_klines(symbol, interval);
+        EventFeed {
+            events,
+            trades,
+            klines,
+        }
+    }
+}
+
+/// 引擎等常驻消费者的逐笔事件订阅。
+///
+/// 持有它期间，对应交易对的成交流与 K 线流上游都会保持打开（见
+/// [`MarketStreams::subscribe_events`]）；丢弃它之后，若没有其它订阅者，
+/// 上游会在宽限期后照常关闭。
+pub struct EventFeed {
+    /// 逐笔事件：新成交、以及收盘的 K 线。慢消费者会收到
+    /// `RecvError::Lagged(n)`——调用方必须显式处理（例如记一次告警并继续读
+    /// 下一条），不能静默吞掉，否则会悄悄漏成交而不自知。
+    pub events: broadcast::Receiver<MarketEvent>,
+    /// 成交 + 盘口视图。这里只用它的 `trades_link` 状态和"保持上游打开"的
+    /// 作用，不建议再直接读 `trades`——逐笔数据应该从 `events` 读。
+    pub trades: watch::Receiver<MarketView>,
+    /// K 线视图。同上，只用 `kline_link` 状态和保活作用。
+    pub klines: watch::Receiver<MarketView>,
+}
+
+impl EventFeed {
+    /// 成交流与 K 线流上游是否都在正常收数据。盘口状态不影响这个判断——
+    /// 引擎不使用盘口。
+    pub fn is_live(&self) -> bool {
+        self.trades.borrow().trades_link == LinkState::Live
+            && self.klines.borrow().kline_link == LinkState::Live
+    }
 }
 
 /// 等到没有订阅者、且宽限期过去仍然没有，再返回。
@@ -757,11 +833,16 @@ async fn connect_once(config: &StreamConfig, url: &str) -> Result<WsStream, Conn
 }
 
 /// 读一条连接直到它断开。返回断开原因。
+///
+/// `events` 承载逐笔广播：成交只在真正写入（非重复）时广播，K 线只在收盘时
+/// 广播——未收盘的更新很频繁，引擎也用不上，不该占广播通道的名额。发送时
+/// 没有接收者会返回 `Err`，这里直接忽略（没有常驻订阅者是正常状态）。
 async fn pump(
     ws: &mut WsStream,
     kind: StreamKind,
     symbol: &str,
     tx: &watch::Sender<MarketView>,
+    events: &broadcast::Sender<MarketEvent>,
     idle: Duration,
 ) -> String {
     // 同一条连接上的解析失败只 warn 一次：格式变了会每 250ms 失败一次，
@@ -797,19 +878,31 @@ async fn pump(
                 });
             }),
             StreamKind::Trades => parse_agg_trade(text.as_str()).map(|trade| {
+                // `send_if_modified` 的闭包不能直接返回给外层，借一个局部变量
+                // 记住"这笔是否真的新写入"，闭包结束后再决定要不要广播。
+                let mut is_new = false;
                 tx.send_if_modified(|v| {
                     let was_live = v.trades_link == LinkState::Live;
                     v.trades_link = LinkState::Live;
-                    v.push_trade(trade) || !was_live
+                    is_new = v.push_trade(trade);
+                    is_new || !was_live
                 });
+                if is_new {
+                    let _ = events.send(MarketEvent::AggTrade(trade));
+                }
             }),
             StreamKind::Kline(interval) => {
                 parse_kline_event(text.as_str(), symbol, interval).map(|candle| {
+                    let mut is_new = false;
                     tx.send_if_modified(|v| {
                         let was_live = v.kline_link == LinkState::Live;
                         v.kline_link = LinkState::Live;
-                        v.push_candle(candle) || !was_live
+                        is_new = v.push_candle(candle.clone());
+                        is_new || !was_live
                     });
+                    if is_new && candle.candle.closed {
+                        let _ = events.send(MarketEvent::Kline(candle.candle));
+                    }
                 })
             }
         };
@@ -835,6 +928,8 @@ async fn run_link(
     let config = &hub.config;
     let url = stream_url(&config.base, kind, &symbol);
     let mut backoff = Backoff::new(config.backoff_initial, config.backoff_max);
+    // 广播发送端按交易对（不是按流 key）索引，depth/trades/kline 共用一份。
+    let events = hub.event_sender(&symbol);
     let retire = until_unused(&hub, &key, &tx);
     tokio::pin!(retire);
 
@@ -873,7 +968,7 @@ async fn run_link(
                 let started = Instant::now();
                 let idle = config.idle_timeout(kind);
                 let reason = tokio::select! {
-                    r = pump(&mut ws, kind, &symbol, &tx, idle) => r,
+                    r = pump(&mut ws, kind, &symbol, &tx, &events, idle) => r,
                     _ = &mut retire => {
                         let _ = ws.close(None).await;
                         break;
@@ -1279,6 +1374,142 @@ mod tests {
         })
         .await
         .expect("无人订阅后上游应关闭");
+    }
+
+    // ---- 逐笔事件广播 ----
+
+    /// 本地假推送服务的变体：每条连接依次发送给定的一串帧，然后保持连接。
+    /// 三条上游连接（Depth/Trades/Kline）都会收到同一串帧——不相关的帧对应
+    /// 连接会解析失败并被丢弃，这与 `fake_stream_server` 是同一个思路。
+    async fn fake_frame_server(frames: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定本地端口");
+        let addr = listener.local_addr().expect("本地地址");
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let frames = frames.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else {
+                        return;
+                    };
+                    for frame in &frames {
+                        let _ = ws.send(Message::Text(frame.as_str().into())).await;
+                    }
+                    while let Some(Ok(_)) = ws.next().await {}
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn recv_event(
+        rx: &mut broadcast::Receiver<MarketEvent>,
+    ) -> Result<MarketEvent, broadcast::error::RecvError> {
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("等待广播事件超时")
+    }
+
+    /// 常驻订阅能收到假上游发出的那一笔成交。
+    #[tokio::test]
+    async fn event_feed_receives_each_new_trade() {
+        let (base, _conns) = fake_stream_server().await;
+        let streams = MarketStreams::with_config(StreamConfig::local_test(base), Cooldown::new());
+        let mut feed = streams.subscribe_events("ETHUSDC", Interval::M15);
+
+        let event = recv_event(&mut feed.events).await.expect("应能收到事件");
+        assert_eq!(
+            event,
+            MarketEvent::AggTrade(parse_agg_trade(TRADE_FRAME).unwrap())
+        );
+    }
+
+    /// 同一笔成交（trade_id 不变）重连或重复推送时不应重复广播；只有 id 更大
+    /// 的新成交才会广播。
+    #[tokio::test]
+    async fn duplicate_trades_are_not_rebroadcast() {
+        let next_trade = TRADE_FRAME.replace("\"a\":42", "\"a\":43");
+        let base = fake_frame_server(vec![
+            TRADE_FRAME.to_string(),
+            TRADE_FRAME.to_string(),
+            next_trade,
+        ])
+        .await;
+        let streams = MarketStreams::with_config(StreamConfig::local_test(base), Cooldown::new());
+        let mut feed = streams.subscribe_events("ETHUSDC", Interval::M15);
+
+        let first = recv_event(&mut feed.events).await.expect("第一笔");
+        let second = recv_event(&mut feed.events).await.expect("第二笔");
+        let ids: Vec<u64> = [first, second]
+            .into_iter()
+            .map(|e| match e {
+                MarketEvent::AggTrade(t) => t.trade_id,
+                other => panic!("应只广播成交事件，实际 {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![42, 43], "重复的 42 不应再次出现");
+    }
+
+    /// 未收盘的 K 线更新不广播；只有收盘那一帧才广播，且 closed == true。
+    #[tokio::test]
+    async fn only_closed_klines_are_broadcast() {
+        let closed = KLINE_FRAME
+            .replace("\"x\":false", "\"x\":true")
+            .replace("\"E\":1790354340200", "\"E\":1790354340300");
+        let base = fake_frame_server(vec![KLINE_FRAME.to_string(), closed]).await;
+        let streams = MarketStreams::with_config(StreamConfig::local_test(base), Cooldown::new());
+        let mut feed = streams.subscribe_events("ETHUSDC", Interval::M15);
+
+        let event = recv_event(&mut feed.events)
+            .await
+            .expect("应能收到收盘 K 线");
+        match event {
+            MarketEvent::Kline(candle) => assert!(candle.closed, "只应广播收盘 K 线"),
+            other => panic!("应是 Kline 事件，实际 {other:?}"),
+        }
+        // 之后没有更多事件——未收盘帧没有被广播，收盘帧只广播一次。
+        let timed_out = tokio::time::timeout(Duration::from_millis(200), feed.events.recv())
+            .await
+            .is_err();
+        assert!(timed_out, "不应再收到额外的 K 线事件");
+    }
+
+    /// `EventFeed` 存在期间上游保持打开；丢弃它之后，若没有其它订阅者，
+    /// 上游最终会像普通订阅者退光一样关闭。
+    #[tokio::test]
+    async fn event_feed_keeps_upstream_alive_until_dropped() {
+        let (base, _conns) = fake_stream_server().await;
+        let streams = MarketStreams::with_config(StreamConfig::local_test(base), Cooldown::new());
+
+        let feed = streams.subscribe_events("ETHUSDC", Interval::M15);
+        let plain = streams.subscribe("ETHUSDC");
+        assert_eq!(streams.active_feeds(), 2, "成交+盘口 与 K 线各一份");
+
+        drop(plain);
+        // 宽限期之后普通订阅者已经清空，但常驻的 EventFeed 还在，上游不应关闭。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(streams.active_feeds(), 2, "EventFeed 应继续让上游保持打开");
+
+        drop(feed);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while streams.active_feeds() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("EventFeed 释放后上游应关闭");
+    }
+
+    /// 两条上游都活着时 `is_live()` 为真。
+    #[tokio::test]
+    async fn event_feed_is_live_once_both_links_are_live() {
+        let (base, _conns) = fake_stream_server().await;
+        let streams = MarketStreams::with_config(StreamConfig::local_test(base), Cooldown::new());
+        let mut feed = streams.subscribe_events("ETHUSDC", Interval::M15);
+        wait_for(&mut feed.trades, |v| v.trades_link == LinkState::Live).await;
+        wait_for(&mut feed.klines, |v| v.kline_link == LinkState::Live).await;
+        assert!(feed.is_live());
     }
 
     /// 握手被 429 拒绝：冷却必须被点亮（REST 也会一起停），且视图显示冷却中。

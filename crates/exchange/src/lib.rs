@@ -47,6 +47,7 @@ pub use error::ExchangeError;
 pub use market::{Interval, KlineRow};
 pub use signing::{Credentials, SignError, endpoint_allowed, sign, signed_query, timestamp_ms};
 pub use stream::{
-    DEPTH_LEVELS, LinkState, MarketStreams, MarketView, PRODUCTION_STREAM_URL, RECENT_TRADES_CAP,
-    StreamConfig, StreamKind, stream_endpoint_allowed, stream_url,
+    DEPTH_LEVELS, EVENT_CHANNEL_CAPACITY, EventFeed, LinkState, MarketStreams, MarketView,
+    PRODUCTION_STREAM_URL, RECENT_TRADES_CAP, StreamConfig, StreamKind, stream_endpoint_allowed,
+    stream_url,
 };

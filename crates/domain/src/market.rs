@@ -84,7 +84,8 @@ impl BookSnapshot {
 /// 喂给策略与撮合引擎的行情事件。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MarketEvent {
-    /// 已收盘或正在形成的 K 线。
+    /// 已收盘或正在形成的 K 线。`at()` 对已收盘的 K 线返回收盘时刻，
+    /// 而非开盘时刻——见 `at()` 的文档。
     Kline(Candle),
     /// 逐笔成交。M1 成交模型的主要输入。
     AggTrade(AggTrade),
@@ -98,8 +99,15 @@ pub enum MarketEvent {
 
 impl MarketEvent {
     /// 事件时刻。
+    ///
+    /// K 线的时刻取决于是否已收盘：已收盘的 K 线在**收盘时刻**才真正可知
+    /// （用 `close_time()`），若按开盘时刻当"现在"，策略在一分钟开头就能
+    /// 看到整分钟的收盘数据，等同于偷看未来；模拟盘里挂单成交判定也会被
+    /// 记早一分钟。仍在形成中的 K 线（`closed == false`）本就代表"当前
+    /// 未完成的一分钟"，继续用开盘时刻。
     pub fn at(&self) -> DateTime<Utc> {
         match self {
+            MarketEvent::Kline(c) if c.closed => c.close_time(),
             MarketEvent::Kline(c) => c.open_time,
             MarketEvent::AggTrade(t) => t.at,
             MarketEvent::Book(b) => b.at,
@@ -177,6 +185,39 @@ mod tests {
         assert!(!candle.is_trade(), "K 线触价不能作为成交依据");
 
         assert!(MarketEvent::AggTrade(trade(1, dec!(100), false)).is_trade());
+    }
+
+    /// 已收盘 K 线只有在收盘时刻才真正可知，`at()` 必须返回收盘时刻，
+    /// 否则策略/撮合会在一分钟开头就看到整分钟的收盘数据。
+    #[test]
+    fn closed_kline_at_is_close_time() {
+        let open_time = Utc::now();
+        let candle = MarketEvent::Kline(Candle {
+            open_time,
+            open: dec!(100),
+            high: dec!(110),
+            low: dec!(90),
+            close: dec!(105),
+            volume: dec!(10),
+            closed: true,
+        });
+        assert_eq!(candle.at(), open_time + chrono::Duration::minutes(1));
+    }
+
+    /// 未收盘 K 线代表"当前未完成的一分钟"，`at()` 仍用开盘时刻。
+    #[test]
+    fn unclosed_kline_at_is_open_time() {
+        let open_time = Utc::now();
+        let candle = MarketEvent::Kline(Candle {
+            open_time,
+            open: dec!(100),
+            high: dec!(110),
+            low: dec!(90),
+            close: dec!(105),
+            volume: dec!(10),
+            closed: false,
+        });
+        assert_eq!(candle.at(), open_time);
     }
 
     #[test]

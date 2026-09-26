@@ -351,6 +351,9 @@ export interface RawCandle {
   close: string
   volume: string
   closed: boolean
+  /** 后端计算：收减开、相对开盘价的百分数；兼容旧服务时显示占位符。 */
+  change?: string
+  change_percent?: string | null
 }
 
 export interface KlinesResponse {

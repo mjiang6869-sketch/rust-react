@@ -85,9 +85,13 @@ impl FillOutcome {
 /// 数据是显式的，也不会出现"模型偷偷用了未来数据"。
 pub struct FillContext<'a> {
     pub order: &'a Order,
-    /// 订单挂出之后的成交带（只含挂单时刻之后的数据，防止偷看未来）。
+    /// 成交带。**调用方可以传整条带**——模型自己会按 `placed_at` 过滤
+    /// （见 `TradeTape::after`），所以挂单之前的成交不会被当成证据。这样
+    /// 设计是因为调用方（尤其是模拟盘）持有的往往是一条滚动的历史带，
+    /// 让每个调用方自己截断既容易出错也是重复劳动。
     pub tape: &'a TradeTape,
-    /// 订单挂出的时刻。
+    /// 订单挂出的时刻。模型只信任 `>= placed_at` 的成交，防止用挂单之前
+    /// 已经发生的成交给新挂单捏造一次"立即成交"。
     pub placed_at: DateTime<Utc>,
     /// 我们用这个 tick 做价格比较。价格必须按 tick 对齐后比较，
     /// 否则 `3199.999` 会因为浮点式的理由不等于 `3200`。
@@ -134,9 +138,11 @@ impl FillModel for M0WickTouchFull {
 
     fn evaluate(&self, ctx: &FillContext<'_>) -> FillOutcome {
         // 只要成交带里有任何一笔成交触及或穿过我们的限价，就视为全额成交。
+        // 只看挂单之后的成交（含挂单时刻）——挂单之前发生的触价不能让新
+        // 挂单立即成交，那是偷看过去的假成交。
         let limit = ctx.order.limit_price.get();
         let side = ctx.order.side;
-        for t in ctx.tape.trades() {
+        for t in ctx.tape.after(ctx.placed_at) {
             let touched = match side {
                 // 买单：价格跌到我们的限价或更低
                 Side::Buy => t.price.get() <= limit,
@@ -213,7 +219,9 @@ impl FillModel for M1TradeThroughQueue {
         // 累计"队列前方"已消化的成交量。
         let mut consumed = Decimal::ZERO;
 
-        for t in ctx.tape.trades() {
+        // 只看挂单之后的成交（含挂单时刻）——挂单之前的成交已经发生在
+        // 队列里，不能替新挂单充当"排到我了"的证据。
+        for t in ctx.tape.after(ctx.placed_at) {
             let price = t.price.get();
 
             // 判定这笔成交是否打到了我们所在的价位。
@@ -330,6 +338,43 @@ mod tests {
         assert_eq!(out.quantity_for(&o), dec!(1), "M0 给全额");
     }
 
+    /// M0 不能拿挂单之前已经发生的成交当成交证据，否则新挂单会被
+    /// "过去的一笔旧成交"立即成交——那是偷看过去制造的假成交。
+    #[test]
+    fn m0_ignores_trades_before_placed_at() {
+        let o = order(OrderPurpose::Entry, Side::Buy, dec!(3200), dec!(1));
+        // 触价的成交发生在挂单之前
+        let t = tape(vec![trade(dec!(3199.99), dec!(0.01), true, T0)]);
+        let ctx = FillContext {
+            order: &o,
+            tape: &t,
+            placed_at: chrono::DateTime::from_timestamp_millis(T0 + 1).unwrap(),
+            tick_size: dec!(0.01),
+        };
+        assert_eq!(
+            M0WickTouchFull.evaluate(&ctx),
+            FillOutcome::None,
+            "挂单之前的旧成交不能让新挂单成交"
+        );
+    }
+
+    /// 挂单之后（含挂单时刻）发生的同样触价成交则正常成交。
+    #[test]
+    fn m0_fills_on_touch_at_or_after_placed_at() {
+        let o = order(OrderPurpose::Entry, Side::Buy, dec!(3200), dec!(1));
+        let t = tape(vec![trade(dec!(3199.99), dec!(0.01), true, T0)]);
+        let ctx = FillContext {
+            order: &o,
+            tape: &t,
+            placed_at: chrono::DateTime::from_timestamp_millis(T0).unwrap(),
+            tick_size: dec!(0.01),
+        };
+        assert!(
+            M0WickTouchFull.evaluate(&ctx).is_filled(),
+            "挂单时刻及之后的触价仍应成交"
+        );
+    }
+
     /// **这是 M0 与 M1 的核心分歧点。**
     ///
     /// 成交价停在我们的价位之上（3199 从未被触及），但 K 线 wick 可能触到过。
@@ -368,6 +413,25 @@ mod tests {
         let out = M1TradeThroughQueue::default().evaluate(&ctx);
         assert!(out.is_filled());
         assert_eq!(out.price_or(dec!(0)), dec!(3200), "以我们的限价成交");
+    }
+
+    /// M1 同样不能拿挂单之前已经发生的成交当成交证据。
+    #[test]
+    fn m1_ignores_trades_before_placed_at() {
+        let o = order(OrderPurpose::Entry, Side::Buy, dec!(3200), dec!(1));
+        // 打到我们价位、方向也对，但发生在挂单之前
+        let t = tape(vec![trade(dec!(3200), dec!(0.5), true, T0)]);
+        let ctx = FillContext {
+            order: &o,
+            tape: &t,
+            placed_at: chrono::DateTime::from_timestamp_millis(T0 + 1).unwrap(),
+            tick_size: dec!(0.01),
+        };
+        assert_eq!(
+            M1TradeThroughQueue::default().evaluate(&ctx),
+            FillOutcome::None,
+            "挂单之前的旧成交不能让新挂单成交"
+        );
     }
 
     /// 关键的方向检查：我们挂买单，但成交是**买方主动**在低位吃单——

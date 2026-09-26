@@ -1,5 +1,5 @@
 /* 交易工作台：14px 正文，4/8px 间距节奏，10px 控件 / 16px 卡片。
- * 交易数值用等宽字体；涨跌保留红涨绿跌，并以文字或符号补充。
+ * 交易数值用等宽字体；涨跌使用绿涨红跌，并以文字或符号补充。
  * 语义颜色集中定义，canvas 图表也从这些变量读取主题。
  */
 :root {
@@ -14,8 +14,13 @@
   --text: #dce3ee;
   --text-dim: #9ba9bc;
   --text-bright: #f4f7fc;
-  --pos: #ff858a;
-  --neg: #53d6ad;
+  --pos: #35c99a;
+  --neg: #f47883;
+  --chart-bg: #101722;
+  --chart-grid: #1b2635;
+  --chart-text: #a6b4c8;
+  --chart-crosshair: #73849c;
+  --chart-label: #34445c;
   --warn: #efc27b;
   --info: #9dbbff;
   --accent: #9dbbff;
@@ -24,15 +29,15 @@
   --danger-soft: #342027;
   --success-soft: #18362f;
   --warn-soft: #2c261e;
-  --ask-bar: #ff858a16;
-  --bid-bar: #53d6ad16;
+  --ask-bar: #f478831a;
+  --bid-bar: #35c99a1a;
   --radius: 10px;
   --radius-lg: 16px;
   --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
   --sans:
     -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
     'Microsoft YaHei', sans-serif;
-  --sidebar-w: 208px;
+  --sidebar-w: 80px;
 }
 .app-live {
   --accent: #ff999d;
@@ -180,13 +185,14 @@ small,
   flex-direction: column;
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
-  padding: 28px 16px 20px;
+  padding: 24px 10px;
 }
 .sidebar-brand {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 0 8px 36px;
+  justify-content: center;
+  padding: 0 0 24px;
 }
 .brand-mark {
   width: 36px;
@@ -200,7 +206,7 @@ small,
   border-radius: 11px;
 }
 .brand-copy {
-  display: flex;
+  display: none;
   flex-direction: column;
   gap: 2px;
 }
@@ -216,15 +222,11 @@ small,
   letter-spacing: 0.15em;
   color: var(--text-dim);
 }
-.nav-caption,
 .eyebrow {
   font-size: 11px;
   font-weight: 500;
   color: var(--text-dim);
   letter-spacing: 0.1em;
-}
-.nav-caption {
-  padding: 0 12px 12px;
 }
 .sidebar-nav {
   display: flex;
@@ -233,8 +235,11 @@ small,
 }
 .nav-item {
   display: flex;
+  flex-direction: column;
+  justify-content: center;
   align-items: center;
-  gap: 12px;
+  gap: 6px;
+  font-size: 12px;
   min-height: 46px;
   padding: 12px;
   border: 1px solid transparent;
@@ -256,45 +261,6 @@ small,
 .nav-icon {
   display: flex;
   flex-shrink: 0;
-}
-.nav-indicator {
-  width: 5px;
-  height: 5px;
-  margin-left: auto;
-  border-radius: 50%;
-  background: var(--accent);
-}
-.sidebar-bottom {
-  margin-top: auto;
-  padding-top: 32px;
-}
-.sidebar-note {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 16px 12px;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  font-size: 12px;
-  color: var(--text);
-}
-.sidebar-note svg {
-  color: var(--accent);
-  flex-shrink: 0;
-  margin-top: 2px;
-}
-.sidebar-note small {
-  display: block;
-  margin-top: 4px;
-  color: var(--text-dim);
-}
-.sidebar-version {
-  display: flex;
-  justify-content: space-between;
-  padding: 20px 8px 0;
-  font-size: 11px;
-  color: var(--text-dim);
 }
 .content {
   flex: 1;
@@ -398,9 +364,9 @@ small,
   background: var(--accent-soft);
 }
 .mode-live {
-  color: var(--pos);
+  color: var(--neg);
   background: var(--danger-soft);
-  box-shadow: 0 0 0 1px var(--pos);
+  box-shadow: 0 0 0 1px var(--neg);
 }
 .topbar-stats {
   display: flex;
@@ -434,7 +400,7 @@ small,
   white-space: nowrap;
 }
 .status-ok {
-  color: var(--neg);
+  color: var(--pos);
 }
 .status-bad {
   color: var(--text-dim);
@@ -467,10 +433,10 @@ small,
 .banner-error,
 .banner-danger {
   background: var(--danger-soft);
-  color: var(--pos);
+  color: var(--neg);
 }
 .banner-danger {
-  border-left: 4px solid var(--pos);
+  border-left: 4px solid var(--neg);
 }
 .banner-info {
   background: var(--accent-soft);
@@ -664,6 +630,8 @@ small,
   font-weight: 600;
 }
 .chart-canvas {
+  background: var(--chart-bg);
+  border-block: 1px solid var(--border);
   position: relative;
 }
 .chart-placeholder {
@@ -684,7 +652,7 @@ small,
 .chart-error {
   padding: 12px 20px;
   background: var(--danger-soft);
-  color: var(--pos);
+  color: var(--neg);
   font-size: 12px;
   overflow-wrap: anywhere;
 }
@@ -750,11 +718,11 @@ small,
 .book-bid .book-bar {
   background: var(--bid-bar);
 }
-.book-ask .book-price,
+.book-bid .book-price,
 .tape-BUY .tape-price {
   color: var(--pos);
 }
-.book-bid .book-price,
+.book-ask .book-price,
 .tape-SELL .tape-price {
   color: var(--neg);
 }
@@ -783,7 +751,7 @@ small,
   padding-bottom: 12px;
 }
 .mid-tight {
-  color: var(--neg);
+  color: var(--pos);
 }
 .mid-normal {
   color: var(--text-bright);
@@ -829,16 +797,16 @@ small,
 .primary.buy {
   background: var(--pos);
   border-color: var(--pos);
-  color: #281318;
+  color: #0b211b;
 }
 .primary.sell {
   background: var(--neg);
   border-color: var(--neg);
-  color: #0c2920;
+  color: #281318;
 }
 .danger {
-  color: var(--pos);
-  border-color: var(--pos);
+  color: var(--neg);
+  border-color: var(--neg);
   background: var(--danger-soft);
 }
 .primary:hover:not(:disabled) {
@@ -1026,12 +994,12 @@ input::placeholder {
   font-weight: 600;
 }
 .segmented .seg-buy {
-  background: var(--danger-soft);
+  background: var(--success-soft);
   color: var(--pos);
   border-color: var(--pos);
 }
 .segmented .seg-sell {
-  background: var(--success-soft);
+  background: var(--danger-soft);
   color: var(--neg);
   border-color: var(--neg);
 }
@@ -1134,7 +1102,7 @@ input::placeholder {
 }
 .notice-error {
   background: var(--danger-soft);
-  color: var(--pos);
+  color: var(--neg);
 }
 .notice-info {
   background: var(--accent-soft);
@@ -1204,7 +1172,7 @@ input::placeholder {
   color: var(--accent);
 }
 .rung-filled .rung-status-state {
-  color: var(--neg);
+  color: var(--pos);
 }
 .data-layout,
 .backtest-layout {
@@ -1327,13 +1295,13 @@ tbody tr:hover {
   white-space: nowrap;
 }
 .tag-ok,
-.side-sell {
-  color: var(--neg);
+.side-buy {
+  color: var(--pos);
   background: var(--success-soft);
 }
 .tag-bad,
-.side-buy {
-  color: var(--pos);
+.side-sell {
+  color: var(--neg);
   background: var(--danger-soft);
 }
 .tag-warn {
@@ -1356,9 +1324,6 @@ tbody tr:hover {
   }
 }
 @media (max-width: 1400px) {
-  :root {
-    --sidebar-w: 184px;
-  }
   .content {
     padding: 24px;
   }
@@ -1388,27 +1353,6 @@ tbody tr:hover {
   }
 }
 @media (max-width: 1100px) {
-  :root {
-    --sidebar-w: 76px;
-  }
-  .sidebar {
-    padding-inline: 12px;
-  }
-  .sidebar-brand {
-    justify-content: center;
-    padding-inline: 0;
-  }
-  .brand-copy,
-  .nav-caption,
-  .nav-label,
-  .nav-indicator,
-  .sidebar-bottom {
-    display: none;
-  }
-  .nav-item {
-    justify-content: center;
-    padding: 12px;
-  }
   .data-layout,
   .backtest-layout {
     grid-template-columns: minmax(300px, 0.9fr) minmax(0, 1fr);
@@ -1631,11 +1575,6 @@ tbody tr:hover {
 }
 
 /* 紧凑交易终端：主要屏幕空间留给 K 线，账户统计保留在总览。 */
-.app-market { --sidebar-w: 76px; }
-.app-market .sidebar { padding-inline: 12px; }
-.app-market .sidebar-brand, .app-market .nav-item { justify-content: center; padding-inline: 0; }
-.app-market .brand-copy, .app-market .nav-caption, .app-market .nav-label,
-.app-market .nav-indicator, .app-market .sidebar-bottom { display: none; }
 .app-market .content { padding: 12px; }
 .app-market .footer { padding: 8px 16px; }
 .market-selector { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
@@ -1663,7 +1602,6 @@ tbody tr:hover {
 .activity-tabs button[aria-selected='true'] { color: var(--text-bright); border-bottom-color: var(--accent); }
 .activity-count { margin-left: 6px; font-family: var(--mono); color: var(--text-dim); }
 .activity-symbol { margin-left: auto; }
-.activity-toggle { display: flex; align-items: center; gap: 4px; background: transparent; border: 0; color: var(--text-dim); padding: 10px 4px; white-space: nowrap; }
 .activity-panel .panel { border: 0; border-radius: 0; box-shadow: none; }
 .activity-panel .panel > .panel-head:first-child, .activity-panel .panel > h2 { display: none; }
 .activity-panel .panel > p.muted { min-height: 100px; display: grid; place-items: center; margin: 0; }
@@ -1690,6 +1628,22 @@ tbody tr:hover {
   .activity-heading { gap: 8px; padding-inline: 8px; }
   .activity-tabs { gap: 12px; }
   .activity-symbol { display: none; }
-  .activity-toggle { margin-left: auto; }
   .app-market .chart-canvas { height: 420px; }
 }
+
+/* 数据条独立于画布，不遮挡蜡烛和鼠标交互。 */
+.chart-host { display: flex; flex-direction: column; width: 100%; }
+.chart-plot { flex: 1; min-height: 0; }
+.chart-details { padding: 8px 12px; border-bottom: 1px solid var(--chart-grid); font-size: 12px; }
+.chart-details-heading { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--text-dim); }
+.chart-details-values { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 4px 0 0; }
+.chart-details-values > div { display: flex; gap: 6px; }
+.chart-details-values dt { color: var(--text-dim); }
+.chart-details-values dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+
+.chart-details-values .candle-open { color: var(--info); }
+.chart-details-values .candle-high { color: var(--pos); }
+.chart-details-values .candle-low { color: var(--neg); }
+.chart-details-values .candle-close { color: var(--warn); }
+.chart-details-values dt { color: inherit; }
+.chart-details-values .candle-volume { color: var(--text-dim); }

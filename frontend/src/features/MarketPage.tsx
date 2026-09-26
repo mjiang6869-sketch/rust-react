@@ -1,7 +1,7 @@
 // 交易行情页：图表 + 盘口 + 手动下单。
 //
 // # 布局
-// 桌面将图表、盘口、下单并排，持仓与委托合并为可折叠标签区。
+// 桌面将图表、盘口、下单并排，持仓与委托合并为标签区。
 // 窄屏依次排列图表、盘口、持仓与下单，保持各面板可读。
 //
 // # 图表数据与引擎状态是两条独立的流
@@ -143,6 +143,7 @@ function MarketWorkspace({ engine, hasPosition, symbol }: MarketPageProps & { sy
 
         <div className="chart-canvas">
           <ChartHost
+            rawCandles={klines.rawCandles}
             candles={klines.candles}
             lastCandle={klines.lastCandle}
             levels={levels}

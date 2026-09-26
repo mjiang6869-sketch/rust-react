@@ -85,8 +85,10 @@ pub struct DaySlice {
 impl DaySlice {
     /// 归并为按时间排序的事件流。
     ///
-    /// 归并规则：同一毫秒时**成交先于 K 线**。理由是 K 线代表一段时间，
-    /// 那一刻收盘的 K 线应当在该时刻的成交之后被策略看到。
+    /// 归并规则：同一时刻**成交先于 K 线**。K 线的 `at()` 现在是**收盘
+    /// 时刻**（见 `MarketEvent::at()`），所以"同一时刻"通常发生在
+    /// 某根 K 线收盘、恰好也是某笔成交的时刻——那一刻收盘的 K 线应当在
+    /// 该时刻的成交之后被策略看到。
     ///
     /// 这个顺序不是细节——反了会让策略在决策时把"尚未发生的成交"当成
     /// 已知信息，等价于偷看未来。
@@ -415,7 +417,8 @@ mod tests {
     /// **这是回放正确性的核心测试**：同一时刻的成交必须先于 K 线。
     ///
     /// 顺序反了会让策略在 K 线收盘时把"尚未发生的成交"当成已知信息，
-    /// 等价于偷看未来。
+    /// 等价于偷看未来。K 线的 `at()` 是收盘时刻，所以这里让 K 线的
+    /// 开盘时刻比成交时刻早 1 分钟，让二者的收盘时刻/成交时刻重合。
     #[test]
     fn trades_are_ordered_before_candles_at_the_same_instant() {
         let t = Utc
@@ -424,7 +427,7 @@ mod tests {
             .unwrap();
         let slice = DaySlice {
             candles: vec![Candle {
-                open_time: t,
+                open_time: t - chrono::Duration::minutes(1),
                 open: dec!(3200),
                 high: dec!(3210),
                 low: dec!(3190),
@@ -478,7 +481,63 @@ mod tests {
 
         let events = slice.into_events();
         assert_eq!(events[0].at(), t0, "更早的事件排前面");
-        assert_eq!(events[1].at(), t1);
+        // K 线的 at() 是收盘时刻（open_time + 1 分钟），不是开盘时刻 t1。
+        assert_eq!(events[1].at(), t1 + chrono::Duration::minutes(1));
+    }
+
+    /// 同一分钟内（开盘之后、收盘之前）发生的成交，必须全部排在该分钟
+    /// 收盘 K 线之前——因为它们发生时 K 线尚未收盘，策略还不知道收盘价。
+    #[test]
+    fn trades_within_the_minute_sort_before_its_closing_candle() {
+        let open_time = Utc
+            .timestamp_millis_opt(1_785_542_400_000)
+            .single()
+            .unwrap();
+        let close_time = open_time + chrono::Duration::minutes(1);
+        let slice = DaySlice {
+            candles: vec![Candle {
+                open_time,
+                open: dec!(3200),
+                high: dec!(3210),
+                low: dec!(3190),
+                close: dec!(3205),
+                volume: dec!(100),
+                closed: true,
+            }],
+            trades: vec![
+                AggTrade {
+                    trade_id: 1,
+                    price: Price::new(dec!(3200)),
+                    quantity: Qty::new(dec!(1)),
+                    is_buyer_maker: true,
+                    at: open_time,
+                },
+                AggTrade {
+                    trade_id: 2,
+                    price: Price::new(dec!(3205)),
+                    quantity: Qty::new(dec!(1)),
+                    is_buyer_maker: false,
+                    at: open_time + chrono::Duration::seconds(30),
+                },
+                AggTrade {
+                    trade_id: 3,
+                    price: Price::new(dec!(3205)),
+                    quantity: Qty::new(dec!(1)),
+                    is_buyer_maker: false,
+                    at: close_time,
+                },
+            ],
+        };
+
+        let events = slice.into_events();
+        assert_eq!(events.len(), 4);
+        for (i, e) in events.iter().take(3).enumerate() {
+            assert!(
+                matches!(e, MarketEvent::AggTrade(_)),
+                "第 {i} 个事件应是成交，实际是 {e:?}"
+            );
+        }
+        assert!(matches!(events[3], MarketEvent::Kline(_)));
     }
 
     #[test]

@@ -7,11 +7,14 @@
 //! 3. 打开 SQLite 并执行迁移（版本不符则拒绝启动）
 //! 4. 完整性检查（孤儿成交、未知状态订单）
 //! 5. 构造引擎与 API 状态
-//! 6. 启动 HTTP 服务
+//! 6. 后台启动引擎行情喂送（连接币安成交流与 1m K 线、拉历史 K 线预热）
+//! 7. 启动 HTTP 服务
 //!
-//! **启动时不做网络请求**——不拉 exchangeInfo 也不连 WebSocket。理由：网络
-//! 不可用不应该阻止服务启动（否则离线时连界面都打不开），而合约规则与行情
-//! 连接是后续的独立步骤，界面会显示它们的就绪状态。
+//! **启动过程本身不做同步网络请求，不会因为网络不可用而阻塞或失败**——
+//! 不拉 exchangeInfo，也不等 WebSocket 握手完成。第 6 步虽然会连网，但整个
+//! 过程都在后台任务里跑：`api::engine_feed::spawn` 立即返回，真正的连接、
+//! 重试、预热都在其后台任务中异步进行。网络不可用时服务仍能正常起来，
+//! 界面会显示行情未连接，而不是无法打开。
 //!
 //! # 安全边界
 //!
@@ -127,6 +130,11 @@ async fn main() -> Result<()> {
 
     let state = api::AppState::new(engine::PaperEngine::new(config), conn, data_root.clone());
     state.set_mode(mode).await;
+
+    // ---- 引擎行情喂送 ----
+    // 后台连接币安成交流与 1m K 线，并用历史 K 线预热策略窗口；不阻塞启动。
+    println!("引擎行情：后台连接币安 {symbol} 成交流与 1m K 线");
+    api::engine_feed::spawn(state.clone());
 
     // ---- 路由 ----
     let app = api::router(state.clone()).layer(tower_http::trace::TraceLayer::new_for_http());

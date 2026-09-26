@@ -1,14 +1,12 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronUp } from 'lucide-react'
 
 import type { EngineState } from '../api/types'
 import { OrdersPanel } from './OrdersPanel'
 import { PositionCard } from './PositionCard'
 
-/** 引擎实际持仓与委托独立于看盘交易对，折叠只改变显示。 */
+/** 引擎实际持仓与委托独立于看盘交易对。 */
 export function TradingActivity({ engine }: { engine: EngineState }) {
   const [tab, setTab] = useState('positions')
-  const [expanded, setExpanded] = useState(true)
   const tabs = [
     { id: 'positions', label: '当前持仓', count: engine.position === null ? 0 : 1 },
     { id: 'orders', label: '当前委托', count: engine.open_orders.length },
@@ -22,7 +20,7 @@ export function TradingActivity({ engine }: { engine: EngineState }) {
             <button type="button" key={item.id} role="tab" id={`tab-${item.id}`}
               aria-controls={`activity-${item.id}`} aria-selected={tab === item.id}
               tabIndex={tab === item.id ? 0 : -1}
-              onClick={() => { setTab(item.id); setExpanded(true) }}
+              onClick={() => setTab(item.id)}
               onKeyDown={(event) => {
                 let next = index
                 if (event.key === 'ArrowRight') next = (index + 1) % tabs.length
@@ -34,7 +32,6 @@ export function TradingActivity({ engine }: { engine: EngineState }) {
                 const id = tabs[next]?.id
                 if (id) {
                   setTab(id)
-                  setExpanded(true)
                   document.getElementById(`tab-${id}`)?.focus()
                 }
               }}>
@@ -43,13 +40,8 @@ export function TradingActivity({ engine }: { engine: EngineState }) {
           ))}
         </div>
         <span className="head-note activity-symbol">{engine.symbol}</span>
-        <button type="button" className="activity-toggle" aria-expanded={expanded}
-          aria-controls="activity-body" onClick={() => setExpanded((value) => !value)}>
-          {expanded ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
-          {expanded ? '折叠' : '展开'}
-        </button>
       </div>
-      <div id="activity-body" hidden={!expanded}>
+      <div id="activity-body">
         <div role="tabpanel" id="activity-positions" aria-labelledby="tab-positions" hidden={tab !== 'positions'} tabIndex={0}>
           <PositionCard position={engine.position} symbol={engine.symbol} compact />
         </div>

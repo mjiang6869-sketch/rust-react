@@ -7,25 +7,31 @@
 //
 // 用户手动缩放到某段区间后，如果每次数据刷新都 `fitContent`，视图会跳回
 // 全览——这是行情软件最让人恼火的体验之一。所以只在**首次加载**和**换周期**
-// 时自适应，后续刷新保持用户当前的缩放。
+// 时显示最近 100 根，后续刷新保持用户当前的缩放。
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   CandlestickSeries,
+  CrosshairMode,
   HistogramSeries,
   createChart,
   type IChartApi,
   type ISeriesApi,
+  type MouseEventParams,
   type UTCTimestamp,
   TickMarkType,
   type Time,
 } from 'lightweight-charts'
 
-import type { CandleBar } from '../api/types'
+import type { CandleBar, RawCandle } from '../api/types'
+import { signedStr } from '../api/decimal'
+import { pnlClass } from '../format'
 import { OrderLines } from './orderLines'
 import { chartUpdatePlan } from './chartUpdate'
 
 export interface ChartHostProps {
+  /** 悬停展示保留原始字符串，不从图表浮点数反向生成价格。 */
+  rawCandles: RawCandle[]
   /** 已收盘的 K 线。 */
   candles: CandleBar[]
   /** 当前正在形成的一根（`closed: false`）。画成动态的。 */
@@ -39,6 +45,7 @@ export interface ChartHostProps {
 }
 
 export function ChartHost({
+  rawCandles,
   candles,
   lastCandle,
   levels,
@@ -46,6 +53,16 @@ export function ChartHost({
   height = 460,
   historyReady = true,
 }: ChartHostProps) {
+  const [hovered, setHovered] = useState<{ key: string; time: number } | null>(null)
+  const activeKeyRef = useRef(intervalKey)
+  useEffect(() => {
+    activeKeyRef.current = intervalKey
+    setHovered(null)
+  }, [intervalKey])
+  const selected = hovered?.key === intervalKey
+    ? rawCandles.find((bar) => bar.time === hovered.time)
+    : undefined
+  const details = selected ?? rawCandles.at(-1)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
@@ -65,13 +82,14 @@ export function ChartHost({
     // Canvas 读取同一套语义色，避免 K 线与盘口的涨跌颜色不一致。
     const style = getComputedStyle(container)
     const theme = {
-      bg: style.getPropertyValue('--bg-panel').trim(),
-      text: style.getPropertyValue('--text-dim').trim(),
-      grid: style.getPropertyValue('--border').trim(),
+      bg: style.getPropertyValue('--chart-bg').trim(),
+      text: style.getPropertyValue('--chart-text').trim(),
+      grid: style.getPropertyValue('--chart-grid').trim(),
       border: style.getPropertyValue('--border').trim(),
       up: style.getPropertyValue('--pos').trim(),
       down: style.getPropertyValue('--neg').trim(),
-      crosshair: style.getPropertyValue('--text-dim').trim(),
+      label: style.getPropertyValue('--chart-label').trim(),
+      crosshair: style.getPropertyValue('--chart-crosshair').trim(),
     }
     const chart = createChart(container, {
       layout: {
@@ -83,13 +101,13 @@ export function ChartHost({
         fontSize: 12,
       },
       grid: {
-        vertLines: { color: theme.grid },
+        vertLines: { color: theme.grid, visible: false },
         horzLines: { color: theme.grid },
       },
       crosshair: {
-        mode: 1,
-        vertLine: { color: theme.crosshair, labelBackgroundColor: '#2b323d' },
-        horzLine: { color: theme.crosshair, labelBackgroundColor: '#2b323d' },
+        mode: CrosshairMode.Normal,
+        vertLine: { color: theme.crosshair, labelBackgroundColor: theme.label },
+        horzLine: { color: theme.crosshair, labelBackgroundColor: theme.label },
       },
       rightPriceScale: {
         borderColor: theme.border,
@@ -121,8 +139,8 @@ export function ChartHost({
       borderDownColor: theme.down,
       wickUpColor: theme.up,
       wickDownColor: theme.down,
-      // 未收盘的那根用细边框区分，让人一眼看出它还没定型
-      borderVisible: true,
+      // 实体与影线保持同色，移除多余描边。
+      borderVisible: false,
     })
 
     const volume = chart.addSeries(HistogramSeries, {
@@ -140,6 +158,20 @@ export function ChartHost({
     candleSeriesRef.current = candlesSeries
     volumeSeriesRef.current = volume
 
+    const onCrosshairMove = (event: MouseEventParams) => {
+      const point = event.point
+      const time = event.time
+      if (!point || point.x < 0 || point.y < 0 ||
+          point.x >= container.clientWidth || point.y >= container.clientHeight ||
+          typeof time !== 'number' || !event.seriesData.has(candlesSeries)) {
+        setHovered(null)
+        return
+      }
+      setHovered((current) => current?.key === activeKeyRef.current && current.time === time
+        ? current : { key: activeKeyRef.current, time })
+    }
+    chart.subscribeCrosshairMove(onCrosshairMove)
+
     // 容器尺寸变化时重算宽度——不做的话窗口缩放会让图表留白。
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0]
@@ -150,6 +182,7 @@ export function ChartHost({
     observer.observe(container)
 
     return () => {
+      chart.unsubscribeCrosshairMove(onCrosshairMove)
       observer.disconnect()
       chart.remove()
       chartRef.current = null
@@ -172,7 +205,6 @@ export function ChartHost({
     const previous = previousBarsRef.current
     const sameInterval = lastIntervalRef.current === intervalKey
     const plan = chartUpdatePlan(previous, all, sameInterval)
-    if (plan.kind === 'skip') return
     const container = containerRef.current
     if (container === null) return
     const style = getComputedStyle(container)
@@ -183,7 +215,7 @@ export function ChartHost({
     })
     const volumePoint = (b: CandleBar) => ({
       time: b.time as UTCTimestamp, value: b.volume,
-      color: b.close >= b.open ? `${up}44` : `${down}44`,
+      color: b.close >= b.open ? `${up}55` : `${down}55`,
     })
     // 通常只变末根（或收盘后追加一根），走增量更新；补历史才整段替换。
     if (plan.kind === 'update') {
@@ -191,7 +223,7 @@ export function ChartHost({
         series.update(pricePoint(bar))
         volume.update(volumePoint(bar))
       }
-    } else {
+    } else if (plan.kind !== 'skip') {
       series.setData(all.map(pricePoint))
       volume.setData(all.map(volumePoint))
     }
@@ -205,7 +237,11 @@ export function ChartHost({
     ) {
       if (all.length > 0 && historyReady) {
         lastIntervalRef.current = intervalKey
-        chartRef.current?.timeScale().fitContent()
+        // 仅设置可见窗口；已加载的历史仍然可以向左拖动查看。
+        chartRef.current?.timeScale().setVisibleLogicalRange({
+          from: Math.max(0, all.length - 100) - 1,
+          to: all.length - 1 + 4,
+        })
       }
     }
   }, [candles, lastCandle, intervalKey, historyReady])
@@ -222,12 +258,37 @@ export function ChartHost({
   }, [levels])
 
   return (
-    <div
-      ref={containerRef}
-      style={{ width: '100%', height }}
-      role="img"
-      aria-label="价格走势图，含 K 线与持仓价位线"
-    />
+    <div className="chart-host" style={{ height }}>
+      <div className="chart-details" aria-label="K 线数据">
+        <div className="chart-details-heading">
+          <span>{selected ? '所选 K 线' : '最新 K 线'}</span>
+          <time>{details ? chartTime(details.time as UTCTimestamp, {
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', hour12: false,
+          }) : '—'} · UTC+8</time>
+          {details && <span>{details.closed ? '已收盘' : '未收盘'}</span>}
+        </div>
+        <dl className="chart-details-values">
+          {([
+            ['开', 'open'], ['高', 'high'], ['低', 'low'], ['收', 'close'], ['量', 'volume'],
+          ] as const).map(([label, field]) => (
+            <div key={field} className={`candle-${field}`}><dt>{label}</dt><dd>{details?.[field] ?? '—'}</dd></div>
+          ))}
+          <div className={pnlClass(details?.change ?? null)} title="收盘价 − 开盘价">
+            <dt>涨跌额</dt><dd>{details?.change == null ? '—' : signedStr(details.change)}</dd>
+          </div>
+          <div className={pnlClass(details?.change ?? null)} title="（收盘价 − 开盘价）÷ 开盘价 × 100%">
+            <dt>涨跌幅</dt><dd>{details?.change_percent == null ? '—' : `${signedStr(details.change_percent, 4)}%`}</dd>
+          </div>
+        </dl>
+      </div>
+      <div
+        ref={containerRef}
+        className="chart-plot"
+        role="img"
+        aria-label="价格走势图，绿涨红跌，含 K 线、成交量与持仓价位线"
+      />
+    </div>
   )
 }
 

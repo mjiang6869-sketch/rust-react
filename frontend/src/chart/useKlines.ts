@@ -28,6 +28,7 @@ const INTERVAL_SECONDS: Record<string, number> = {
 }
 
 export interface KlineState {
+  rawCandles: RawCandle[]
   candles: CandleBar[]
   lastCandle: CandleBar | null
   source: string | null
@@ -69,6 +70,7 @@ export function useKlines(symbol: string, interval: string, frame: KlineFrame | 
   const last = mapped.at(-1)
   const forming = last !== undefined && !last.closed
   return {
+    rawCandles: snapshot.bars,
     candles: forming ? mapped.slice(0, -1) : mapped,
     lastCandle: forming ? last : null,
     source: snapshot.source,

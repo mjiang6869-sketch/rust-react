@@ -40,13 +40,13 @@ const NAV = [
   },
   {
     value: 'market',
-    label: '交易行情',
+    label: '行情',
     icon: CandlestickChart,
     description: '观察市场，规划每一笔交易。',
   },
   {
     value: 'data',
-    label: '数据管理',
+    label: '管理',
     icon: Database,
     description: '管理本地历史归档，为可复现的研究做好准备。',
   },
@@ -66,7 +66,6 @@ const NAV = [
 export function App() {
   const { engine, connected, error, clearError, refresh } = useAppState()
   const [page, setPage] = useState<Page>('market')
-
   const hasPosition = useMemo(
     () =>
       engine !== null &&
@@ -169,8 +168,7 @@ function Sidebar({
         </div>
       </div>
 
-      <div className="nav-caption">研究工作区</div>
-      <nav className="sidebar-nav" aria-label="主导航">
+      <nav id="sidebar-navigation" className="sidebar-nav" aria-label="主导航">
         {NAV.map((item) => {
           const active = page === item.value
           return (
@@ -187,22 +185,10 @@ function Sidebar({
                 <item.icon size={19} strokeWidth={1.8} />
               </span>
               <span className="nav-label">{item.label}</span>
-              {active && <span className="nav-indicator" aria-hidden="true" />}
             </button>
           )
         })}
       </nav>
-      <div className="sidebar-bottom">
-        <div className="sidebar-note">
-          <FlaskConical size={18} aria-hidden="true" />
-          <span>
-            研究先于交易<small>验证假设，再做决策。</small>
-          </span>
-        </div>
-        <span className="sidebar-version">
-          Rust Crypto <span>v0.1</span>
-        </span>
-      </div>
     </aside>
   )
 }

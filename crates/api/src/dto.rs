@@ -579,6 +579,12 @@ pub struct CandleDto {
     pub close: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub volume: Decimal,
+    /// 收盘价减开盘价；历史和实时 K 线共用此口径。
+    #[serde(with = "rust_decimal::serde::str")]
+    pub change: Decimal,
+    /// 相对开盘价的百分数；开盘价为零时无定义。
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub change_percent: Option<Decimal>,
     /// 是否已收盘。
     ///
     /// 界面必须把未收盘的最后一根画成动态的——它每时每刻都在变。更重要的是
@@ -698,6 +704,10 @@ impl CandleDto {
     ///
     /// **时间戳从毫秒转成秒**：`lightweight-charts` 的 `UTCTimestamp` 是秒。
     pub fn from_candle(c: &Candle) -> Self {
+        let change = c.close - c.open;
+        let change_percent = change
+            .checked_div(c.open)
+            .and_then(|ratio| ratio.checked_mul(Decimal::ONE_HUNDRED));
         Self {
             time: c.open_time.timestamp(),
             open: c.open,
@@ -706,6 +716,8 @@ impl CandleDto {
             close: c.close,
             volume: c.volume,
             closed: c.closed,
+            change,
+            change_percent,
         }
     }
 }
@@ -1480,6 +1492,44 @@ mod tests {
         assert!(dto.time < 10_000_000_000, "秒级时间戳不可能是 13 位");
         assert_eq!(dto.open, dec!(2684.75));
         assert!(dto.closed);
+    }
+
+    #[test]
+    fn candle_change_uses_open_and_serializes_as_strings() {
+        for (open, close, change, percent) in [
+            (dec!(100), dec!(101.25), "1.25", Some("1.25")),
+            (dec!(100), dec!(98.5), "-1.5", Some("-1.5")),
+            (dec!(100), dec!(100), "0", Some("0")),
+            (dec!(0), dec!(1), "1", None),
+            (
+                dec!(0.00000001),
+                dec!(0.00000002),
+                "0.00000001",
+                Some("100"),
+            ),
+        ] {
+            let candle = Candle {
+                open_time: Utc::now(),
+                open,
+                close,
+                high: open.max(close),
+                low: open.min(close),
+                volume: Decimal::ONE,
+                closed: true,
+            };
+            let dto = CandleDto::from_candle(&candle);
+            assert_eq!(dto.change, change.parse::<Decimal>().unwrap());
+            assert_eq!(
+                dto.change_percent,
+                percent.map(|value| value.parse::<Decimal>().unwrap())
+            );
+            let json = serde_json::to_value(dto).unwrap();
+            assert!(json["change"].is_string());
+            assert_eq!(json["change_percent"].is_null(), percent.is_none());
+            if percent.is_some() {
+                assert!(json["change_percent"].is_string());
+            }
+        }
     }
 
     /// 未收盘的 K 线必须如实传递——界面靠它把最后一根画成动态的。

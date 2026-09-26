@@ -230,6 +230,66 @@ impl PaperEngine {
             })
     }
 
+    /// 已收盘 K 线窗口的容量上限。`on_market_event` 与 `seed_candles`
+    /// 共用同一个上限，避免两处各写一份常量导致以后分叉。
+    fn candle_cap(&self) -> usize {
+        self.config.max_candles.max(120)
+    }
+
+    /// 用一批历史（REST 拉取的）已收盘 K 线为策略预热。
+    ///
+    /// 仅在服务启动、实时流尚未攒够窗口时调用一次。它只做"补窗口"这一件
+    /// 事，刻意不做 `on_market_event` 里的其它任何事：
+    ///
+    /// - 不更新 `last_event_at` / `feed_connected`：新鲜度只能由**实时**事件
+    ///   驱动，否则策略会把"几分钟前的 REST 快照"误判为"行情还活着"，
+    ///   在行情早已断线的情况下继续开仓。
+    /// - 不触发成交判定、持仓管理、策略决策、过期清理：这些逻辑假设自己是
+    ///   被"当下发生的事件"调用的；预热数据只是历史存量，用它们驱动决策
+    ///   会在启动瞬间凭一堆旧数据下单，而不是等真正的实时行情。
+    ///
+    /// 返回实际新增（此前窗口里没有）的 K 线根数。
+    pub fn seed_candles(&mut self, candles: impl IntoIterator<Item = domain::Candle>) -> usize {
+        let existing: std::collections::BTreeSet<_> =
+            self.candles.iter().map(|c| c.open_time).collect();
+
+        let mut merged: BTreeMap<DateTime<Utc>, domain::Candle> =
+            self.candles.drain(..).map(|c| (c.open_time, c)).collect();
+
+        let mut added_keys = std::collections::BTreeSet::new();
+        for c in candles {
+            if !c.closed {
+                continue;
+            }
+            // 同一 open_time 已存在（大概率来自实时流）时保留已有的那根——
+            // 实时推送比 REST 快照更新，不能用陈旧数据覆盖它。同一批输入内
+            // 若有重复 open_time，只按去重后的一根计数。
+            if existing.contains(&c.open_time) {
+                continue;
+            }
+            added_keys.insert(c.open_time);
+            merged.insert(c.open_time, c);
+        }
+        let added = added_keys.len();
+
+        self.candles = merged.into_values().collect();
+        let keep = self.candle_cap();
+        if self.candles.len() > keep {
+            let drop = self.candles.len() - keep;
+            self.candles.drain(0..drop);
+        }
+
+        if added > 0 {
+            self.events.push(EngineEvent::StateChanged);
+        }
+        added
+    }
+
+    /// 当前已收盘 K 线窗口的根数（用于界面/日志展示预热进度）。
+    pub fn candle_count(&self) -> usize {
+        self.candles.len()
+    }
+
     /// 喂入一个行情事件。
     ///
     /// 这是引擎的主入口。顺序很重要：
@@ -245,11 +305,20 @@ impl PaperEngine {
         match &event {
             MarketEvent::Kline(c) => {
                 if c.closed {
-                    self.candles.push(c.clone());
-                    let keep = self.config.max_candles.max(120);
-                    if self.candles.len() > keep {
-                        let drop = self.candles.len() - keep;
-                        self.candles.drain(0..drop);
+                    // 断线重连时实时流可能重复推送同一根已收盘 K 线；exchange
+                    // 层已经按 view 去重，这里是引擎自身的兜底保护，避免同一根
+                    // K 线被多次计入窗口（不影响本次事件其余处理照常进行）。
+                    let is_duplicate = self
+                        .candles
+                        .last()
+                        .is_some_and(|last| last.open_time >= c.open_time);
+                    if !is_duplicate {
+                        self.candles.push(c.clone());
+                        let keep = self.candle_cap();
+                        if self.candles.len() > keep {
+                            let drop = self.candles.len() - keep;
+                            self.candles.drain(0..drop);
+                        }
                     }
                 }
             }
@@ -1026,6 +1095,20 @@ mod tests {
         })
     }
 
+    /// 构造一根裸的 `domain::Candle`（不经过 `MarketEvent`），供 `seed_candles`
+    /// 相关测试直接使用。
+    fn candle(offset_min: i64, closed: bool) -> domain::Candle {
+        domain::Candle {
+            open_time: t0() + Duration::minutes(offset_min),
+            open: dec!(3190),
+            high: dec!(3210),
+            low: dec!(3190),
+            close: dec!(3210),
+            volume: dec!(1),
+            closed,
+        }
+    }
+
     fn trade(offset_ms: i64, px: Decimal, buyer_maker: bool) -> MarketEvent {
         MarketEvent::AggTrade(domain::AggTrade {
             trade_id: offset_ms.unsigned_abs() + 1,
@@ -1173,6 +1256,40 @@ mod tests {
         e.on_market_event(trade(1000, dec!(3210), true));
 
         assert!(e.snapshot().position.is_none(), "价格未到买价不应成交");
+    }
+
+    /// 挂单之前已经发生的成交不能让新挂单立即成交。
+    ///
+    /// 模拟盘的成交带是一条滚动的历史带（8 小时窗口），`try_fill_pending`
+    /// / `manage_position` 每次都把整条带传给成交模型——过滤挂单之前的
+    /// 成交必须由模型自己完成（见 `FillContext::tape` 的文档），这里锁住
+    /// 这个行为，防止回归成"挂单前 8 小时内任何一笔旧成交都能让新挂单
+    /// 立即成交"。
+    #[test]
+    fn stale_trade_before_placed_at_does_not_fill_new_order() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+
+        // 挂单之前已有一笔打到 3200 的卖方主动成交
+        e.on_market_event(trade(1000, dec!(3200), true));
+
+        // t0()+10s 才提交买 3200 的手动计划
+        let plan = manual_plan(Side::Buy, dec!(3200), dec!(3192), dec!(0.1));
+        let _ = e.submit_manual(&plan, t0() + Duration::seconds(10));
+
+        // 喂一笔不触价的成交，只是为了驱动一次成交判定
+        e.on_market_event(trade(20_000, dec!(3210), true));
+        assert!(
+            e.snapshot().position.is_none(),
+            "挂单之前的旧成交不能让新挂单成交"
+        );
+
+        // 挂单之后同样条件的成交才应该成交
+        e.on_market_event(trade(30_000, dec!(3200), true));
+        assert!(
+            e.snapshot().position.is_some(),
+            "挂单之后的同价位、同方向成交应该成交"
+        );
     }
 
     /// 方向不对的成交不能让我们成交。
@@ -1497,5 +1614,108 @@ mod tests {
         assert!(!first.is_empty(), "设置连接状态应产生事件");
         let second = e.drain_events();
         assert!(second.is_empty(), "取出后应清空");
+    }
+
+    /// 预热必须只补窗口——不能碰新鲜度或连接状态。
+    ///
+    /// 预热数据来自 REST，是"过去某个时刻"的快照；只有实时事件才能证明
+    /// 行情此刻还活着，所以 `last_event_at` / `feed_is_fresh` 必须保持
+    /// 预热之前的原样。
+    #[test]
+    fn seed_candles_fills_window_without_touching_freshness() {
+        let mut e = engine();
+        let batch: Vec<_> = (0..60).map(|i| candle(i, true)).collect();
+
+        let added = e.seed_candles(batch);
+
+        assert_eq!(added, 60);
+        assert_eq!(e.candle_count(), 60);
+        assert!(
+            e.snapshot().last_event_at.is_none(),
+            "预热不应设置 last_event_at"
+        );
+        assert!(!e.feed_is_fresh(t0()), "预热不应让行情被判定为新鲜");
+    }
+
+    /// 未收盘的 K 线与已存在的 open_time 都不应计入新增。
+    #[test]
+    fn seed_candles_ignores_unclosed_and_duplicates() {
+        let mut e = engine();
+        let first = e.seed_candles(vec![candle(0, true), candle(1, true)]);
+        assert_eq!(first, 2);
+
+        // 一根未收盘 + 一根与已有 open_time 重复
+        let second = e.seed_candles(vec![candle(2, false), candle(1, true)]);
+
+        assert_eq!(second, 0, "未收盘与重复 open_time 都不应计入新增");
+        assert_eq!(e.candle_count(), 2);
+    }
+
+    /// 预热必须与已有窗口按 open_time 合并、去重、排序，并遵守同一个上限。
+    #[test]
+    fn seed_candles_merges_in_order_and_caps() {
+        let mut e = engine();
+
+        // 先用实时事件喂入较新的一段（offset 100..160）
+        for i in 100..160 {
+            e.on_market_event(kline(i, dec!(3190), dec!(3210)));
+        }
+        assert_eq!(e.candle_count(), 60);
+
+        // 再用一批较旧、且与已有部分重叠的历史 K 线预热（offset 0..120）
+        let batch: Vec<_> = (0..120).map(|i| candle(i, true)).collect();
+        let added = e.seed_candles(batch);
+
+        // 0..100 全新，100..120 与实时流重叠——重叠部分不应重复计入。
+        assert_eq!(added, 100);
+
+        let cap = 120usize; // config().max_candles.max(120)
+        assert!(e.candle_count() <= cap);
+        assert_eq!(e.candle_count(), 120);
+
+        // 窗口应按 open_time 升序，且保留的是最新的一段（不应把最新的
+        // 100..160 挤掉）。
+        let snapshot_candles = &e.candles;
+        assert!(
+            snapshot_candles
+                .windows(2)
+                .all(|w| w[0].open_time < w[1].open_time),
+            "窗口必须按 open_time 升序"
+        );
+        assert_eq!(
+            snapshot_candles.last().unwrap().open_time,
+            t0() + Duration::minutes(159),
+            "最新的实时数据不应被裁剪掉"
+        );
+    }
+
+    /// 预热即使凑够了策略触发条件，也绝不能挂出订单或建立持仓——
+    /// 那是只有实时事件才能触发的决策路径。
+    #[test]
+    fn seed_candles_does_not_place_orders() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        e.drain_events();
+
+        let batch: Vec<_> = (0..100).map(|i| candle(i, true)).collect();
+        e.seed_candles(batch);
+
+        let snap = e.snapshot();
+        assert!(snap.open_orders.is_empty(), "预热不应产生任何在途订单");
+        assert!(snap.position.is_none(), "预热不应建立持仓");
+    }
+
+    /// 同一根收盘 K 线被实时流重复推送两次时，只应计入窗口一次。
+    #[test]
+    fn duplicate_closed_kline_is_not_added_twice() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        let k = kline(0, dec!(3190), dec!(3210));
+
+        e.on_market_event(k.clone());
+        assert_eq!(e.candle_count(), 1);
+
+        e.on_market_event(k);
+        assert_eq!(e.candle_count(), 1, "重复的收盘 K 线不应被重复计入窗口");
     }
 }
