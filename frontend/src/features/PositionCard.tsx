@@ -20,9 +20,10 @@ import { useAction } from '../state/store'
 interface Props {
   position: PositionInfo | null
   symbol: string
+  compact?: boolean
 }
 
-export function PositionCard({ position, symbol }: Props) {
+export function PositionCard({ position, symbol, compact = false }: Props) {
   const action = useAction()
   const [confirming, setConfirming] = useState(false)
 
@@ -34,7 +35,7 @@ export function PositionCard({ position, symbol }: Props) {
   if (position === null) {
     return (
       <section className="panel" aria-labelledby="pos-title">
-        <h2 id="pos-title">持仓</h2>
+        <h2 id="pos-title">当前持仓</h2>
         <p className="muted">当前无持仓（{symbol}）。</p>
       </section>
     )
@@ -46,12 +47,27 @@ export function PositionCard({ position, symbol }: Props) {
   return (
     <section className="panel" aria-labelledby="pos-title">
       <div className="panel-head">
-        <h2 id="pos-title">持仓</h2>
+        <h2 id="pos-title">当前持仓</h2>
         <span className={`side-badge ${isLong ? 'side-buy' : 'side-sell'}`}>
           {position.side_label}
         </span>
       </div>
 
+      {compact ? (
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead><tr>
+              <th>合约</th><th>方向</th><th>数量</th><th>开仓价格</th><th>未实现盈亏</th><th>止损价格</th>
+            </tr></thead>
+            <tbody><tr>
+              <td>{symbol}</td><td>{position.side_label}</td><td className="mono">{num(position.quantity)}</td>
+              <td className="mono">{num(position.entry_price)}</td>
+              <td className={`mono ${pnlClass(position.unrealized_pnl)}`}>{signed(position.unrealized_pnl)}</td>
+              <td className="mono">{num(position.stop_price)}{position.stop_triggered && <span className="inline-warn"> 已触发未成交</span>}</td>
+            </tr></tbody>
+          </table>
+        </div>
+      ) : (
       <dl className="kv">
         <div>
           <dt>数量</dt>
@@ -77,6 +93,8 @@ export function PositionCard({ position, symbol }: Props) {
           </dd>
         </div>
       </dl>
+
+      )}
 
       {/* 分批止盈状态。这是"分批"能力的可视化——用户要能看出第几档已成交。 */}
       <div className="rungs-status">

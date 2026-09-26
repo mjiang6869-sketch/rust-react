@@ -14,12 +14,31 @@
 // 2. **提交带幂等键。** 双击不会下出两张单。键在用户第一次点击时生成，
 //    提交成功后丢弃。
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+
+import { SlidersHorizontal } from 'lucide-react'
 
 import { api, newIdempotencyKey } from '../api/client'
-import type { InstrumentInfo, ManualPlanRequest, ManualPreview, Side } from '../api/types'
+import type {
+  InstrumentInfo,
+  ManualPlanRequest,
+  ManualPreview,
+  Side,
+} from '../api/types'
 import { num, pct, signed } from '../format'
 import { useAction } from '../state/store'
+
+/**
+ * 一个 tick 需要几位小数。
+ *
+ * `tick_size` 是 `0.01` 这种形式，取它的小数位即可。用字符串判断而不是
+ * `Math.log10`——后者对 0.001 这类值会因浮点误差算出 2.9999999。
+ */
+function decimalsFor(tick: number): number {
+  const s = String(tick)
+  const dot = s.indexOf('.')
+  return dot < 0 ? 0 : s.length - dot - 1
+}
 
 interface RungInput {
   /** 距入场价的基点。 */
@@ -33,6 +52,13 @@ interface Props {
   /** 当前是否已有持仓或在途单。有则禁用下单。 */
   hasPosition: boolean
   onSubmitted: () => void
+  /**
+   * 当前市场中间价（字符串）。
+   *
+   * 用作入场价的初始值——硬编码一个价格（比如 `3200`）在 ETH 涨到 4000 时
+   * 会让每次下单都被风控拒绝，而且用户看不出为什么。`null` 时不覆盖。
+   */
+  referencePrice?: string | null
 }
 
 /** 默认三档止盈：25/50/75 bp，比例 40/30/30。 */
@@ -42,9 +68,17 @@ const DEFAULT_RUNGS: RungInput[] = [
   { bp: '75', percent: '30' },
 ]
 
-export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
+export function ManualPanel({
+  instrument,
+  hasPosition,
+  onSubmitted,
+  referencePrice = null,
+}: Props) {
   const [side, setSide] = useState<Side>('BUY')
-  const [entry, setEntry] = useState('3200')
+  const [entry, setEntry] = useState('')
+  // 用户是否手动改过入场价。一旦改过就不再跟随行情——
+  // 否则辛苦算好的价格会被下一次刷新悄悄覆盖掉。
+  const entryTouchedRef = useRef(false)
   const [stopBp, setStopBp] = useState('25')
   const [leverage, setLeverage] = useState('3')
   const [sizePct, setSizePct] = useState('10')
@@ -56,6 +90,18 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
 
   const [preview, setPreview] = useState<ManualPreview | null>(null)
   const action = useAction()
+
+  // 行情到位且用户没手动改过时，用中间价填入入场价。
+  useEffect(() => {
+    if (entryTouchedRef.current) return
+    if (referencePrice === null || referencePrice === '') return
+    // 中间价带 4 位小数（买卖价各 2 位的平均），按 tick 对齐
+    const tick = Number(instrument.tick_size)
+    const n = Number(referencePrice)
+    if (!Number.isFinite(n) || n <= 0) return
+    const aligned = tick > 0 ? Math.round(n / tick) * tick : n
+    setEntry(aligned.toFixed(tick > 0 ? decimalsFor(tick) : 2))
+  }, [referencePrice, instrument.tick_size])
 
   // 由入场价与基点算出止损价。
   //
@@ -160,8 +206,15 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
   const disabled = hasPosition || action.busy
 
   return (
-    <section className="panel" aria-labelledby="manual-title">
-      <h2 id="manual-title">手动下单</h2>
+    <section className="panel manual-panel" aria-labelledby="manual-title">
+      <div className="panel-head">
+        <h2 id="manual-title">
+          <SlidersHorizontal size={17} aria-hidden="true" />
+          手动下单
+        </h2>
+        <span className="tag">仅 Maker</span>
+      </div>
+      <p className="panel-intro">一个入场点，完整规划止盈与止损。</p>
 
       {hasPosition && (
         <p className="notice notice-warn">
@@ -170,8 +223,8 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
       )}
 
       <div className="row">
-        <label>
-          <span>方向</span>
+        <div className="direction-field">
+          <span className="field-label">交易方向</span>
           <div className="segmented" role="group" aria-label="下单方向">
             <button
               type="button"
@@ -190,7 +243,7 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
               做空
             </button>
           </div>
-        </label>
+        </div>
       </div>
 
       <div className="row">
@@ -198,7 +251,11 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
           label="挂单价格"
           unit={instrument.quote_asset}
           value={entry}
-          onChange={setEntry}
+          onChange={(v) => {
+            // 用户一动手就不再跟随行情——否则填好的价格会被刷新覆盖
+            entryTouchedRef.current = true
+            setEntry(v)
+          }}
           hint="限价单（GTX），只会作为 maker 成交"
         />
         <Field
@@ -227,7 +284,7 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
         />
       </div>
 
-      <div className="row">
+      <div className="row protection-options">
         <label className="checkbox">
           <input
             type="checkbox"
@@ -242,7 +299,9 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
             checked={breakEven}
             onChange={(e) => setBreakEven(e.target.checked)}
           />
-          <span>保本止损（浮盈 1 倍止损距离后推到入场价）</span>
+          <span>
+            保本止损<small>浮盈 1 倍止损距离后推到入场价</small>
+          </span>
         </label>
       </div>
 
@@ -258,16 +317,18 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
             <div className="rung-row" key={i}>
               <span className="rung-index">第 {i + 1} 档</span>
               <Field
-                label=""
+                label={`第 ${i + 1} 档止盈距离`}
                 unit="基点"
                 value={r.bp}
                 onChange={(v) =>
-                  setRungs((prev) => prev.map((x, j) => (j === i ? { ...x, bp: v } : x)))
+                  setRungs((prev) =>
+                    prev.map((x, j) => (j === i ? { ...x, bp: v } : x)),
+                  )
                 }
                 compact
               />
               <Field
-                label=""
+                label={`第 ${i + 1} 档平仓比例`}
                 unit="%"
                 value={r.percent}
                 onChange={(v) =>
@@ -281,7 +342,9 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
                 type="button"
                 className="icon-btn"
                 aria-label={`删除第 ${i + 1} 档止盈`}
-                onClick={() => setRungs((prev) => prev.filter((_, j) => j !== i))}
+                onClick={() =>
+                  setRungs((prev) => prev.filter((_, j) => j !== i))
+                }
                 disabled={rungs.length <= 1}
               >
                 ×
@@ -293,7 +356,9 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
             <button
               type="button"
               className="link-btn"
-              onClick={() => setRungs((prev) => [...prev, { bp: '100', percent: '0' }])}
+              onClick={() =>
+                setRungs((prev) => [...prev, { bp: '100', percent: '0' }])
+              }
             >
               + 增加档位
             </button>
@@ -339,7 +404,9 @@ export function ManualPanel({ instrument, hasPosition, onSubmitted }: Props) {
           type="button"
           className={`primary ${side === 'BUY' ? 'buy' : 'sell'}`}
           onClick={() => void submit()}
-          disabled={disabled || preview === null || !preview.accepted || !rungTotalOk}
+          disabled={
+            disabled || preview === null || !preview.accepted || !rungTotalOk
+          }
         >
           {action.busy ? '提交中…' : side === 'BUY' ? '挂买单' : '挂卖单'}
         </button>
@@ -395,29 +462,31 @@ function PreviewBlock({ preview }: { preview: ManualPreview }) {
       </dl>
 
       {preview.take_profits.length > 0 && (
-        <table className="mini-table">
-          <caption className="sr-only">分批止盈明细</caption>
-          <thead>
-            <tr>
-              <th scope="col">档位</th>
-              <th scope="col">价格</th>
-              <th scope="col">数量</th>
-              <th scope="col">距入场</th>
-              <th scope="col">毛利</th>
-            </tr>
-          </thead>
-          <tbody>
-            {preview.take_profits.map((r) => (
-              <tr key={r.rung}>
-                <td>第 {r.index} 档</td>
-                <td>{num(r.price)}</td>
-                <td>{num(r.quantity)}</td>
-                <td>{num(r.distance_bp, 2)} bp</td>
-                <td className="pos">{signed(r.gross_profit)}</td>
+        <div className="table-wrap">
+          <table className="mini-table">
+            <caption className="sr-only">分批止盈明细</caption>
+            <thead>
+              <tr>
+                <th scope="col">档位</th>
+                <th scope="col">价格</th>
+                <th scope="col">数量</th>
+                <th scope="col">距入场</th>
+                <th scope="col">毛利</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {preview.take_profits.map((r) => (
+                <tr key={r.rung}>
+                  <td>第 {r.index} 档</td>
+                  <td>{num(r.price)}</td>
+                  <td>{num(r.quantity)}</td>
+                  <td>{num(r.distance_bp, 2)} bp</td>
+                  <td className="pos">{signed(r.gross_profit)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
 
       {preview.warnings.length > 0 && (
@@ -452,22 +521,27 @@ function Field({
   hint?: string
   compact?: boolean
 }) {
-  const id = `f-${label}-${unit}-${Math.random().toString(36).slice(2, 7)}`
+  const id = useId()
   return (
     <div className={compact ? 'field field-compact' : 'field'}>
-      {label !== '' && <label htmlFor={id}>{label}</label>}
+      {label !== '' && (
+        <label className={compact ? 'sr-only' : undefined} htmlFor={id}>
+          {label}
+        </label>
+      )}
       <div className="input-wrap">
         <input
           id={id}
           type="text"
           inputMode="decimal"
+          aria-describedby={hint === undefined ? undefined : `${id}-hint`}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           aria-label={label !== '' ? undefined : unit}
         />
         {unit !== '' && <span className="unit">{unit}</span>}
       </div>
-      {hint !== undefined && <small>{hint}</small>}
+      {hint !== undefined && <small id={`${id}-hint`}>{hint}</small>}
     </div>
   )
 }

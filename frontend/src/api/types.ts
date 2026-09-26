@@ -316,3 +316,133 @@ export interface CandleBar {
   close: number
   volume: number
 }
+
+// ---------------------------------------------------------------------------
+// 行情（图表、盘口、成交流）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一根 K 线。
+ *
+ * `time` 是 **Unix 秒**（不是毫秒）——`lightweight-charts` 的 `UTCTimestamp`
+ * 以秒为单位。毫秒传进去会让图表把时间解释到公元 5 万年。
+ *
+ * 价格是字符串：bp 级的数值经不起 `number` 的精度损失。但图表库要求
+ * `number`——所以**只在这一个地方**转换，且转换前后不参与任何算术
+ * （见 `chart/ChartHost.tsx`）。
+ */
+export interface CandleBar {
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+  /** 是否已收盘。未收盘的是当前正在形成的 K 线，每刻都在变。 */
+  closed: boolean
+}
+
+/** 原始 K 线（价格是字符串）。`ChartHost` 之外不要用。 */
+export interface RawCandle {
+  time: number
+  open: string
+  high: string
+  low: string
+  close: string
+  volume: string
+  closed: boolean
+}
+
+export interface KlinesResponse {
+  symbol: string
+  interval: string
+  candles: RawCandle[]
+  /**
+   * 数据来源。
+   *
+   * 「币安公开行情」与「本地归档」不是同一份数据：回测读本地归档，图表读
+   * 这里。不显示出来，用户会以为图表覆盖的区间就是回测覆盖的区间。
+   */
+  source: string
+}
+
+export interface BookLevel {
+  price: string
+  quantity: string
+  /** 该档累计量（后端算好，前端不累加——浮点误差会让深度条宽度失真）。 */
+  cumulative: string
+}
+
+export interface BookSnapshotResponse {
+  symbol: string
+  bid: string
+  ask: string
+  mid: string
+  spread: string
+  /** 价差相对中间价的基点。做市看这个数，不看绝对值。 */
+  spread_bp: string
+  bids: BookLevel[]
+  asks: BookLevel[]
+}
+
+export interface RecentTrade {
+  trade_id: number
+  price: string
+  quantity: string
+  /** 买方是挂单方，即**卖方主动**成交。 */
+  is_buyer_maker: boolean
+  /** 成交时刻（Unix 毫秒，字符串）。只用于比较，不做算术。 */
+  time: string
+}
+
+export interface StreamCandle extends RawCandle {
+  /** 交易所事件时间，毫秒字符串。 */
+  event_ms: string
+}
+
+export interface KlineFrame {
+  interval: string
+  live: boolean
+  notice: string | null
+  generation: string
+  /** 按开盘时间升序，包含最近收盘帧。 */
+  candles: StreamCandle[]
+}
+
+/**
+ * 行情推送的一帧（`/api/v1/market/stream`）。
+ *
+ * 每帧都是**完整视图**：直接替换本地状态，不做合并。
+ */
+export interface MarketFrame {
+  type: 'market'
+  kline?: KlineFrame
+  symbol: string
+  /** 数据来源，界面必须显示。 */
+  source: string
+  /** 盘口与成交两条上游都在收数据。 */
+  live: boolean
+  /** 只是还在建立连接（没有断线、没有限流）。 */
+  connecting: boolean
+  /** 不在线时的原因。`null` 表示一切正常。 */
+  notice: string | null
+  /** 上游限流的剩余冷却毫秒数。0 表示没有冷却。 */
+  cooldown_ms: number
+  book: BookSnapshotResponse | null
+  /** 新的在前。 */
+  trades: RecentTrade[]
+}
+
+/** 图表支持的周期。与后端 `Interval` 一一对应。 */
+export const INTERVALS = [
+  { value: '1m', label: '1分' },
+  { value: '3m', label: '3分' },
+  { value: '5m', label: '5分' },
+  { value: '15m', label: '15分' },
+  { value: '30m', label: '30分' },
+  { value: '1h', label: '1时' },
+  { value: '4h', label: '4时' },
+  { value: '1d', label: '日线' },
+] as const
+
+export type IntervalValue = (typeof INTERVALS)[number]['value']

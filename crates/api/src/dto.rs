@@ -18,7 +18,10 @@
 
 use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
-use domain::{ManualPlan, ManualPreview, PositionView, ServiceMode, Side, StandDownReason};
+use domain::{
+    AggTrade, BookSnapshot, Candle, ManualPlan, ManualPreview, PositionView, ServiceMode, Side,
+    StandDownReason,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +50,20 @@ pub enum ApiError {
     Conflict(String),
     #[error("内部错误：{0}")]
     Internal(String),
+    /// 上游限流。**必须保留真实等待时间**。
+    ///
+    /// # 为什么不能压平成 500
+    ///
+    /// 之前 429/418 被统一包成 `Internal`，于是：
+    ///
+    /// 1. 前端只看到「服务器错误」，没有任何退避依据，于是**继续按原频率
+    ///    重试**——而币安明确说过，429 之后继续请求会升级成 418 封禁；
+    /// 2. `Retry-After` 在 API 层再次丢失，前端即便想退避也不知道等多久。
+    ///
+    /// 所以这里单独成一个变体，并把它映射回 **HTTP 429 + `Retry-After`
+    /// 响应头**——保持与上游一致，前端按标准语义处理即可。
+    #[error("上游限流，请在 {retry_after_ms} 毫秒后重试")]
+    RateLimited { retry_after_ms: u64 },
 }
 
 impl ApiError {
@@ -56,6 +73,7 @@ impl ApiError {
             ApiError::NotFound(_) => "not_found",
             ApiError::Conflict(_) => "conflict",
             ApiError::Internal(_) => "internal",
+            ApiError::RateLimited { .. } => "rate_limited",
         }
     }
 
@@ -66,17 +84,57 @@ impl ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }
 
+/// 交易所错误 → API 错误。
+///
+/// 关键是**限流不能被归到 `Internal`**：那会让前端失去退避依据。
+impl From<exchange::ExchangeError> for ApiError {
+    fn from(e: exchange::ExchangeError) -> Self {
+        use exchange::ExchangeError as E;
+        match e {
+            E::RateLimited { retry_after_ms } => ApiError::RateLimited { retry_after_ms },
+            E::Definitive(m) => ApiError::BadRequest(m),
+            other => ApiError::Internal(other.to_string()),
+        }
+    }
+}
+
+/// 附在错误响应上的错误摘要，只在进程内流转，不序列化给前端。
+#[derive(Clone, Debug)]
+pub struct ApiErrorInfo {
+    pub code: &'static str,
+    pub message: String,
+}
+
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        use axum::http::header::{HeaderValue, RETRY_AFTER};
         let body = ApiResponse::<()>::Error {
             code: self.code().to_string(),
             message: self.to_string(),
         };
-        (self.status(), axum::Json(body)).into_response()
+        let mut resp = (self.status(), axum::Json(body)).into_response();
+        // 留给日志中间件（`routes::log_failures`）读取：它能看到路径，但看不到
+        // 错误内容——响应体此时已经是序列化好的字节。
+        resp.extensions_mut().insert(ApiErrorInfo {
+            code: self.code(),
+            message: self.to_string(),
+        });
+
+        // 与上游保持一致的语义：`Retry-After` 用**秒**。
+        // 向上取整——向下取整会让客户端在还差几百毫秒时重试，那正是
+        // "继续打"从而把封禁拖长的情形。
+        if let ApiError::RateLimited { retry_after_ms } = self {
+            let secs = retry_after_ms.div_ceil(1_000).max(1);
+            if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert(RETRY_AFTER, v);
+            }
+        }
+        resp
     }
 }
 
@@ -497,6 +555,222 @@ pub struct FillModelDto {
 }
 
 // ---------------------------------------------------------------------------
+// 行情（图表与盘口）
+// ---------------------------------------------------------------------------
+
+/// 一根 K 线。
+///
+/// # 时间单位是**秒**不是毫秒
+///
+/// `lightweight-charts` 的 `UTCTimestamp` 以秒为单位。毫秒传过去会让图表
+/// 把时间解释到公元 5 万年，坐标轴显示成一堆看不出问题的怪日期——所以这里
+/// 显式说明单位，并配测试锁住。
+#[derive(Debug, Serialize)]
+pub struct CandleDto {
+    /// 开盘时间（Unix 秒）。
+    pub time: i64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub open: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub high: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub low: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub close: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub volume: Decimal,
+    /// 是否已收盘。
+    ///
+    /// 界面必须把未收盘的最后一根画成动态的——它每时每刻都在变。更重要的是
+    /// 这个标记来自后端：策略不使用未收盘 K 线，界面也不该让用户以为那根
+    /// 已经定型。
+    pub closed: bool,
+}
+
+/// K 线响应。带 `interval` 与 `symbol` 回显，避免多标签页时序错乱时张冠李戴。
+#[derive(Debug, Serialize)]
+pub struct KlinesDto {
+    pub symbol: String,
+    pub interval: String,
+    pub candles: Vec<CandleDto>,
+    /// 数据来源，界面需要展示。
+    ///
+    /// 「本地归档」与「币安实时」在覆盖范围与可信度上不同——前者是回测用的
+    /// 同一份数据，后者只服务看盘。混在一起而不标注，用户会以为回测覆盖到
+    /// 了图表上的每一根 K 线。
+    pub source: String,
+}
+
+/// 盘口一档。
+#[derive(Debug, Serialize)]
+pub struct LevelDto {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+    /// 该档的累计量（从最优价算起）。界面画深度条用，避免前端累加。
+    #[serde(with = "rust_decimal::serde::str")]
+    pub cumulative: Decimal,
+}
+
+/// 盘口快照。
+#[derive(Debug, Serialize)]
+pub struct BookDto {
+    pub symbol: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub bid: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub ask: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub mid: Decimal,
+    /// 价差（绝对值）。
+    #[serde(with = "rust_decimal::serde::str")]
+    pub spread: Decimal,
+    /// 价差相对于中间价的**基点**。
+    ///
+    /// 做市看这个数而不是绝对值：4bp 的止盈距离在 0.5bp 价差下和 3bp 价差下
+    /// 是两门完全不同的生意。
+    #[serde(with = "rust_decimal::serde::str")]
+    pub spread_bp: Decimal,
+    pub bids: Vec<LevelDto>,
+    pub asks: Vec<LevelDto>,
+}
+
+/// 最近成交一笔。
+#[derive(Debug, Serialize)]
+pub struct TradeDto {
+    pub trade_id: u64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+    /// 是否买方为挂单方（即**卖方主动**）。
+    pub is_buyer_maker: bool,
+    /// 成交时刻（Unix 毫秒，字符串）。
+    ///
+    /// 成交流按时间倒序展示，前端**不做时间算术**，只比较大小。传字符串是
+    /// 为了与其余数值字段一致——一旦将来精度到微秒，`i64` 转 `f64` 会静默
+    /// 丢位，而字符串不会。
+    pub time: String,
+}
+
+/// K 线查询参数。
+#[derive(Debug, Deserialize)]
+pub struct KlinesQuery {
+    pub symbol: Option<String>,
+    pub interval: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// 盘口查询参数。
+#[derive(Debug, Deserialize)]
+pub struct BookQuery {
+    pub symbol: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// 校验交易对名称。
+///
+/// 交易对会被拼进币安的查询字符串。虽然 base URL 有白名单，但交易对没有——
+/// 一个带 `&` 的"交易对"能往请求里追加参数。所以只接受大写字母与数字。
+pub fn validate_symbol(raw: &str) -> Result<String, ApiError> {
+    let s = raw.trim().to_uppercase();
+    if s.is_empty() {
+        return Err(ApiError::BadRequest("交易对不能为空".into()));
+    }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(ApiError::BadRequest(format!(
+            "交易对只能包含字母与数字，收到：{raw}"
+        )));
+    }
+    if s.len() > 32 {
+        return Err(ApiError::BadRequest(format!("交易对名称过长：{raw}")));
+    }
+    Ok(s)
+}
+
+// ---------------------------------------------------------------------------
+// 领域类型 → 行情 DTO
+// ---------------------------------------------------------------------------
+
+impl CandleDto {
+    /// 转成图表用的 K 线。
+    ///
+    /// **时间戳从毫秒转成秒**：`lightweight-charts` 的 `UTCTimestamp` 是秒。
+    pub fn from_candle(c: &Candle) -> Self {
+        Self {
+            time: c.open_time.timestamp(),
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+            volume: c.volume,
+            closed: c.closed,
+        }
+    }
+}
+
+impl TradeDto {
+    pub fn from_trade(t: &AggTrade) -> Self {
+        Self {
+            trade_id: t.trade_id,
+            price: t.price.get(),
+            quantity: t.quantity.get(),
+            is_buyer_maker: t.is_buyer_maker,
+            time: t.at.timestamp_millis().to_string(),
+        }
+    }
+}
+
+/// 把一档档的 (价, 量) 累计成深度。
+///
+/// 累计量在后端算而不是前端：前端累加会引入浮点误差，而深度条的宽度正是
+/// 用户判断"这一档厚不厚"的依据。Decimal 累加是精确的。
+fn to_levels(side: &[(Decimal, Decimal)]) -> Vec<LevelDto> {
+    let mut cum = Decimal::ZERO;
+    side.iter()
+        .map(|(p, q)| {
+            cum += *q;
+            LevelDto {
+                price: *p,
+                quantity: *q,
+                cumulative: cum,
+            }
+        })
+        .collect()
+}
+
+impl BookDto {
+    pub fn from_snapshot(symbol: &str, b: BookSnapshot) -> Self {
+        let mid = b.mid();
+        let spread = b.ask - b.bid;
+        // 基点 = 价差 / 中间价 × 10000。
+        //
+        // 必须**舍入到 2 位**：不做除法会得到 28 位小数（Decimal 的默认精度），
+        // 界面显示成 "0.0372473465921471419179780000 bp"。这个数是要给人看的，
+        // 2 位足够判断"价差是 0.04bp 还是 3bp"——那才是做市要看的差别。
+        //
+        // 中间价为 0 时（无盘口）退化为 0，而不是产生 inf 让界面显示 "Infinity"。
+        let spread_bp = if mid.is_zero() {
+            Decimal::ZERO
+        } else {
+            (spread / mid * Decimal::from(10_000)).round_dp(2)
+        };
+
+        Self {
+            symbol: symbol.to_string(),
+            bid: b.bid,
+            ask: b.ask,
+            mid,
+            spread,
+            spread_bp,
+            bids: to_levels(&b.bids),
+            asks: to_levels(&b.asks),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 数值序列化
 // ---------------------------------------------------------------------------
 
@@ -787,6 +1061,119 @@ mod tests {
         }
     }
 
+    // ---- 限流语义必须原样穿过 API 层 ----
+    //
+    // 事故里的放大器之一：429/418 被压平成 500，前端没有退避依据，
+    // 于是继续按原频率重试，把 429 拖成了 20 分钟的 418 封禁。
+
+    /// 上游限流必须映射到 **HTTP 429**，不能是 500。
+    #[test]
+    fn rate_limited_maps_to_429_not_500() {
+        let e = ApiError::from(exchange::ExchangeError::RateLimited {
+            retry_after_ms: 1_234_000,
+        });
+        assert_eq!(e.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(e.code(), "rate_limited");
+        assert_ne!(e.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// `Retry-After` 必须以**秒**出现在响应头里——这是前端的退避依据。
+    #[test]
+    fn rate_limited_response_carries_retry_after_in_seconds() {
+        let e = ApiError::RateLimited {
+            retry_after_ms: 1_234_000,
+        };
+        let resp = e.into_response();
+        let ra = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("必须带 Retry-After 响应头")
+            .to_str()
+            .unwrap();
+        assert_eq!(ra, "1234", "1234 秒应原样传出，不是毫秒");
+    }
+
+    /// 错误响应必须带上 [`ApiErrorInfo`]，日志中间件靠它记下"失败的是什么"。
+    #[test]
+    fn error_response_carries_info_for_logging() {
+        let resp = ApiError::Internal("盘口：HTTP 502".into()).into_response();
+        let info = resp
+            .extensions()
+            .get::<ApiErrorInfo>()
+            .expect("错误响应应带 ApiErrorInfo");
+        assert_eq!(info.code, "internal");
+        assert!(info.message.contains("HTTP 502"), "{}", info.message);
+    }
+
+    /// 不足 1 秒要向上取整：向下取整会让客户端在还差几百毫秒时重试，
+    /// 那正是"继续打"从而把封禁拖长的情形。
+    #[test]
+    fn retry_after_rounds_up_and_is_at_least_one() {
+        let secs = |ms: u64| {
+            ApiError::RateLimited { retry_after_ms: ms }
+                .into_response()
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(secs(1), "1", "最小是 1 秒，不能是 0");
+        assert_eq!(secs(1_001), "2", "向上取整");
+        assert_eq!(secs(2_000), "2", "正好整除");
+    }
+
+    /// 只有限流才带 `Retry-After`，其他错误带上会让前端做出错误判断。
+    #[test]
+    fn only_rate_limit_sets_retry_after() {
+        for e in [
+            ApiError::BadRequest("坏的参数".into()),
+            ApiError::Internal("炸了".into()),
+            ApiError::NotFound("没有".into()),
+            ApiError::Conflict("冲突".into()),
+        ] {
+            assert!(
+                e.into_response()
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "非限流错误不应带 Retry-After"
+            );
+        }
+    }
+
+    /// 非限流的交易所错误仍按原有分类走——这次改动不能顺手改了别的语义。
+    #[test]
+    fn other_exchange_errors_keep_their_classification() {
+        let bad = ApiError::from(exchange::ExchangeError::Definitive(
+            "-1121 合约不存在".into(),
+        ));
+        assert_eq!(bad.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let unknown = ApiError::from(exchange::ExchangeError::Unknown("超时".into()));
+        assert_eq!(
+            unknown.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let fatal = ApiError::from(exchange::ExchangeError::Fatal("配置错误".into()));
+        assert_eq!(
+            fatal.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// 限流的正文必须说清等多久，而不是只说"失败了"。
+    #[test]
+    fn rate_limit_message_states_the_wait() {
+        let msg = ApiError::RateLimited {
+            retry_after_ms: 60_000,
+        }
+        .to_string();
+        assert!(msg.contains("60000"), "应包含等待毫秒数：{msg}");
+    }
+
     /// `num()` 是所有数值传输的基础：去尾随零但不丢精度。
     ///
     /// 尾随零不去掉会让前端显示 `3200.00`、`25.0000` 这种难看的值，而且
@@ -1061,5 +1448,188 @@ mod tests {
         ] {
             assert!(!stand_down_message(r).is_empty());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 行情 DTO
+    // -----------------------------------------------------------------------
+
+    /// 时间戳单位是**秒**——图表库要的就是秒。
+    ///
+    /// 传毫秒会让图表把时间解释到公元 5 万年，坐标轴显示成一堆看不出问题的
+    /// 怪日期。这个错误不会报错，只会让图看起来"有点怪"，所以必须锁住。
+    #[test]
+    fn candle_timestamp_is_seconds_not_millis() {
+        let open_time = chrono::DateTime::parse_from_rfc3339("2026-09-26T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let c = Candle {
+            open_time,
+            open: dec!(2684.75),
+            high: dec!(2690),
+            low: dec!(2680),
+            close: dec!(2688),
+            volume: dec!(120),
+            closed: true,
+        };
+
+        let dto = CandleDto::from_candle(&c);
+
+        assert_eq!(dto.time, 1_790_380_800, "应为 Unix 秒");
+        // 毫秒会大 1000 倍——这个断言就是防它
+        assert!(dto.time < 10_000_000_000, "秒级时间戳不可能是 13 位");
+        assert_eq!(dto.open, dec!(2684.75));
+        assert!(dto.closed);
+    }
+
+    /// 未收盘的 K 线必须如实传递——界面靠它把最后一根画成动态的。
+    #[test]
+    fn unclosed_candle_flag_is_preserved() {
+        let c = Candle {
+            open_time: Utc::now(),
+            open: dec!(1),
+            high: dec!(2),
+            low: dec!(1),
+            close: dec!(2),
+            volume: dec!(1),
+            closed: false,
+        };
+        assert!(!CandleDto::from_candle(&c).closed);
+    }
+
+    /// 深度必须累计。前端累加会引入浮点误差，而条的宽度就是用户判断
+    /// "这一档厚不厚"的依据。
+    #[test]
+    fn book_levels_are_cumulative() {
+        let book = BookSnapshot {
+            bid: dec!(100),
+            ask: dec!(100.02),
+            bids: vec![
+                (dec!(100), dec!(2)),
+                (dec!(99.99), dec!(3)),
+                (dec!(99.98), dec!(5)),
+            ],
+            asks: vec![(dec!(100.02), dec!(1)), (dec!(100.03), dec!(4))],
+            at: Utc::now(),
+        };
+
+        let dto = BookDto::from_snapshot("ETHUSDC", book);
+
+        assert_eq!(dto.bids[0].cumulative, dec!(2));
+        assert_eq!(dto.bids[1].cumulative, dec!(5), "2 + 3");
+        assert_eq!(dto.bids[2].cumulative, dec!(10), "2 + 3 + 5");
+        assert_eq!(dto.asks[0].cumulative, dec!(1));
+        assert_eq!(dto.asks[1].cumulative, dec!(5), "1 + 4");
+    }
+
+    /// 价差基点必须舍入到 2 位。
+    ///
+    /// 不做舍入会得到 Decimal 的默认 28 位小数，界面显示成
+    /// `0.0372473465921471419179780000 bp`。这个数是给人看的。
+    #[test]
+    fn spread_bp_is_rounded_to_two_decimals() {
+        let book = BookSnapshot {
+            bid: dec!(2684.75),
+            ask: dec!(2684.76),
+            bids: vec![],
+            asks: vec![],
+            at: Utc::now(),
+        };
+        let dto = BookDto::from_snapshot("ETHUSDC", book);
+
+        assert_eq!(dto.spread, dec!(0.01));
+        assert_eq!(
+            dto.spread_bp,
+            dec!(0.04),
+            "0.01/2684.755×10000 ≈ 0.0372 → 0.04"
+        );
+        // 小数位不超过 2
+        assert!(dto.spread_bp.scale() <= 2, "实际：{}", dto.spread_bp);
+    }
+
+    /// 中间价为 0（无盘口）时不能产生 inf 或 NaN。
+    #[test]
+    fn empty_book_does_not_produce_infinity() {
+        let book = BookSnapshot {
+            bid: Decimal::ZERO,
+            ask: Decimal::ZERO,
+            bids: vec![],
+            asks: vec![],
+            at: Utc::now(),
+        };
+        let dto = BookDto::from_snapshot("ETHUSDC", book);
+
+        assert_eq!(dto.spread_bp, Decimal::ZERO);
+        assert!(dto.mid.is_zero());
+        assert!(dto.spread.is_zero());
+    }
+
+    #[test]
+    fn book_mid_is_the_average_of_bid_and_ask() {
+        let book = BookSnapshot {
+            bid: dec!(100),
+            ask: dec!(101),
+            bids: vec![],
+            asks: vec![],
+            at: Utc::now(),
+        };
+        assert_eq!(BookDto::from_snapshot("X", book).mid, dec!(100.5));
+    }
+
+    /// 成交时间传字符串——将来精度到微秒时 `i64` 转 `f64` 会静默丢位。
+    #[test]
+    fn trade_time_is_a_string() {
+        let t = AggTrade {
+            trade_id: 42,
+            price: Price::new(dec!(2684.75)),
+            quantity: Qty::new(dec!(0.009)),
+            is_buyer_maker: true,
+            at: Utc::now(),
+        };
+        let dto = TradeDto::from_trade(&t);
+        assert_eq!(dto.trade_id, 42);
+        assert!(dto.is_buyer_maker, "卖方主动必须如实传递");
+        assert!(dto.time.parse::<i64>().is_ok(), "时间应为可解析的字符串");
+    }
+
+    // -----------------------------------------------------------------------
+    // 交易对校验
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn symbol_is_normalized_to_uppercase() {
+        assert_eq!(validate_symbol("ethusdc").unwrap(), "ETHUSDC");
+        assert_eq!(validate_symbol("  ETHUSDC  ").unwrap(), "ETHUSDC");
+    }
+
+    /// 交易对会被拼进币安的查询字符串。带 `&` 的值能往请求里追加参数，
+    /// 带 `/` 的能改路径。所以只接受字母与数字。
+    #[test]
+    fn symbol_rejects_injection_attempts() {
+        for bad in [
+            "ETH&limit=1",
+            "ETH USDC",
+            "ETH/USDC",
+            "../../etc/passwd",
+            "ETH?x=1",
+            "ETH%26",
+            r"ETH\USDC",
+        ] {
+            assert!(validate_symbol(bad).is_err(), "「{bad}」不应被接受");
+        }
+    }
+
+    #[test]
+    fn symbol_rejects_empty_and_overlong() {
+        assert!(validate_symbol("").is_err());
+        assert!(validate_symbol("   ").is_err());
+        assert!(validate_symbol(&"A".repeat(33)).is_err());
+        assert!(validate_symbol(&"A".repeat(32)).is_ok());
+    }
+
+    /// 数字交易对（TradFi 编码）也必须能通过。
+    #[test]
+    fn symbol_accepts_digits() {
+        assert_eq!(validate_symbol("1000PEPEUSDC").unwrap(), "1000PEPEUSDC");
     }
 }

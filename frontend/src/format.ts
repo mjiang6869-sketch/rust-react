@@ -75,12 +75,12 @@ export function duration(secs: number): string {
   return `${h} 小时 ${m} 分`
 }
 
-/** 时刻 → 本地可读。 */
+/** 时刻 → UTC+8 可读；不依赖浏览器所在时区。 */
 export function time(iso: string | null | undefined): string {
   if (iso === null || iso === undefined || iso === '') return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
-  return d.toLocaleString('zh-CN', { hour12: false })
+  return d.toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })
 }
 
 /** 只显示时间部分。 */
@@ -88,7 +88,7 @@ export function clock(iso: string | null | undefined): string {
   if (iso === null || iso === undefined || iso === '') return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
-  return d.toLocaleTimeString('zh-CN', { hour12: false })
+  return d.toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })
 }
 
 /**

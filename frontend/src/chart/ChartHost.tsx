@@ -1,19 +1,13 @@
 // 图表宿主。**这是唯一接触 lightweight-charts 的 React 文件。**
 //
-// # 性能铁律
+// 历史加载/补齐用 setData；实时推送只更新末根或追加新根。
+// 指纹覆盖完整 OHLCV，收盘价不变但成交量变化时也必须更新。
 //
-// K 线数据**不经过 React state**。每根 K 线更新都触发 React 重渲染会让整棵树
-// 重新协调——在 1 分钟 K 线加上实时推送的场景下这是最大的性能陷阱。
+// # 为什么缩放位置必须保住
 //
-// 正确做法是数据直接从 WebSocket 处理器进 series（`series.update()`），
-// React 只负责创建与销毁图表实例。
-//
-// # 为什么把图表放在独立组件而不是内联在 App 里
-//
-// lightweight-charts 是命令式 API（创建实例、附加 series、订阅事件），而
-// React 是声明式的。混在一起最容易出的错是「effect 依赖变化导致图表被反复
-// 重建」——图表每次重建都会丢失缩放位置与所有标注。这里用 ref 持有实例，
-// 且 effect 的依赖列表是空的（只在挂载时创建一次）。
+// 用户手动缩放到某段区间后，如果每次数据刷新都 `fitContent`，视图会跳回
+// 全览——这是行情软件最让人恼火的体验之一。所以只在**首次加载**和**换周期**
+// 时自适应，后续刷新保持用户当前的缩放。
 
 import { useEffect, useRef } from 'react'
 import {
@@ -23,33 +17,34 @@ import {
   type IChartApi,
   type ISeriesApi,
   type UTCTimestamp,
+  TickMarkType,
+  type Time,
 } from 'lightweight-charts'
 
 import type { CandleBar } from '../api/types'
 import { OrderLines } from './orderLines'
+import { chartUpdatePlan } from './chartUpdate'
 
 export interface ChartHostProps {
-  /** 初始 K 线。后续更新通过 `seriesRef` 直接推入，不走 React。 */
-  initialCandles: CandleBar[]
+  /** 已收盘的 K 线。 */
+  candles: CandleBar[]
+  /** 当前正在形成的一根（`closed: false`）。画成动态的。 */
+  lastCandle: CandleBar | null
   /** 持仓与订单的价位线。 */
   levels: { entry: string | null; stop: string | null; takeProfits: string[] }
-  /** 供父组件拿到 series，用于直接推送更新。 */
-  onReady?: (handle: ChartHandle) => void
-  height?: number
-}
-
-/** 供外部直接操作图表（绕过 React）。 */
-export interface ChartHandle {
-  updateCandle: (bar: CandleBar) => void
-  setCandles: (bars: CandleBar[]) => void
-  fitContent: () => void
+  /** 周期标识。变化时重置缩放位置。 */
+  intervalKey: string
+  historyReady?: boolean
+  height?: number | string
 }
 
 export function ChartHost({
-  initialCandles,
+  candles,
+  lastCandle,
   levels,
-  onReady,
-  height = 420,
+  intervalKey,
+  height = 460,
+  historyReady = true,
 }: ChartHostProps) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -57,99 +52,99 @@ export function ChartHost({
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
   const orderLinesRef = useRef<OrderLines | null>(null)
 
-  // 创建图表。依赖列表刻意为空——只在挂载时创建一次。
+  // 保留上一次数据，判断推送可否增量更新。
+  const previousBarsRef = useRef<CandleBar[]>([])
+  // 上一次的周期，用于判断是否要重新自适应
+  const lastIntervalRef = useRef<string>('')
+
+  // --- 创建图表。依赖列表刻意为空：只在挂载时创建一次。 ---
   useEffect(() => {
     const container = containerRef.current
     if (container === null) return
 
+    // Canvas 读取同一套语义色，避免 K 线与盘口的涨跌颜色不一致。
+    const style = getComputedStyle(container)
+    const theme = {
+      bg: style.getPropertyValue('--bg-panel').trim(),
+      text: style.getPropertyValue('--text-dim').trim(),
+      grid: style.getPropertyValue('--border').trim(),
+      border: style.getPropertyValue('--border').trim(),
+      up: style.getPropertyValue('--pos').trim(),
+      down: style.getPropertyValue('--neg').trim(),
+      crosshair: style.getPropertyValue('--text-dim').trim(),
+    }
     const chart = createChart(container, {
       layout: {
-        background: { color: '#0f1115' },
-        textColor: '#c9d1d9',
+        background: { color: theme.bg },
+        textColor: theme.text,
         attributionLogo: false,
+        fontFamily:
+          "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace",
+        fontSize: 12,
       },
       grid: {
-        vertLines: { color: '#1c2029' },
-        horzLines: { color: '#1c2029' },
+        vertLines: { color: theme.grid },
+        horzLines: { color: theme.grid },
       },
-      crosshair: { mode: 1 },
-      rightPriceScale: { borderColor: '#2a3038' },
+      crosshair: {
+        mode: 1,
+        vertLine: { color: theme.crosshair, labelBackgroundColor: '#2b323d' },
+        horzLine: { color: theme.crosshair, labelBackgroundColor: '#2b323d' },
+      },
+      rightPriceScale: {
+        borderColor: theme.border,
+        // 做市看的是 bp 级波动，价格轴需要更多刻度
+        scaleMargins: { top: 0.08, bottom: 0.22 },
+      },
       timeScale: {
-        borderColor: '#2a3038',
+        borderColor: theme.border,
         timeVisible: true,
         secondsVisible: false,
+        rightOffset: 4,
+        tickMarkFormatter: (time: Time, type: TickMarkType) => {
+          const options: Intl.DateTimeFormatOptions =
+            type === TickMarkType.Year ? { year: 'numeric' } :
+            type === TickMarkType.Month ? { month: 'short' } :
+            type === TickMarkType.DayOfMonth ? { month: '2-digit', day: '2-digit' } :
+            { hour: '2-digit', minute: '2-digit', hour12: false }
+          return chartTime(time, options)
+        },
       },
-      localization: {
-        // 中文界面：时间轴与价格轴都用本地格式
-        locale: 'zh-CN',
-      },
+      localization: { locale: 'zh-CN', timeFormatter: (time: Time) => chartTime(time, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) },
     })
 
     // v5 用 addSeries(CandlestickSeries) 而非 addCandlestickSeries()
-    const candles = chart.addSeries(CandlestickSeries, {
-      upColor: '#26a69a',
-      downColor: '#ef5350',
-      borderUpColor: '#26a69a',
-      borderDownColor: '#ef5350',
-      wickUpColor: '#26a69a',
-      wickDownColor: '#ef5350',
+    const candlesSeries = chart.addSeries(CandlestickSeries, {
+      upColor: theme.up,
+      downColor: theme.down,
+      borderUpColor: theme.up,
+      borderDownColor: theme.down,
+      wickUpColor: theme.up,
+      wickDownColor: theme.down,
+      // 未收盘的那根用细边框区分，让人一眼看出它还没定型
+      borderVisible: true,
     })
 
     const volume = chart.addSeries(HistogramSeries, {
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
+      lastValueVisible: false,
+      priceLineVisible: false,
     })
     // 成交量单独一栏，避免压扁价格轴
     chart.priceScale('volume').applyOptions({
-      scaleMargins: { top: 0.8, bottom: 0 },
+      scaleMargins: { top: 0.82, bottom: 0 },
     })
 
     chartRef.current = chart
-    candleSeriesRef.current = candles
+    candleSeriesRef.current = candlesSeries
     volumeSeriesRef.current = volume
-
-    const handle: ChartHandle = {
-      updateCandle: (bar) => {
-        candles.update({
-          time: bar.time as UTCTimestamp,
-          open: bar.open,
-          high: bar.high,
-          low: bar.low,
-          close: bar.close,
-        })
-        volume.update({
-          time: bar.time as UTCTimestamp,
-          value: bar.volume,
-          color: bar.close >= bar.open ? '#26a69a55' : '#ef535055',
-        })
-      },
-      setCandles: (bars) => {
-        candles.setData(
-          bars.map((b) => ({
-            time: b.time as UTCTimestamp,
-            open: b.open,
-            high: b.high,
-            low: b.low,
-            close: b.close,
-          })),
-        )
-        volume.setData(
-          bars.map((b) => ({
-            time: b.time as UTCTimestamp,
-            value: b.volume,
-            color: b.close >= b.open ? '#26a69a55' : '#ef535055',
-          })),
-        )
-      },
-      fitContent: () => chart.timeScale().fitContent(),
-    }
-    onReady?.(handle)
 
     // 容器尺寸变化时重算宽度——不做的话窗口缩放会让图表留白。
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0]
       if (entry !== undefined) {
-        chart.applyOptions({ width: entry.contentRect.width })
+        chart.applyOptions({ width: Math.floor(entry.contentRect.width), height: Math.floor(entry.contentRect.height) })
       }
     })
     observer.observe(container)
@@ -162,45 +157,66 @@ export function ChartHost({
       volumeSeriesRef.current = null
       orderLinesRef.current = null
     }
-  }, [onReady])
-
-  // 初始数据。只在挂载时设置一次；后续更新走 handle。
-  useEffect(() => {
-    if (initialCandles.length === 0) return
-    const candles = candleSeriesRef.current
-    const volume = volumeSeriesRef.current
-    if (candles === null || volume === null) return
-
-    candles.setData(
-      initialCandles.map((b) => ({
-        time: b.time as UTCTimestamp,
-        open: b.open,
-        high: b.high,
-        low: b.low,
-        close: b.close,
-      })),
-    )
-    volume.setData(
-      initialCandles.map((b) => ({
-        time: b.time as UTCTimestamp,
-        value: b.volume,
-        color: b.close >= b.open ? '#26a69a55' : '#ef535055',
-      })),
-    )
-    chartRef.current?.timeScale().fitContent()
-    // 刻意只在挂载时执行——后续数据更新通过 handle 直接推入。
-    // eslint 之外的说明：initialCandles 变化是父组件重新渲染导致的，
-    // 这里不希望重置用户的缩放位置。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // 价位线。这些可以走 React，因为它们的更新频率远低于 K 线。
+  // --- 数据更新 ---
   useEffect(() => {
-    const candles = candleSeriesRef.current
-    if (candles === null) return
+    const series = candleSeriesRef.current
+    const volume = volumeSeriesRef.current
+    if (series === null || volume === null) return
+
+    // 已收盘 + 未收盘拼成完整序列。图表需要连续的时间轴，
+    // 所以未收盘那根也必须在数据里。
+    const all = lastCandle === null ? candles : [...candles, lastCandle]
+
+    const previous = previousBarsRef.current
+    const sameInterval = lastIntervalRef.current === intervalKey
+    const plan = chartUpdatePlan(previous, all, sameInterval)
+    if (plan.kind === 'skip') return
+    const container = containerRef.current
+    if (container === null) return
+    const style = getComputedStyle(container)
+    const up = style.getPropertyValue('--pos').trim()
+    const down = style.getPropertyValue('--neg').trim()
+    const pricePoint = (b: CandleBar) => ({
+      time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close,
+    })
+    const volumePoint = (b: CandleBar) => ({
+      time: b.time as UTCTimestamp, value: b.volume,
+      color: b.close >= b.open ? `${up}44` : `${down}44`,
+    })
+    // 通常只变末根（或收盘后追加一根），走增量更新；补历史才整段替换。
+    if (plan.kind === 'update') {
+      for (const bar of all.slice(plan.from)) {
+        series.update(pricePoint(bar))
+        volume.update(volumePoint(bar))
+      }
+    } else {
+      series.setData(all.map(pricePoint))
+      volume.setData(all.map(volumePoint))
+    }
+    previousBarsRef.current = all
+
+    // 只在首次加载、或周期变化时自适应缩放。
+    // 每次推送都 fitContent 会把用户的缩放位置冲掉。
+    if (
+      lastIntervalRef.current !== intervalKey ||
+      lastIntervalRef.current === ''
+    ) {
+      if (all.length > 0 && historyReady) {
+        lastIntervalRef.current = intervalKey
+        chartRef.current?.timeScale().fitContent()
+      }
+    }
+  }, [candles, lastCandle, intervalKey, historyReady])
+
+  // --- 价位线。更新频率远低于 K 线，可以走 React。 ---
+  useEffect(() => {
+    const series = candleSeriesRef.current
+    if (series === null) return
 
     if (orderLinesRef.current === null) {
-      orderLinesRef.current = new OrderLines(candles)
+      orderLinesRef.current = new OrderLines(series)
     }
     orderLinesRef.current.apply(levels)
   }, [levels])
@@ -210,7 +226,15 @@ export function ChartHost({
       ref={containerRef}
       style={{ width: '100%', height }}
       role="img"
-      aria-label="价格图表，显示 K 线与持仓价位"
+      aria-label="价格走势图，含 K 线与持仓价位线"
     />
   )
+}
+
+/** 只格式化坐标标签，原始 UTC 时间戳不变。 */
+function chartTime(value: Time, options: Intl.DateTimeFormatOptions): string {
+  const date = typeof value === 'number' ? new Date(value * 1000)
+    : typeof value === 'string' ? new Date(value)
+    : new Date(Date.UTC(value.year, value.month - 1, value.day))
+  return date.toLocaleString('zh-CN', { ...options, timeZone: 'Asia/Shanghai' })
 }

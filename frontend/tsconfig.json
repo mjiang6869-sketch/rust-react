@@ -15,7 +15,10 @@
     "isolatedModules": true,
     "skipLibCheck": true,
     "noEmit": true,
+    /** `scripts/` 下的离线检查脚本用 Node 直接跑，导入必须带 `.ts` 后缀
+     *  （Node 的类型剥离器不做后缀推断）。这是那唯一一处需要的放宽。 */
+    "allowImportingTsExtensions": true,
     "types": ["vite/client"]
   },
-  "include": ["src"]
+  "include": ["src", "scripts"]
 }

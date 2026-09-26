@@ -29,11 +29,16 @@ crates/
 ├── sim/          撮合与回测：成交模型 M0/M1、成交带、反欺指标、回测引擎
 ├── store/        热状态持久化：SQLite schema、迁移、订单与历史仓储
 ├── strategies/   策略实现
-├── exchange/     币安客户端：签名、合约规则解析、REST 客户端
+├── exchange/     币安客户端：签名、合约规则解析、REST 客户端、公开行情
+├── engine/       编排层：模拟盘引擎（状态、保护单管理、安全闸门）
+├── api/          HTTP + WebSocket：路由、DTO、共享状态
 └── cli/          命令行入口
+apps/server/      服务端二进制
+frontend/         React 界面
 ```
 
-依赖方向严格向内：`cli` → `strategies` / `exchange` / `store` / `sim` / `data` → `domain`。
+依赖方向严格向内：
+`cli` / `apps/server` → `api` / `engine` → `strategies` / `exchange` / `store` / `sim` / `data` → `domain`。
 
 **`domain` 的零 I/O 是硬约束**，CI 校验：
 
@@ -112,6 +117,27 @@ cargo tree -p domain | grep -E 'tokio|reqwest|duckdb|axum'   # 必须无输出
 - `FeeSource::PromotionalAssumed` 必须让回测结果标记为 `incomplete`。
 - 每份回测都报告「0% 费率 vs 常规费率」两组 P&L。
 
+### 行情数据的两条通路，不要混淆
+
+| 通路 | 用途 | 来源 | 可复现 |
+| --- | --- | --- | --- |
+| **本地归档** | 回测、覆盖查询 | `data/lake/` Parquet | ✅ 有校验和 |
+| **币安公开行情** | 看盘（K 线走 REST；盘口、成交流走推送） | `/api/v1/market/*` | ❌ 实时快照 |
+
+图表走第二条是因为打开界面时本地通常什么都还没下载。**回测永远走第一条。**
+两条通路的覆盖区间不同，所以行情接口的响应必须带 `source` 字段，界面必须
+把它显示出来——不显示的话用户会以为图表覆盖的区间就是回测覆盖的区间。
+
+### 前端不计算交易价格
+
+**前端永远不做价格算术。** 它发 `ManualPlan` 意图，后端用 `ProtectionPlanner`
+编译出具体价位。前端做算术就会出现第四份止盈公式，而那份公式会和其余三份
+分叉——这正是重写前那个 bug 的成因。
+
+唯一的数值换算例外是图表层：`lightweight-charts` 的 API 要求 `number`，所以
+后端传来的字符串价格在 `chart/useKlines.ts` 里转成 `number`。**转换后的值只
+供图表绘制，不参与任何算术、不用于显示。**
+
 ## Rust 代码规范
 
 - 稳定版 Rust、`edition = "2024"`。提交前运行 `cargo fmt --check` 与
@@ -144,6 +170,10 @@ cargo tree -p domain | grep -E 'tokio|reqwest|duckdb|axum'   # 必须无输出
 - 价格量化 → tick 边界双向往返、三种 `PriceRole`、幂等性
 - 订单状态机 → 含 `Unknown` 的唯一出口是查询
 - SQLite 迁移 → 未知版本拒绝、外键生效、金额列必须是 TEXT
+- 行情 DTO → 时间戳单位（K 线是秒、成交是毫秒字符串）、深度累计、价差舍入、
+  交易对注入拒绝、空盘口不产生 inf
+- API 路由 → 逐路径断言**不返回 404**（用非法参数让请求在发网络前被拒），
+  而不是只检查一个字符串数组的长度
 
 ## 文件、配置与依赖
 

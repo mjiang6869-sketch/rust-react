@@ -541,3 +541,93 @@ async fn errors_are_structured_json() {
     assert!(body["code"].is_string(), "错误必须带 code：{body}");
     assert!(body["message"].is_string(), "错误必须带可读消息：{body}");
 }
+
+// ---------------------------------------------------------------------------
+// 行情
+// ---------------------------------------------------------------------------
+
+/// 路由必须真的注册，而不只是出现在某个数组里。
+///
+/// 用非法交易对请求是刻意的：它在**任何网络调用之前**就被拒绝，所以这个
+/// 测试不需要网络，也不依赖币安是否可达。404 说明路由不存在（真正的失败），
+/// 400 说明请求到达了处理函数（正是我们要的）。
+#[tokio::test]
+async fn market_routes_are_registered() {
+    let s = test_state();
+
+    for path in [
+        "/api/v1/market/klines?symbol=%21%21&interval=1m",
+        "/api/v1/market/book?symbol=%21%21",
+        "/api/v1/market/trades?symbol=%21%21",
+        // 推送路由在升级为 WebSocket **之前**校验交易对，所以普通 GET 也能
+        // 拿到 400——证明它注册了，且非法交易对到不了上游 URL。
+        "/api/v1/market/stream?symbol=%21%21",
+    ] {
+        let (status, body) = get(&s, path).await;
+        assert_ne!(status, StatusCode::NOT_FOUND, "{path} 未注册（返回 404）");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} -> {body}");
+    }
+}
+
+/// 合法交易对但不是 WebSocket 握手：必须被拒绝，且**不能**因此去连上游。
+#[tokio::test]
+async fn market_stream_requires_websocket_upgrade() {
+    let s = test_state();
+    let (status, _) = get(&s, "/api/v1/market/stream?symbol=ETHUSDC").await;
+    assert_ne!(status, StatusCode::NOT_FOUND);
+    assert!(
+        status.is_client_error(),
+        "非握手请求应是 4xx，实际 {status}"
+    );
+    assert_eq!(
+        s.market_streams().map(|m| m.active_feeds()),
+        Some(0),
+        "被拒绝的请求不应建立上游连接"
+    );
+}
+
+/// 周期只接受精确匹配。拼错的周期必须报错，而不是静默变回默认值——
+/// 用户选了 4 小时却看到 1 分钟图，是没有提示的错误。
+#[tokio::test]
+async fn market_rejects_unknown_interval() {
+    let s = test_state();
+    for bad in ["1min", "2h", "1M", ""] {
+        let (status, body) = get(
+            &s,
+            &format!("/api/v1/market/klines?symbol=ETHUSDC&interval={bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "周期「{bad}」: {body}");
+        let msg = body["message"].as_str().unwrap();
+        assert!(msg.contains("周期"), "错误应说明是周期问题：{msg}");
+    }
+}
+
+/// 交易对里的注入字符必须在任何网络调用前被拒绝。
+#[tokio::test]
+async fn market_rejects_symbol_injection() {
+    let s = test_state();
+    // 注意：`&` 在 URL 里是参数分隔符，所以这里用编码后的 %26
+    for bad in ["ETH%26limit%3D1", "ETH%2FUSDC", "%2E%2E%2F%2E%2E"] {
+        let (status, body) = get(&s, &format!("/api/v1/market/klines?symbol={bad}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "「{bad}」: {body}");
+    }
+}
+
+/// 空交易对回退到引擎配置的交易对，而不是报错或发一个空 symbol 的请求。
+#[tokio::test]
+async fn market_falls_back_to_engine_symbol() {
+    let s = test_state();
+    // symbol 省略、给出的周期非法 -> 应该先因周期报错，说明 symbol 已回退
+    let (status, body) = get(&s, "/api/v1/market/klines?interval=2h").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains("周期"), "{body}");
+}
+
+#[tokio::test]
+async fn market_stream_rejects_invalid_interval_before_connecting() {
+    let s = test_state();
+    let (status, _) = get(&s, "/api/v1/market/stream?symbol=ETHUSDC&interval=invalid").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(s.market_streams().map(|m| m.active_feeds()), Some(0));
+}

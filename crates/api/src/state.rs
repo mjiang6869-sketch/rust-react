@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use domain::ServiceMode;
 use engine::{EngineConfig, PaperEngine};
+use exchange::{BinanceClient, MarketStreams, PRODUCTION_URL};
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
@@ -60,18 +61,56 @@ pub struct AppState {
     seen_idempotency_keys: Mutex<HashSet<String>>,
     /// 当前服务模式。
     mode: Mutex<ServiceMode>,
+    /// 默认交易对。
+    ///
+    /// 单独存一份而不是每次锁引擎读 `snapshot().symbol`：那会与行情处理争锁，
+    /// 而行情处理是做市链路里最不该被阻塞的一环。这个值在构造时就固定了。
+    symbol: String,
+    /// 公开行情客户端（无需凭据）。
+    ///
+    /// 只用于**补数据**：图表要 K 线、成交流要开屏的那几笔，而本地归档可能
+    /// 还没下载完。它不是实时行情源——实时盘口与成交走 [`Self::market_streams`]，
+    /// REST 轮询做实时更新既浪费配额又慢（事故就是这么来的）。
+    ///
+    /// 惰性构造：构造失败（网络配置异常）不应该让服务起不来，界面退化成
+    /// 「暂无数据」而不是整个进程挂掉。
+    market: std::sync::OnceLock<Option<BinanceClient>>,
+    /// 上游限流冷却。
+    ///
+    /// **必须建在状态上而不是客户端内部**：封禁记在 IP 上，同一个进程里
+    /// 只要有一个客户端撞到 418，所有请求方都得一起等。放在这里的话，
+    /// 将来新增的行情客户端（或后台任务自己建的）可以 `adopt` 到同一份
+    /// 冷却上，不会各撞一次。
+    market_cooldown: exchange::Cooldown,
+    /// 行情推送（盘口与成交流）。
+    ///
+    /// 与 REST 共用 `market_cooldown`：REST 撞到 418 期间推送不去握手，推送
+    /// 握手被限流也会让 REST 一起停。构造时不连网，第一个订阅者到来时才连。
+    ///
+    /// `None` 表示行情 REST 被指到了非生产地址。推送只接生产网——测试网的
+    /// 推送入口与生产不同，混用会让盘口与 K 线来自两个不同的市场。
+    market_streams: Option<MarketStreams>,
 }
 
 impl AppState {
     pub fn new(engine: PaperEngine, db: Connection, data_root: PathBuf) -> Arc<Self> {
         let (progress_tx, _) = tokio::sync::broadcast::channel(256);
+        let symbol = engine.snapshot().symbol;
+        let market_cooldown = exchange::Cooldown::new();
+        let market_streams = market_rest_base()
+            .eq(PRODUCTION_URL)
+            .then(|| MarketStreams::production(market_cooldown.clone()));
         Arc::new(Self {
             engine: Arc::new(Mutex::new(engine)),
             db: Arc::new(Mutex::new(db)),
             data_root,
+            symbol,
             progress_tx,
             seen_idempotency_keys: Mutex::new(HashSet::new()),
             mode: Mutex::new(ServiceMode::Paper),
+            market: std::sync::OnceLock::new(),
+            market_cooldown,
+            market_streams,
         })
     }
 
@@ -82,6 +121,46 @@ impl AppState {
 
     pub fn schema_version(&self) -> i32 {
         store::CURRENT_VERSION
+    }
+
+    /// 默认交易对。
+    pub fn symbol(&self) -> String {
+        self.symbol.clone()
+    }
+
+    /// 公开行情客户端。首次调用时构造并缓存。
+    ///
+    /// base URL 可用 `RUST_CRYPTO_BINANCE_MARKET_URL` 覆盖，但只能指向
+    /// 白名单内的域名——测试网与生产网的行情数据不同，误指会让图表显示的
+    /// 价格与将要下单的价格不一致。
+    pub fn market(&self) -> Option<&BinanceClient> {
+        self.market
+            .get_or_init(|| {
+                let base = market_rest_base();
+                // 注入共享冷却：这个客户端的 429/418 会被记在状态上，
+                // 其它请求方（以及将来的 WebSocket 重连逻辑）都能看到。
+                match BinanceClient::public_with_cooldown(&base, self.market_cooldown.clone()) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!("行情客户端构造失败，图表将无数据：{e}");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// 行情上游的冷却状态。
+    ///
+    /// 给 API 层用：即便行情客户端还没构造出来，也要能回答「现在是不是
+    /// 正在被限流」，否则界面会在封禁期间一直重试并显示无意义的错误。
+    pub fn market_cooldown(&self) -> &exchange::Cooldown {
+        &self.market_cooldown
+    }
+
+    /// 行情推送。`None` 的含义见字段文档。
+    pub fn market_streams(&self) -> Option<&MarketStreams> {
+        self.market_streams.as_ref()
     }
 
     pub async fn mode(&self) -> ServiceMode {
@@ -116,6 +195,11 @@ impl AppState {
         // 没有订阅者时返回 Err，不是错误——界面可能还没打开。
         let _ = self.progress_tx.send(msg);
     }
+}
+
+/// 行情 REST 的 base URL。`RUST_CRYPTO_BINANCE_MARKET_URL` 可覆盖。
+fn market_rest_base() -> String {
+    std::env::var("RUST_CRYPTO_BINANCE_MARKET_URL").unwrap_or_else(|_| PRODUCTION_URL.to_string())
 }
 
 #[cfg(test)]
@@ -222,6 +306,19 @@ mod tests {
             completed: 1,
             failed: 0,
         });
+    }
+
+    /// 冷却状态在状态层共享——即便行情客户端还没构造，也能回答
+    /// 「现在是否被限流」。事故里界面在封禁期间一直重试就是这个信息缺失。
+    #[tokio::test]
+    async fn market_cooldown_is_shared_and_visible_before_client_exists() {
+        let s = state();
+        assert!(s.market_cooldown().remaining_ms().is_none(), "初始无冷却");
+        s.market_cooldown().arm_ms(60_000);
+        assert!(
+            s.market_cooldown().is_cooling_down(),
+            "状态层必须能看到冷却，否则界面无法退避"
+        );
     }
 
     #[tokio::test]

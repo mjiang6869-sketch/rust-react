@@ -25,6 +25,7 @@ use domain::{ContractKind, FeeSchedule, FeeSource, Instrument, Precision, Reject
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::cooldown::{DEFAULT_RETRY_AFTER_MS, parse_banned_until_ms, parse_retry_after_opt};
 use crate::error::ExchangeError;
 
 /// 从 `exchangeInfo` 解析出的合约规则。
@@ -332,15 +333,56 @@ pub struct BinanceError {
     pub msg: String,
 }
 
+/// 限流响应里能用来算等待时间的原始信息。
+///
+/// 单独成类型而不是给 `classify_api_error` 加两个 `&str` 参数：两个裸字符串
+/// 相邻会让调用点写反顺序（`classify_api_error(status, body, header)` 编译
+/// 通过但语义错），而这里字段名是字面量。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RateLimitHint<'a> {
+    /// `Retry-After` 响应头的原值（秒）。
+    pub retry_after: Option<&'a str>,
+    /// 响应正文。418 的正文里带 `IP banned until <毫秒>`。
+    pub body: &'a str,
+}
+
 /// 把币安的 HTTP 响应转成分类后的错误。
 ///
 /// 分类依据是**能否安全重试**，而不是错误文本。
+///
+/// 没有响应头上下文时用这个重载——它会走 [`DEFAULT_RETRY_AFTER_MS`] 兜底。
+/// 能拿到响应头（`client.rs` 的发送路径）时必须用
+/// [`classify_api_error_with`]，否则真实的冷却时间会被丢掉。
 pub fn classify_api_error(status: u16, body: &str) -> ExchangeError {
-    // 限流：明确的、可等待后重试的
+    classify_api_error_with(
+        status,
+        RateLimitHint {
+            retry_after: None,
+            body,
+        },
+    )
+}
+
+/// 带响应头的错误分类。
+///
+/// # 限流等待时间的取值顺序
+///
+/// 1. `Retry-After` 头——币安的正常路径，429 与 418 都会带；
+/// 2. 正文里的 `IP banned until <毫秒>`——响应头被中间层吃掉时的唯一真相；
+/// 3. 兜底常量。
+///
+/// 顺序不能反过来：正文里的时间戳是从币安服务器时钟来的，而我们与它的
+/// 时钟偏差会让剩余时间算错；响应头给的**时长**不受时钟偏差影响。
+pub fn classify_api_error_with(status: u16, hint: RateLimitHint<'_>) -> ExchangeError {
+    let body = hint.body;
+    // 限流：明确的、可等待后重试的。等待时间必须来自响应本身——
+    // 写死成 1 秒会让调用方在封禁期内继续打，把封禁拖长。
     if status == 429 || status == 418 {
-        return ExchangeError::RateLimited {
-            retry_after_ms: 1000,
-        };
+        let from_header = parse_retry_after_opt(hint.retry_after);
+        let retry_after_ms = from_header
+            .or_else(|| parse_banned_until_ms(body, Utc::now().timestamp_millis()))
+            .unwrap_or(DEFAULT_RETRY_AFTER_MS);
+        return ExchangeError::RateLimited { retry_after_ms };
     }
 
     // 5xx：状态未知，必须先查询对账
@@ -726,6 +768,104 @@ mod tests {
             classify_api_error(418, "banned"),
             ExchangeError::RateLimited { .. }
         ));
+    }
+
+    /// **事故回归测试**：418 的真实等待时间必须来自响应，而不是写死的 1 秒。
+    #[test]
+    fn rate_limit_uses_real_retry_after_header() {
+        let e = classify_api_error_with(
+            418,
+            RateLimitHint {
+                retry_after: Some("1234"),
+                body: r#"{"code":-1003,"msg":"Way too much request weight used; IP banned until 1790354159999."}"#,
+            },
+        );
+        assert!(
+            matches!(
+                e,
+                ExchangeError::RateLimited {
+                    retry_after_ms: 1_234_000
+                }
+            ),
+            "响应头给的 1234 秒必须被保留：{e:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_prefers_header_over_body_timestamp() {
+        // 时钟偏差会让正文推算错，所以响应头优先
+        let e = classify_api_error_with(
+            429,
+            RateLimitHint {
+                retry_after: Some("30"),
+                body: r#"{"msg":"IP banned until 9999999999999."}"#,
+            },
+        );
+        assert!(matches!(
+            e,
+            ExchangeError::RateLimited {
+                retry_after_ms: 30_000
+            }
+        ));
+    }
+
+    /// 响应头缺失时，正文里的解封时间是唯一真相。
+    #[test]
+    fn rate_limit_falls_back_to_body_timestamp() {
+        let until = Utc::now().timestamp_millis() + 600_000;
+        let body = format!(r#"{{"code":-1003,"msg":"IP banned until {until}."}}"#);
+        let e = classify_api_error_with(
+            418,
+            RateLimitHint {
+                retry_after: None,
+                body: &body,
+            },
+        );
+        match e {
+            ExchangeError::RateLimited { retry_after_ms } => {
+                assert!(
+                    (598_000..=600_000).contains(&retry_after_ms),
+                    "应从正文解出约 600 秒，实际 {retry_after_ms}"
+                );
+            }
+            other => panic!("应是限流错误：{other:?}"),
+        }
+    }
+
+    /// 两者都拿不到时才用兜底值——且兜底不能是 0。
+    #[test]
+    fn rate_limit_without_any_hint_uses_conservative_default() {
+        let e = classify_api_error_with(
+            429,
+            RateLimitHint {
+                retry_after: None,
+                body: "too many requests",
+            },
+        );
+        assert!(matches!(
+            e,
+            ExchangeError::RateLimited {
+                retry_after_ms: DEFAULT_RETRY_AFTER_MS
+            }
+        ));
+        // 编译期检查：兜底值若被改成 0，这里直接编译失败。
+        const { assert!(DEFAULT_RETRY_AFTER_MS > 0, "兜底值不能允许立刻重试") };
+    }
+
+    /// 限流不能被 `retryable_without_reconcile` 误判为可重发订单。
+    #[test]
+    fn rate_limit_is_not_a_free_retry_for_orders() {
+        let e = classify_api_error_with(
+            429,
+            RateLimitHint {
+                retry_after: Some("10"),
+                body: "",
+            },
+        );
+        assert!(
+            !e.retryable_without_reconcile(),
+            "限流下重发下单必须仍然走对账：{e:?}"
+        );
     }
 
     #[test]

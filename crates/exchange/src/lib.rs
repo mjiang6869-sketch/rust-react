@@ -24,17 +24,29 @@
 
 pub mod binance;
 pub mod client;
+pub mod cooldown;
 pub mod error;
+pub mod market;
 pub mod signing;
+pub mod stream;
 
 pub use binance::{
     AcceptedOrder, AccountFeeResponse, BinanceError, ContractSpec, ExchangeInfoResponse,
-    OrderRequest, OrderResponse, RawSymbol, TriggerProtectVerdict, check_trigger_protect,
-    classify_api_error, fee_schedule_from_account, find_contract, parse_all_contracts,
-    parse_contract, reject_reason_from_code, side_tag,
+    OrderRequest, OrderResponse, RateLimitHint, RawSymbol, TriggerProtectVerdict,
+    check_trigger_protect, classify_api_error, classify_api_error_with, fee_schedule_from_account,
+    find_contract, parse_all_contracts, parse_contract, reject_reason_from_code, side_tag,
 };
 pub use client::{
     BinanceClient, Mode, PRODUCTION_URL, TESTNET_URL, exchange_mode_for, parse_available_balance,
 };
+pub use cooldown::{
+    Cooldown, DEFAULT_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS, parse_banned_until_ms, parse_retry_after,
+    parse_retry_after_opt,
+};
 pub use error::ExchangeError;
+pub use market::{Interval, KlineRow};
 pub use signing::{Credentials, SignError, endpoint_allowed, sign, signed_query, timestamp_ms};
+pub use stream::{
+    DEPTH_LEVELS, LinkState, MarketStreams, MarketView, PRODUCTION_STREAM_URL, RECENT_TRADES_CAP,
+    StreamConfig, StreamKind, stream_endpoint_allowed, stream_url,
+};

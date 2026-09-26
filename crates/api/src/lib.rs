@@ -26,11 +26,13 @@
 //! - `POST /api/v1/backtest`
 //! - `GET  /api/v1/data/coverage`、`POST /api/v1/data/download`
 //! - `POST /api/v1/live/arm`、`/disarm`、`PUT /api/v1/mode`
-//! - `GET  /api/v1/ws`
+//! - `GET  /api/v1/market/klines`、`/market/book`、`/market/trades`
+//! - `GET  /api/v1/ws`（引擎状态）、`/api/v1/market/stream`（盘口与成交推送）
 
 pub mod backtest;
 pub mod download_task;
 pub mod dto;
+pub mod market_stream;
 pub mod routes;
 pub mod state;
 pub mod ws;

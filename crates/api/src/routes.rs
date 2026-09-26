@@ -19,6 +19,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use domain::{ManualPlan, ServiceMode};
+use exchange::Interval;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -46,6 +47,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // ---- 回测 ----
         .route("/api/v1/backtest", post(run_backtest))
         .route("/api/v1/backtests", get(list_backtests))
+        // ---- 行情（图表、盘口、成交流）----
+        .route("/api/v1/market/klines", get(market_klines))
+        .route("/api/v1/market/book", get(market_book))
+        .route("/api/v1/market/trades", get(market_trades))
+        .route("/api/v1/market/stream", get(crate::market_stream::handler))
         // ---- 数据管理 ----
         .route("/api/v1/data/coverage", get(data_coverage))
         .route("/api/v1/data/download", post(start_download))
@@ -55,7 +61,42 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/mode", put(set_mode))
         // ---- 流 ----
         .route("/api/v1/ws", get(crate::ws::handler))
+        .layer(axum::middleware::from_fn(log_failures))
         .with_state(state)
+}
+
+/// 每个失败响应记一行：方法、路径、状态码、错误码、说明、耗时。
+///
+/// 事故时日志里只有"60 秒 91 次失败"，看不出是哪个接口、是限流还是别的——
+/// 错误在 handler 里被转成 JSON 之后，外层 `TraceLayer` 只看得到状态码。
+/// 这里从响应扩展里取 [`ApiErrorInfo`]，补上"失败的是什么"。
+///
+/// 只记路径不记查询串：查询串对排查帮助不大，而且不该让日志的内容取决于
+/// 调用方传了什么。
+async fn log_failures(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let status = resp.status();
+    if status.is_client_error() || status.is_server_error() {
+        let elapsed_ms = started.elapsed().as_millis();
+        let (code, message) = resp
+            .extensions()
+            .get::<ApiErrorInfo>()
+            .map(|i| (i.code, i.message.as_str()))
+            .unwrap_or(("-", ""));
+        // 4xx 里只有限流值得警告：参数错误是调用方的事，每次都 warn 会淹没真正的问题。
+        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            tracing::warn!(%method, path, status = status.as_u16(), code, message, elapsed_ms, "请求失败");
+        } else {
+            tracing::info!(%method, path, status = status.as_u16(), code, message, elapsed_ms, "请求被拒绝");
+        }
+    }
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +487,114 @@ async fn list_backtests(
 }
 
 // ---------------------------------------------------------------------------
+// 行情
+//
+// # 为什么走 REST 而不是 WebSocket
+//
+// 画一张图需要几百根历史 K 线，WebSocket 只推增量——先 REST 取种子，再 WS
+// 接增量是唯一可行的顺序。这里的三个接口负责「种子」那一半。
+//
+// # 数据来源的边界
+//
+// 这些接口**读币安公开 REST**，不是本地归档。原因：本地归档要先下载才有，
+// 而用户打开界面时通常什么都还没下。代价是这些数据不是回测用的那一份——
+// 所以响应里带 `source` 字段，界面必须显示出来。回测永远读本地归档。
+// ---------------------------------------------------------------------------
+
+/// 行情拉取失败 → API 错误，带上"在做什么"的上下文。
+///
+/// # 为什么不能一律用 `Internal`
+///
+/// 限流必须保持独立的变体（→ HTTP 429 + `Retry-After`），否则前端拿不到
+/// 退避依据，会在封禁期继续按原频率重试——那正是事故升级成 418 的路径。
+/// 这条规则由 `From<ExchangeError> for ApiError` 保证，这里只负责附加
+/// 中文上下文，**不改动错误分类**。
+fn market_error(context: &str, e: exchange::ExchangeError) -> ApiError {
+    match ApiError::from(e) {
+        // 限流是"等一会儿再来"，不是"这次失败了"——不加"失败"字样，
+        // 免得界面把它当成故障展示。
+        ApiError::RateLimited { retry_after_ms } => ApiError::RateLimited { retry_after_ms },
+        other => ApiError::Internal(format!("{context}：{other}")),
+    }
+}
+
+/// 默认 K 线周期。1 分钟是做市的基本粒度。
+const DEFAULT_INTERVAL: &str = "1m";
+/// 默认返回根数。够填满屏幕且留出滚动余量，不至于一次拉 1500 根拖慢界面。
+const DEFAULT_KLINE_LIMIT: u32 = 500;
+
+async fn market_klines(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<KlinesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let symbol = validate_symbol(q.symbol.as_deref().unwrap_or(&s.symbol()))?;
+    let iv_str = q.interval.as_deref().unwrap_or(DEFAULT_INTERVAL);
+    let interval = Interval::parse(iv_str).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "不支持的 K 线周期「{iv_str}」。支持：1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d"
+        ))
+    })?;
+    // 上限 1500 是币安的硬限制，这里再收到 1000 避免单次响应过大
+    let limit = q.limit.unwrap_or(DEFAULT_KLINE_LIMIT).clamp(1, 1000);
+
+    let client = s
+        .market()
+        .ok_or_else(|| ApiError::Internal("行情客户端不可用".into()))?;
+
+    let candles = client
+        .klines(&symbol, interval, limit)
+        .await
+        .map_err(|e| market_error("拉取 K 线失败", e))?;
+
+    Ok(Json(ApiResponse::ok(KlinesDto {
+        symbol,
+        interval: interval.as_str().to_string(),
+        candles: candles.iter().map(CandleDto::from_candle).collect(),
+        source: "币安公开行情（非本地归档）".into(),
+    })))
+}
+
+async fn market_book(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<BookQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let symbol = validate_symbol(q.symbol.as_deref().unwrap_or(&s.symbol()))?;
+    let limit = q.limit.unwrap_or(20).clamp(1, 500);
+
+    let client = s
+        .market()
+        .ok_or_else(|| ApiError::Internal("行情客户端不可用".into()))?;
+
+    let book = client
+        .depth(&symbol, limit)
+        .await
+        .map_err(|e| market_error("拉取盘口失败", e))?;
+
+    Ok(Json(ApiResponse::ok(BookDto::from_snapshot(&symbol, book))))
+}
+
+async fn market_trades(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<BookQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let symbol = validate_symbol(q.symbol.as_deref().unwrap_or(&s.symbol()))?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+
+    let client = s
+        .market()
+        .ok_or_else(|| ApiError::Internal("行情客户端不可用".into()))?;
+
+    let trades = client
+        .recent_trades(&symbol, limit)
+        .await
+        .map_err(|e| market_error("拉取成交流失败", e))?;
+
+    // 币安返回按时间升序，界面成交流最新的在最上面，所以反转
+    let list: Vec<TradeDto> = trades.iter().rev().map(TradeDto::from_trade).collect();
+    Ok(Json(ApiResponse::ok(list)))
+}
+
+// ---------------------------------------------------------------------------
 // 数据管理
 // ---------------------------------------------------------------------------
 
@@ -652,6 +801,10 @@ mod tests {
             "/api/v1/pnl",
             "/api/v1/backtest",
             "/api/v1/backtests",
+            "/api/v1/market/klines",
+            "/api/v1/market/book",
+            "/api/v1/market/trades",
+            "/api/v1/market/stream",
             "/api/v1/data/coverage",
             "/api/v1/data/download",
             "/api/v1/live/arm",
@@ -659,7 +812,7 @@ mod tests {
             "/api/v1/mode",
             "/api/v1/ws",
         ];
-        assert_eq!(paths.len(), 20);
+        assert_eq!(paths.len(), 24);
         // 路径必须是版本化的——未来breaking change要走 v2。
         for p in paths {
             assert!(p.starts_with("/api/v1/"), "路由必须版本化：{p}");
