@@ -235,7 +235,7 @@ export function BacktestPanel({ symbol, initialEquity }: Props) {
                   <span>最终权益 <strong>{num(m.final_equity, 2)}</strong></span>
                   <span>订单数 <strong>{m.trades.length}</strong></span>
                 </div>
-                <EquityCurve points={m.equity_curve} asset="USDC" trend={pnlClass(m.pnl)} />
+                <EquityCurve points={m.equity_curve} asset={result.symbol.endsWith('USDT') ? 'USDT' : 'USDC'} trend={pnlClass(m.pnl)} />
                 <div className="table-wrap">
                   <table className="data-table">
                     <thead><tr><th>入场</th><th>出场</th><th>方向</th><th className="num">数量</th><th className="num">入场价</th><th className="num">出场价</th><th>原因</th><th className="num">盈亏</th></tr></thead>
