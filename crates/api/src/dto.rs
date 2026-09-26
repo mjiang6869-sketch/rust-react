@@ -556,7 +556,7 @@ pub struct BacktestRequestDto {
 }
 
 /// 回测结果摘要。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct BacktestResultDto {
     pub symbol: String,
     pub strategy_id: String,
@@ -568,7 +568,7 @@ pub struct BacktestResultDto {
     pub verdict: VerdictDto,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct ModelResultDto {
     pub name: String,
     pub optimism: &'static str,
@@ -576,10 +576,35 @@ pub struct ModelResultDto {
     pub pnl: String,
     pub trade_count: usize,
     pub win_rate: Option<String>,
+    pub cumulative_pnl: String,
+    pub annualized_return: Option<String>,
+    pub liquidated: bool,
+    pub termination_reason: Option<String>,
+    pub equity_curve: Vec<EquityPointDto>,
+    pub trades: Vec<TradeDto>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct EquityPointDto {
+    pub at: DateTime<Utc>,
+    pub equity: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TradeDto {
+    pub entry_at: DateTime<Utc>,
+    pub exit_at: DateTime<Utc>,
+    pub side: String,
+    pub quantity: String,
+    pub entry_price: String,
+    pub exit_price: String,
+    pub fee: String,
+    pub exit_reason: String,
+    pub pnl: String,
 }
 
 /// 结论可信度。前端必须显眼展示，不能藏在折叠面板里。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct VerdictDto {
     /// 结论是否可信。
     pub conclusive: bool,

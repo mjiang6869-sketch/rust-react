@@ -84,6 +84,7 @@ pub struct TradeRecord {
 pub enum ExitKind {
     TakeProfit,
     StopLoss,
+    Liquidation,
     ForcedAtEnd,
 }
 
@@ -107,6 +108,8 @@ pub struct BacktestResult {
     pub latency: LatencyStats,
     /// 零费率与常规费率两套结果，用于展示"多少收益来自活动"。
     pub final_equity_at_standard_fee: Decimal,
+    /// 由于强平而提前终止时为 `LIQUIDATED`。
+    pub termination_reason: Option<String>,
 }
 
 /// 引擎内部的一张在途开仓单。
@@ -134,6 +137,7 @@ struct OpenPosition {
     low_since: Decimal,
     /// 止损被触发但尚未成交的时刻（用于裸露统计）。
     stop_triggered_at: Option<DateTime<Utc>>,
+    liquidation_price: Option<Decimal>,
 }
 
 /// 跑一次回测。
@@ -173,6 +177,7 @@ pub fn run(
     let mut candles: Vec<Candle> = Vec::with_capacity(config.lookback + 8);
     let mut order_seq: u64 = 0;
     let mut used_signals: Vec<DateTime<Utc>> = Vec::new();
+    let mut termination_reason: Option<String> = None;
 
     // 订单状态机。回测里也走它，保证与实盘同一套生命周期。
     let mut state = OrderBookState::new();
@@ -202,6 +207,40 @@ pub fn run(
                 if px < p.low_since {
                     p.low_since = px;
                 }
+            }
+        }
+
+        // 全仓强平必须先于止盈止损处理：一旦标记价格触及强平线，回测立即
+        // 终止，不允许策略在已经失去保证金后继续产生订单。
+        if let (Some(pos), MarketEvent::AggTrade(t)) = (position.as_ref(), event) {
+            let liquidation_hit = pos.liquidation_price.is_some_and(|lp| match pos.side {
+                Side::Buy => t.price.get() <= lp,
+                Side::Sell => t.price.get() >= lp,
+            });
+            if liquidation_hit {
+                let pos = position.take().expect("已判存在");
+                let fill_px = t.price.get();
+                let gross = match pos.side {
+                    Side::Buy => (fill_px - pos.entry_price) * pos.quantity,
+                    Side::Sell => (pos.entry_price - fill_px) * pos.quantity,
+                };
+                let fee = fill_px * pos.quantity * config.instrument.liquidation_fee;
+                total_fees += fee;
+                equity += gross - fee;
+                trades.push(TradeRecord {
+                    entry_at: pos.opened_at,
+                    exit_at: now,
+                    side: pos.side,
+                    quantity: pos.quantity,
+                    entry_price: pos.entry_price,
+                    exit_price: fill_px,
+                    fee,
+                    exit_reason: ExitKind::Liquidation,
+                    pnl: gross - fee,
+                });
+                termination_reason = Some("LIQUIDATED".to_string());
+                equity_curve.push(EquityPoint { at: now, equity });
+                break;
             }
         }
 
@@ -279,6 +318,20 @@ pub fn run(
                         high_since: px,
                         low_since: px,
                         stop_triggered_at: None,
+                        liquidation_price: match domain::cross_liquidation(
+                            &config.instrument,
+                            &domain::MarginAccount::flat(
+                                config.instrument.margin_asset.clone(),
+                                equity,
+                            ),
+                            entry.order.side,
+                            px,
+                            Qty::new(qty),
+                        ) {
+                            Ok(domain::CrossLiquidation::At(price)) => Some(price),
+                            Ok(domain::CrossLiquidation::Immediate) => Some(px),
+                            _ => None,
+                        },
                     });
                 }
             }
@@ -694,6 +747,7 @@ pub fn run(
         rejections,
         latency,
         final_equity_at_standard_fee: standard_final,
+        termination_reason,
     }
 }
 

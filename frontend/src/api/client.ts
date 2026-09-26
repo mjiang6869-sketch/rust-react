@@ -23,7 +23,7 @@ import type {
   ArchiveRange,
   AutoMakerConfig,
   AutoMakerParams,
-  BacktestResult,
+  BacktestJobSnapshot,
   BacktestRunSummary,
   Coverage,
   DownloadJob,
@@ -237,10 +237,15 @@ export const api = {
     fill_models?: string[]
     initial_equity?: string
   }) =>
-    request<BacktestResult>('/backtest', {
+    request<{ run_id: string; state: 'running' }>('/backtest', {
       method: 'POST',
       body: JSON.stringify(req),
     }),
+
+  backtestStatus: (runId?: string) =>
+    request<BacktestJobSnapshot>(`/backtest/status${runId ? `?run_id=${encodeURIComponent(runId)}` : ''}`),
+
+  symbols: () => request<string[]>('/symbols'),
 
   /**
    * K 线。

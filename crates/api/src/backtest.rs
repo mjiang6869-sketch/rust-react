@@ -13,11 +13,12 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use chrono::{Duration, NaiveDate};
+use chrono::{Datelike, Duration, Months, NaiveDate};
 use domain::{FeeSource, Instrument, MarketEvent, RiskLimits};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
-use crate::dto::{BacktestResultDto, ModelResultDto, VerdictDto};
+use crate::dto::{BacktestResultDto, EquityPointDto, ModelResultDto, TradeDto, VerdictDto};
 
 /// 一次回测请求的全部参数。
 ///
@@ -38,6 +39,14 @@ pub struct BacktestRequest<'a> {
 
 /// 跑一次回测。
 pub fn run(req: &BacktestRequest<'_>) -> Result<BacktestResultDto> {
+    run_with_progress(req, |_stage, _done, _total| {})
+}
+
+/// 与 `run` 相同，但在每个数据分片和成交模型完成时回调进度。
+pub fn run_with_progress<F>(req: &BacktestRequest<'_>, mut progress: F) -> Result<BacktestResultDto>
+where
+    F: FnMut(&str, usize, usize),
+{
     let BacktestRequest {
         data_root,
         instrument,
@@ -58,7 +67,10 @@ pub fn run(req: &BacktestRequest<'_>) -> Result<BacktestResultDto> {
     let strategy =
         strategies::by_id(strategy_id).ok_or_else(|| anyhow::anyhow!("未知策略：{strategy_id}"))?;
 
-    let (events, missing) = load_events(data_root, symbol, from, to)?;
+    let total_days = (to - from).num_days().max(0) as usize + 1;
+    let (events, missing) = load_events(data_root, symbol, from, to, |done| {
+        progress("加载数据", done, total_days);
+    })?;
     if events.is_empty() {
         bail!(
             "没有读到 {symbol} 在 {from} .. {to} 的数据。\
@@ -82,7 +94,7 @@ pub fn run(req: &BacktestRequest<'_>) -> Result<BacktestResultDto> {
 
     // 逐模型跑
     let mut results = Vec::new();
-    for name in models.iter() {
+    for (model_index, name) in models.iter().enumerate() {
         let model =
             sim::model_by_name(name).ok_or_else(|| anyhow::anyhow!("未知成交模型：{name}"))?;
         let config = sim::BacktestConfig {
@@ -121,6 +133,7 @@ pub fn run(req: &BacktestRequest<'_>) -> Result<BacktestResultDto> {
             win_rate,
             result: r,
         });
+        progress(name, model_index + 1, models.len());
     }
 
     // 构造裁决
@@ -128,13 +141,71 @@ pub fn run(req: &BacktestRequest<'_>) -> Result<BacktestResultDto> {
 
     let model_dtos: Vec<ModelResultDto> = results
         .iter()
-        .map(|m| ModelResultDto {
-            name: m.name.clone(),
-            optimism: m.optimism,
-            final_equity: m.final_equity.to_string(),
-            pnl: m.pnl.to_string(),
-            trade_count: m.trade_count,
-            win_rate: m.win_rate.clone(),
+        .map(|m| {
+            let last_at = m.result.equity_curve.last().map(|p| p.at);
+            let first_at = m.result.equity_curve.first().map(|p| p.at);
+            let annualized_return = match (
+                first_at,
+                last_at,
+                m.final_equity.to_f64(),
+                initial_equity.to_f64(),
+            ) {
+                (Some(start), Some(end), Some(final_value), Some(initial)) if initial > 0.0 => {
+                    let days = (end - start).num_seconds().max(1) as f64 / 86_400.0;
+                    Some(format!(
+                        "{:.8}",
+                        (final_value / initial).powf(365.0 / days) - 1.0
+                    ))
+                }
+                _ => None,
+            };
+            ModelResultDto {
+                name: m.name.clone(),
+                optimism: m.optimism,
+                final_equity: m.final_equity.to_string(),
+                pnl: m.pnl.to_string(),
+                trade_count: m.trade_count,
+                win_rate: m.win_rate.clone(),
+                cumulative_pnl: m.pnl.to_string(),
+                annualized_return,
+                liquidated: m.result.termination_reason.as_deref() == Some("LIQUIDATED"),
+                termination_reason: m.result.termination_reason.clone(),
+                equity_curve: m
+                    .result
+                    .equity_curve
+                    .iter()
+                    .map(|p| EquityPointDto {
+                        at: p.at,
+                        equity: p.equity.to_string(),
+                    })
+                    .collect(),
+                trades: m
+                    .result
+                    .trades
+                    .iter()
+                    .map(|t| TradeDto {
+                        entry_at: t.entry_at,
+                        exit_at: t.exit_at,
+                        side: match t.side {
+                            domain::Side::Buy => "BUY",
+                            domain::Side::Sell => "SELL",
+                        }
+                        .into(),
+                        quantity: t.quantity.to_string(),
+                        entry_price: t.entry_price.to_string(),
+                        exit_price: t.exit_price.to_string(),
+                        fee: t.fee.to_string(),
+                        exit_reason: match t.exit_reason {
+                            sim::ExitKind::TakeProfit => "TAKE_PROFIT",
+                            sim::ExitKind::StopLoss => "STOP_LOSS",
+                            sim::ExitKind::Liquidation => "LIQUIDATION",
+                            sim::ExitKind::ForcedAtEnd => "FORCED_AT_END",
+                        }
+                        .into(),
+                        pnl: t.pnl.to_string(),
+                    })
+                    .collect(),
+            }
         })
         .collect();
 
@@ -247,24 +318,47 @@ fn load_events(
     symbol: &str,
     from: NaiveDate,
     to: NaiveDate,
+    mut progress: impl FnMut(usize),
 ) -> Result<(Vec<MarketEvent>, Vec<String>)> {
     let mut all = Vec::new();
     let mut missing = Vec::new();
+    let mut done = 0usize;
 
-    let mut day = from;
-    while day <= to {
-        use chrono::Datelike;
-        match data::replay::load_day(data_root, symbol, "1m", day.year(), day.month(), day.day()) {
-            Ok(slice) => {
-                if slice.candles.is_empty() && slice.trades.is_empty() {
-                    missing.push(day.to_string());
-                } else {
-                    all.extend(slice.into_events());
+    // 以月为边界组织读取。`monthly` 在每次循环结束时被释放，避免把
+    // Parquet 解压出的成交带和最终事件数组同时扩张到多个临时副本。
+    let mut month_start = from.with_day(1).expect("合法日期");
+    while month_start <= to {
+        let next_month = month_start
+            .checked_add_months(Months::new(1))
+            .expect("日期范围过大");
+        let month_end = (next_month - Duration::days(1)).min(to);
+        let mut monthly = Vec::new();
+        let mut day = from.max(month_start);
+        while day <= month_end {
+            match data::replay::load_day(
+                data_root,
+                symbol,
+                "1m",
+                day.year(),
+                day.month(),
+                day.day(),
+            ) {
+                Ok(slice) => {
+                    if slice.candles.is_empty() && slice.trades.is_empty() {
+                        missing.push(day.to_string());
+                    } else {
+                        monthly.extend(slice.into_events());
+                    }
                 }
+                Err(_) => missing.push(day.to_string()),
             }
-            Err(_) => missing.push(day.to_string()),
+            done += 1;
+            progress(done);
+            day += Duration::days(1);
         }
-        day += Duration::days(1);
+        monthly.sort_by_key(|e| e.at());
+        all.extend(monthly);
+        month_start = next_month;
     }
 
     all.sort_by_key(|e| e.at());

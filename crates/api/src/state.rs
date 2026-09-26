@@ -49,6 +49,120 @@ pub enum ProgressMessage {
     },
 }
 
+/// 回测任务的可持久查询快照。结果只在任务完成后挂载，运行中不会把大数组
+/// 复制到状态里，避免多个刷新请求放大内存占用。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BacktestJobSnapshot {
+    pub run_id: String,
+    pub state: String,
+    pub symbol: String,
+    pub strategy_id: String,
+    pub model: Option<String>,
+    pub done: usize,
+    pub total: usize,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub result: Option<crate::dto::BacktestResultDto>,
+}
+
+impl Default for BacktestJobSnapshot {
+    fn default() -> Self {
+        Self {
+            run_id: String::new(),
+            state: "idle".into(),
+            symbol: String::new(),
+            strategy_id: String::new(),
+            model: None,
+            done: 0,
+            total: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            result: None,
+        }
+    }
+}
+
+struct BacktestJobsInner {
+    snapshot: BacktestJobSnapshot,
+}
+
+/// 同时只运行一个回测，结果保留在有界的单个快照中。
+#[derive(Clone)]
+pub struct BacktestJobs {
+    inner: Arc<StdMutex<BacktestJobsInner>>,
+}
+
+impl Default for BacktestJobs {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(BacktestJobsInner {
+                snapshot: BacktestJobSnapshot::default(),
+            })),
+        }
+    }
+}
+
+impl BacktestJobs {
+    pub fn try_start(
+        &self,
+        run_id: String,
+        symbol: String,
+        strategy_id: String,
+        total: usize,
+    ) -> Result<(), String> {
+        let mut guard = lock_backtest_inner(&self.inner);
+        if guard.snapshot.state == "running" {
+            return Err("已有回测任务在进行".into());
+        }
+        guard.snapshot = BacktestJobSnapshot {
+            run_id,
+            state: "running".into(),
+            symbol,
+            strategy_id,
+            model: None,
+            done: 0,
+            total,
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            result: None,
+        };
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> BacktestJobSnapshot {
+        lock_backtest_inner(&self.inner).snapshot.clone()
+    }
+
+    pub fn update(&self, model: Option<String>, done: usize, total: usize) {
+        let mut guard = lock_backtest_inner(&self.inner);
+        if guard.snapshot.state == "running" {
+            guard.snapshot.model = model;
+            guard.snapshot.done = done;
+            guard.snapshot.total = total;
+        }
+    }
+
+    pub fn finish(&self, result: crate::dto::BacktestResultDto) {
+        let mut guard = lock_backtest_inner(&self.inner);
+        guard.snapshot.state = "finished".into();
+        guard.snapshot.finished_at = Some(Utc::now());
+        guard.snapshot.done = guard.snapshot.total;
+        guard.snapshot.model = None;
+        guard.snapshot.result = Some(result);
+    }
+
+    pub fn fail(&self, error: String) {
+        let mut guard = lock_backtest_inner(&self.inner);
+        guard.snapshot.state = "failed".into();
+        guard.snapshot.finished_at = Some(Utc::now());
+        guard.snapshot.model = None;
+        guard.snapshot.error = Some(error);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 下载任务状态
 // ---------------------------------------------------------------------------
@@ -139,6 +253,10 @@ struct DownloadJobsInner {
 /// 从中毒的锁里也能拿到内容——下载任务的临界区从不做可能 panic 的复杂计算，
 /// 但持锁方（例如 `Drop`）绝不能因为别处的 panic 而跟着 panic 或死锁。
 fn lock_inner(inner: &StdMutex<DownloadJobsInner>) -> MutexGuard<'_, DownloadJobsInner> {
+    inner.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_backtest_inner(inner: &StdMutex<BacktestJobsInner>) -> MutexGuard<'_, BacktestJobsInner> {
     inner.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -404,6 +522,8 @@ pub struct AppState {
     market_streams: Option<MarketStreams>,
     /// 下载任务状态机。单任务，见 [`DownloadJobs`]。
     downloads: DownloadJobs,
+    /// 回测任务状态；结果仅保留最近一次，避免后台任务无限增长。
+    backtests: BacktestJobs,
     /// 币安归档列举（S3）的结果缓存。key 是 `(数据集, 交易对)`。
     ///
     /// 用 `std::sync::Mutex`：临界区只是查表/写表，从不跨 `.await`。
@@ -444,6 +564,7 @@ impl AppState {
             market_cooldown,
             market_streams,
             downloads: DownloadJobs::default(),
+            backtests: BacktestJobs::default(),
             archive_cache: StdMutex::new(HashMap::new()),
             archive_client,
         })
@@ -461,6 +582,10 @@ impl AppState {
     /// 默认交易对。
     pub fn symbol(&self) -> String {
         self.symbol.clone()
+    }
+
+    pub fn backtests(&self) -> &BacktestJobs {
+        &self.backtests
     }
 
     /// 公开行情客户端。首次调用时构造并缓存。
@@ -806,6 +931,23 @@ mod tests {
         assert!(!token.is_cancelled());
         assert!(jobs.cancel(), "有任务时应返回 true");
         assert!(token.is_cancelled(), "cancel() 必须真的触发令牌");
+    }
+
+    #[test]
+    fn backtest_job_exposes_running_progress_and_blocks_overlap() {
+        let jobs = BacktestJobs::default();
+        jobs.try_start("bt-1".into(), "BTCUSDC".into(), "range_maker".into(), 12)
+            .unwrap();
+        assert_eq!(jobs.snapshot().state, "running");
+        assert_eq!(jobs.snapshot().symbol, "BTCUSDC");
+        jobs.update(Some("M1".into()), 5, 12);
+        let snapshot = jobs.snapshot();
+        assert_eq!(snapshot.done, 5);
+        assert_eq!(snapshot.model.as_deref(), Some("M1"));
+        assert!(
+            jobs.try_start("bt-2".into(), "ETHUSDC".into(), "range_maker".into(), 1)
+                .is_err()
+        );
     }
 
     // ---- 归档缓存 TTL ----

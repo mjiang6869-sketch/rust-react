@@ -11,10 +11,11 @@
 // 的刷新频率和失败模式都不同，所以不合并成一个状态——行情断了不该让持仓
 // 显示不出来，反之亦然。
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { CandlestickChart, Radio } from 'lucide-react'
 
 import { cooldownNotice, useMarketFeed } from '../api/marketFeed'
+import { api } from '../api/client'
 import { INTERVALS, type EngineState } from '../api/types'
 import { Input } from '../components/FormControls'
 import { ChartHost } from '../chart/ChartHost'
@@ -38,6 +39,10 @@ export function MarketPage({ engine, hasPosition }: MarketPageProps) {
   const [symbol, setSymbol] = useState(engine.symbol)
   const [draftSymbol, setDraftSymbol] = useState(engine.symbol)
   const [symbolError, setSymbolError] = useState<string | null>(null)
+  const [availableSymbols, setAvailableSymbols] = useState<string[]>([engine.symbol])
+  useEffect(() => {
+    api.symbols().then((values) => setAvailableSymbols([...new Set([engine.symbol, ...values])])).catch(() => undefined)
+  }, [engine.symbol])
   return (
     <>
       <div className="market-toolbar">
@@ -57,7 +62,7 @@ export function MarketPage({ engine, hasPosition }: MarketPageProps) {
             onChange={(event) => setDraftSymbol(event.target.value)} autoComplete="off"
             spellCheck={false} aria-describedby={symbolError ? 'symbol-error' : undefined} />
           <datalist id="market-symbols">
-            {[...new Set([engine.symbol, 'ETHUSDC', 'BTCUSDC', 'SOLUSDC', 'ETHUSDT', 'BTCUSDT'])].map((value) => <option key={value} value={value} />)}
+            {availableSymbols.map((value) => <option key={value} value={value} />)}
           </datalist>
           <button type="submit" className="secondary">切换</button>
           {symbolError && <span id="symbol-error" role="alert">{symbolError}</span>}

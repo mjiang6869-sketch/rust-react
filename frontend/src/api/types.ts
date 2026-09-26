@@ -281,6 +281,12 @@ export interface ModelResult {
   pnl: string
   trade_count: number
   win_rate: string | null
+  cumulative_pnl: string
+  annualized_return: string | null
+  liquidated: boolean
+  termination_reason: string | null
+  equity_curve: BacktestEquityPoint[]
+  trades: BacktestTrade[]
 }
 
 /** 结论可信度。这是回测最重要的输出。 */
@@ -305,6 +311,37 @@ export interface BacktestResult {
   candle_count: number
   models: ModelResult[]
   verdict: BacktestVerdict
+}
+
+export interface BacktestEquityPoint {
+  at: string
+  equity: string
+}
+
+export interface BacktestTrade {
+  entry_at: string
+  exit_at: string
+  side: Side
+  quantity: string
+  entry_price: string
+  exit_price: string
+  fee: string
+  exit_reason: string
+  pnl: string
+}
+
+export interface BacktestJobSnapshot {
+  run_id: string
+  state: 'idle' | 'running' | 'finished' | 'failed'
+  symbol: string
+  strategy_id: string
+  model: string | null
+  done: number
+  total: number
+  started_at: string | null
+  finished_at: string | null
+  error: string | null
+  result: BacktestResult | null
 }
 
 export interface BacktestRunSummary {

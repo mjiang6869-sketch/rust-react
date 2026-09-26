@@ -52,6 +52,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/pnl", get(pnl_summary))
         // ---- 回测 ----
         .route("/api/v1/backtest", post(run_backtest))
+        .route("/api/v1/backtest/status", get(backtest_status))
         .route("/api/v1/backtests", get(list_backtests))
         // ---- 行情（图表、盘口、推送）----
         .route("/api/v1/market/klines", get(market_klines))
@@ -59,6 +60,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/market/stream", get(crate::market_stream::handler))
         // ---- 数据管理 ----
         .route("/api/v1/data/coverage", get(data_coverage))
+        .route("/api/v1/symbols", get(list_symbols))
         .route(
             "/api/v1/data/download",
             get(download_status).post(start_download),
@@ -439,7 +441,8 @@ async fn run_backtest(
         .unwrap_or_else(|| vec!["m0".into(), "m1".into()]);
 
     let engine = s.engine.lock().await;
-    let instrument = engine.instrument().clone();
+    let mut instrument = engine.instrument().clone();
+    instrument.symbol = req.symbol.trim().to_uppercase();
     let initial_equity = match &req.initial_equity {
         Some(s) => s
             .parse::<rust_decimal::Decimal>()
@@ -449,20 +452,160 @@ async fn run_backtest(
     let limits = engine.config().limits;
     drop(engine);
 
-    let result = crate::backtest::run(&crate::backtest::BacktestRequest {
-        data_root: &s.data_root,
-        instrument: &instrument,
-        symbol: &req.symbol,
-        strategy_id: &strategy_id,
-        from,
-        to,
-        models: &models,
-        initial_equity,
-        limits,
-    })
-    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let total = ((to - from).num_days().max(0) as usize + 1) + models.len();
+    let run_id = format!("bt-{}", uuid_like());
+    s.backtests()
+        .try_start(
+            run_id.clone(),
+            req.symbol.clone(),
+            strategy_id.clone(),
+            total,
+        )
+        .map_err(ApiError::Conflict)?;
 
-    Ok(Json(ApiResponse::ok(result)))
+    let state = s.clone();
+    let data_root = s.data_root.clone();
+    let symbol = req.symbol.clone();
+    let models_for_task = models.clone();
+    let task_run_id = run_id.clone();
+    let task_strategy_id = strategy_id.clone();
+    let persist_strategy_id = strategy_id.clone();
+    tokio::spawn(async move {
+        let job = state.backtests().clone();
+        let progress_state = state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::backtest::run_with_progress(
+                &crate::backtest::BacktestRequest {
+                    data_root: &data_root,
+                    instrument: &instrument,
+                    symbol: &symbol,
+                    strategy_id: &task_strategy_id,
+                    from,
+                    to,
+                    models: &models_for_task,
+                    initial_equity,
+                    limits,
+                },
+                |model, done, stage_total| {
+                    let loading_total = (to - from).num_days().max(0) as usize + 1;
+                    let (display_done, display_total) = if model == "加载数据" {
+                        (done, loading_total + models_for_task.len())
+                    } else {
+                        (loading_total + done, loading_total + stage_total)
+                    };
+                    progress_state.backtests().update(
+                        Some(model.to_string()),
+                        display_done,
+                        display_total,
+                    );
+                    progress_state.broadcast(crate::state::ProgressMessage::Backtest {
+                        symbol: symbol.clone(),
+                        model: model.to_string(),
+                        done: display_done,
+                        total: display_total,
+                    });
+                },
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(result)) => {
+                persist_backtest_rows(
+                    &state,
+                    &result,
+                    &task_run_id,
+                    &persist_strategy_id,
+                    initial_equity,
+                    from,
+                    to,
+                )
+                .await;
+                job.finish(result)
+            }
+            Ok(Err(error)) => job.fail(error.to_string()),
+            Err(error) => job.fail(format!("回测任务异常：{error}")),
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::ok(serde_json::json!({
+            "run_id": run_id,
+            "state": "running",
+        }))),
+    ))
+}
+
+async fn persist_backtest_rows(
+    state: &Arc<AppState>,
+    result: &crate::dto::BacktestResultDto,
+    run_id: &str,
+    strategy_id: &str,
+    initial_equity: rust_decimal::Decimal,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) {
+    let start = from.and_hms_opt(0, 0, 0).expect("日期时间有效").and_utc();
+    let end = to.and_hms_opt(23, 59, 59).expect("日期时间有效").and_utc();
+    let conn = state.db.lock().await;
+    for model in &result.models {
+        let row = store::BacktestRunRow {
+            run_id: format!("{run_id}:{}", model.name),
+            symbol: result.symbol.clone(),
+            strategy_id: strategy_id.to_string(),
+            strategy_params: "{}".into(),
+            fill_model: model.name.clone(),
+            initial_equity,
+            final_equity: model.final_equity.parse().unwrap_or(initial_equity),
+            trade_count: model.trade_count as i64,
+            start,
+            end,
+            sign_flips: result.verdict.sign_flips,
+            breakeven_fill_rate: result
+                .verdict
+                .breakeven_fill_rate
+                .as_deref()
+                .and_then(|v| v.parse().ok()),
+            adverse_markout_5s: result
+                .verdict
+                .markout_5s
+                .as_deref()
+                .and_then(|v| v.parse().ok()),
+            fee_incomplete: result.verdict.fee_incomplete,
+            gap_count: 0,
+        };
+        if let Err(error) = store::insert_backtest_run(&conn, &row) {
+            tracing::warn!(%error, run_id = %row.run_id, "写入回测历史失败");
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BacktestStatusQuery {
+    run_id: Option<String>,
+}
+
+async fn backtest_status(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<BacktestStatusQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let snapshot = s.backtests().snapshot();
+    if let Some(run_id) = q.run_id {
+        if snapshot.run_id != run_id {
+            return Err(ApiError::NotFound(
+                "回测任务不存在或已被新的任务替换".into(),
+            ));
+        }
+    }
+    Ok(Json(ApiResponse::ok(snapshot)))
+}
+
+fn uuid_like() -> String {
+    format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_micros(),
+        std::process::id()
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -662,6 +805,17 @@ async fn data_coverage(State(s): State<Arc<AppState>>) -> Result<impl IntoRespon
         datasets,
         gaps,
     })))
+}
+
+async fn list_symbols(State(s): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    let mut symbols = std::collections::BTreeSet::from([s.symbol()]);
+    if let Ok(manifest) = data::Manifest::load(&s.data_root.join("manifest/manifest.json")) {
+        symbols.extend(manifest.partitions.keys().map(|key| key.symbol.clone()));
+        symbols.extend(manifest.gaps.iter().map(|gap| gap.symbol.clone()));
+    }
+    Ok(Json(ApiResponse::ok(
+        symbols.into_iter().collect::<Vec<_>>(),
+    )))
 }
 
 /// 查询当前下载任务状态。没有任务时是 `state == "idle"` 的默认快照。
@@ -906,11 +1060,13 @@ mod tests {
             "/api/v1/fills",
             "/api/v1/pnl",
             "/api/v1/backtest",
+            "/api/v1/backtest/status",
             "/api/v1/backtests",
             "/api/v1/market/klines",
             "/api/v1/market/book",
             "/api/v1/market/stream",
             "/api/v1/data/coverage",
+            "/api/v1/symbols",
             "/api/v1/data/download",
             "/api/v1/data/download/cancel",
             "/api/v1/data/archive-range",
@@ -919,7 +1075,7 @@ mod tests {
             "/api/v1/mode",
             "/api/v1/ws",
         ];
-        assert_eq!(paths.len(), 27);
+        assert_eq!(paths.len(), 29);
         // 路径必须是版本化的——未来breaking change要走 v2。
         for p in paths {
             assert!(p.starts_with("/api/v1/"), "路由必须版本化：{p}");

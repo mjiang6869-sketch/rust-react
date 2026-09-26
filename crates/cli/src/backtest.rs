@@ -450,10 +450,12 @@ fn count_exit_kinds(trades: &[sim::TradeRecord]) -> Vec<(&'static str, usize)> {
     let mut tp = 0;
     let mut sl = 0;
     let mut forced = 0;
+    let mut liquidated = 0;
     for t in trades {
         match t.exit_reason {
             sim::ExitKind::TakeProfit => tp += 1,
             sim::ExitKind::StopLoss => sl += 1,
+            sim::ExitKind::Liquidation => liquidated += 1,
             sim::ExitKind::ForcedAtEnd => forced += 1,
         }
     }
@@ -466,6 +468,9 @@ fn count_exit_kinds(trades: &[sim::TradeRecord]) -> Vec<(&'static str, usize)> {
     }
     if forced > 0 {
         v.push(("回测结束强制平仓", forced));
+    }
+    if liquidated > 0 {
+        v.push(("爆仓停止", liquidated));
     }
     v
 }

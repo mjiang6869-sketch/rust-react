@@ -13,10 +13,11 @@ import { useCallback, useEffect, useState } from 'react'
 
 import { SelectField, DateField } from '../components/FormControls'
 import { api } from '../api/client'
-import type { BacktestResult, BacktestRunSummary, StrategyInfo } from '../api/types'
-import { duration, pct, pnlClass, signed } from '../format'
+import type { BacktestJobSnapshot, BacktestResult, BacktestRunSummary, StrategyInfo } from '../api/types'
+import { duration, num, pct, pnlClass, signed, time } from '../format'
 import { useAction } from '../state/store'
 import { BacktestRunsTable } from './OrdersPanel'
+import { EquityCurve } from '../chart/EquityCurve'
 
 interface Props {
   symbol: string
@@ -30,24 +31,35 @@ export function BacktestPanel({ symbol, initialEquity }: Props) {
   const [from, setFrom] = useState('2026-08-01')
   const [to, setTo] = useState('2026-08-07')
   const [models, setModels] = useState<string[]>(['m0', 'm1'])
+  const [symbols, setSymbols] = useState<string[]>([symbol])
+  const [selectedSymbol, setSelectedSymbol] = useState(symbol)
   const [result, setResult] = useState<BacktestResult | null>(null)
   const [runs, setRuns] = useState<BacktestRunSummary[]>([])
+  const [job, setJob] = useState<BacktestJobSnapshot | null>(null)
 
   const loadHistory = useCallback(async () => {
-    const r = await action.run(() => api.backtests(symbol))
+    const r = await action.run(() => api.backtests(selectedSymbol))
     if (r !== undefined) setRuns(r)
-  }, [action, symbol])
+  }, [action, selectedSymbol])
 
   useEffect(() => {
     api.strategies().then(setStrategies).catch(() => setStrategies([]))
+    api.symbols().then((values) => {
+      const next = [...new Set([symbol, ...values])]
+      setSymbols(next)
+      if (!next.includes(selectedSymbol)) setSelectedSymbol(next[0] ?? symbol)
+    }).catch(() => setSymbols([symbol]))
     void loadHistory()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    // `useAction()` intentionally returns a per-render facade; including it here
+    // would refetch forever while the progress snapshot updates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, selectedSymbol])
 
   const run = useCallback(async () => {
-    const r = await action.run(() =>
+    const started = await action.run(() =>
       api.runBacktest({
-        symbol,
+        symbol: selectedSymbol,
         strategy,
         from,
         to,
@@ -55,11 +67,23 @@ export function BacktestPanel({ symbol, initialEquity }: Props) {
         initial_equity: initialEquity,
       }),
     )
-    if (r !== undefined) {
-      setResult(r)
-      void loadHistory()
+    if (started !== undefined) {
+      setJob({ run_id: started.run_id, state: 'running', symbol: selectedSymbol, strategy_id: strategy, model: null, done: 0, total: 0, started_at: null, finished_at: null, error: null, result: null })
+      for (;;) {
+        await new Promise((resolve) => window.setTimeout(resolve, 500))
+        const snapshot = await api.backtestStatus(started.run_id)
+        setJob(snapshot)
+        if (snapshot.state === 'finished') {
+          setResult(snapshot.result)
+          void loadHistory()
+          break
+        }
+        if (snapshot.state === 'failed') {
+          break
+        }
+      }
     }
-  }, [symbol, strategy, from, to, models, initialEquity, action, loadHistory])
+  }, [selectedSymbol, strategy, from, to, models, initialEquity, action, loadHistory])
 
   return (
     <div className="backtest-layout">
@@ -67,6 +91,8 @@ export function BacktestPanel({ symbol, initialEquity }: Props) {
         <h2 id="bt-title">运行回测</h2>
 
         <div className="row">
+          <SelectField id="bt-symbol" label="交易对" value={selectedSymbol} onChange={setSelectedSymbol}
+            options={symbols.map((value) => ({ value, label: value }))} />
           <SelectField id="bt-strategy" label="策略" value={strategy} onChange={setStrategy}
             options={strategies.map((s) => ({ value: s.id, label: s.name }))} />
         </div>
@@ -124,11 +150,18 @@ export function BacktestPanel({ symbol, initialEquity }: Props) {
             type="button"
             className="primary"
             onClick={() => void run()}
-            disabled={action.busy || models.length === 0 || !from || !to || from > to}
+            disabled={action.busy || job?.state === 'running' || models.length === 0 || !from || !to || from > to}
           >
-            {action.busy ? '回测中…' : '运行回测'}
+            {action.busy || job?.state === 'running' ? '回测中…' : '运行回测'}
           </button>
         </div>
+        {job?.state === 'running' && (
+          <div className="backtest-progress" role="status">
+            <div className="panel-head"><strong>回测进行中</strong><span className="muted">{job.model ?? '准备数据'}</span></div>
+            <progress max={job.total || 1} value={job.done} />
+            <small className="muted">{job.done} / {job.total || '…'} 个分片/模型</small>
+          </div>
+        )}
       </section>
 
       <section className="panel" aria-labelledby="bt-results">
@@ -191,6 +224,30 @@ export function BacktestPanel({ symbol, initialEquity }: Props) {
                 </tbody>
               </table>
             </div>
+            {result.models.map((m) => (
+              <section className="backtest-model-detail" key={`${m.name}-detail`} aria-labelledby={`model-${m.name}`}>
+                <div className="panel-head sub-head">
+                  <h3 id={`model-${m.name}`}>{m.name} 明细</h3>
+                  <span className={m.liquidated ? 'tag-bad' : 'muted'}>{m.liquidated ? '已爆仓并停止' : `年化 ${m.annualized_return === null ? '—' : pct(m.annualized_return, 2)}`}</span>
+                </div>
+                <div className="backtest-kpis">
+                  <span>累计盈亏 <strong className={pnlClass(m.cumulative_pnl)}>{signed(m.cumulative_pnl)}</strong></span>
+                  <span>最终权益 <strong>{num(m.final_equity, 2)}</strong></span>
+                  <span>订单数 <strong>{m.trades.length}</strong></span>
+                </div>
+                <EquityCurve points={m.equity_curve} asset="USDC" trend={pnlClass(m.pnl)} />
+                <div className="table-wrap">
+                  <table className="data-table">
+                    <thead><tr><th>入场</th><th>出场</th><th>方向</th><th className="num">数量</th><th className="num">入场价</th><th className="num">出场价</th><th>原因</th><th className="num">盈亏</th></tr></thead>
+                    <tbody>{m.trades.map((trade, index) => <tr key={`${m.name}-${trade.entry_at}-${index}`}>
+                      <td className="mono">{time(trade.entry_at)}</td><td className="mono">{time(trade.exit_at)}</td><td>{trade.side}</td>
+                      <td className="num mono">{trade.quantity}</td><td className="num mono">{trade.entry_price}</td><td className="num mono">{trade.exit_price}</td>
+                      <td>{trade.exit_reason}</td><td className={`num mono ${pnlClass(trade.pnl)}`}>{signed(trade.pnl)}</td>
+                    </tr>)}</tbody>
+                  </table>
+                </div>
+              </section>
+            ))}
           </>
         )}
       </section>
