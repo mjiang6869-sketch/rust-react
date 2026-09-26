@@ -20,10 +20,10 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use domain::{
     ClientOrderId, EntryFill, ExecEvent, Fill, Instrument, LiveSafety, ManualPlan, ManualPreview,
-    MarketEvent, MarketView, Order, OrderBookState, OrderPurpose, OrderState, Position,
-    PositionSet, Price, ProtectionPlan, ProtectionPlanner, Qty, RiskLimits, ServiceMode, Side,
-    SizeHint, StandDownReason, Strategy as _, StrategyIntent, TpPlan, check_consistency,
-    on_stop_filled, on_take_profit_filled, preview_manual,
+    MarginAccount, MarketEvent, MarketView, Order, OrderBookState, OrderPurpose, OrderState,
+    Position, PositionSet, Price, ProtectionFix, ProtectionPlan, ProtectionPlanner, Qty,
+    RiskLimits, ServiceMode, Side, SizeHint, StandDownReason, Strategy as _, StrategyIntent,
+    TpPlan, check_consistency, on_stop_filled, on_take_profit_filled, preview_manual,
 };
 use rust_decimal::Decimal;
 use sim::fill::{FillContext, FillModel, Optimism};
@@ -101,6 +101,10 @@ pub struct EngineSnapshot {
     pub auto_maker: AutoMakerView,
     /// 当前持仓的来源（手动 / 自动化做市）；无持仓时为 `None`。
     pub position_source: Option<OrderSource>,
+    /// 保证金模式。本项目统一全仓。
+    pub margin_mode: domain::MarginMode,
+    /// 当前持仓的全仓强平估算；无持仓时为 `None`。
+    pub position_liquidation: Option<domain::CrossLiquidation>,
 }
 
 /// 一张订单的展示快照。
@@ -633,6 +637,18 @@ impl PaperEngine {
             stop_price: None,
         };
         let mut set = PositionSet::new(&pos, pending.plan.clone(), pending.tp.clone());
+        let rung_count = pending.tp.rungs().len();
+        set.set_tp_order_ids(
+            (0..rung_count)
+                .map(|i| {
+                    pending.order.client_id.child(&if rung_count == 1 {
+                        "tp".into()
+                    } else {
+                        format!("tp{i}")
+                    })
+                })
+                .collect(),
+        );
 
         // 编译保护单并登记（模拟盘里"挂出"就是登记进状态机）
         let fill = EntryFill {
@@ -647,10 +663,20 @@ impl PaperEngine {
         {
             for a in actions {
                 if let domain::ProtectionAction::Place(order) = a {
+                    let order_id = order.client_id.clone();
                     if order.purpose == OrderPurpose::StopLoss {
                         set.stop_price = Some(order.limit_price);
+                        set.stop_placed_at = Some(now);
                     }
-                    let _ = self.state.register(*order, now);
+                    if self.state.register(*order, now).is_ok() {
+                        let _ = self.state.apply(
+                            ExecEvent::Accepted {
+                                client_id: order_id,
+                                exchange_id: "paper".into(),
+                            },
+                            now,
+                        );
+                    }
                 }
             }
         }
@@ -682,6 +708,7 @@ impl PaperEngine {
             .open_orders()
             .into_iter()
             .filter(|t| t.order.reduce_only())
+            .cloned()
             .collect();
 
         // 逐个检查止盈档位。
@@ -690,13 +717,12 @@ impl PaperEngine {
         // 不要在这里用当前 `quantity` 当基准，那会让第二档基于缩小后的
         // 基数再乘比例，总平仓量永远到不了 100%。
         let rungs = set.tp.rungs();
-        for (i, (pct, _)) in rungs.iter().enumerate() {
+        for (i, _) in rungs.iter().enumerate() {
             if set.completed_rungs.contains(&i) {
                 continue;
             }
-            let target = match set.side {
-                Side::Buy => entry_price * (Decimal::ONE + pct),
-                Side::Sell => entry_price * (Decimal::ONE - pct),
+            let Some(target) = set.tp.rung_price(i, entry_price, set.side) else {
+                continue;
             };
             let quantized = self
                 .config
@@ -738,14 +764,48 @@ impl PaperEngine {
             self.total_fees += fee;
 
             let set = self.position_set.as_mut().expect("已判存在");
-            let working_refs: Vec<_> = working.to_vec();
-            let _ = on_take_profit_filled(set, i, fill_qty, &working_refs);
+            let working_refs: Vec<_> = working.iter().collect();
+            let prior_stop = set.stop_price;
+            let fixes = match on_take_profit_filled(set, i, fill_qty, &working_refs) {
+                Ok(fixes) => fixes,
+                Err(error) => {
+                    self.events
+                        .push(EngineEvent::Alarm(format!("止盈成交状态更新失败：{error}")));
+                    return;
+                }
+            };
+            if set.stop_price != prior_stop {
+                set.stop_placed_at = Some(now);
+                set.stop_triggered_at = None;
+            }
 
             let gross = match set.side {
                 Side::Buy => (fill_px - entry_price) * fill_qty.get(),
                 Side::Sell => (entry_price - fill_px) * fill_qty.get(),
             };
             self.realized_pnl += gross - fee;
+
+            let state_update = self.state.apply(
+                ExecEvent::Filled(Fill {
+                    trade_id: format!("paper-{}", tp_order.client_id),
+                    client_id: tp_order.client_id.clone(),
+                    quantity: fill_qty,
+                    price: Price::new(fill_px),
+                    fee,
+                    fee_asset: self.config.instrument.settlement_asset.clone(),
+                    at: now,
+                }),
+                now,
+            );
+            if let Err(error) = state_update {
+                self.events
+                    .push(EngineEvent::Alarm(format!("保护单状态同步失败：{error}")));
+            }
+            if let Err(error) = apply_paper_protection_fixes(&mut self.state, fixes, now) {
+                self.events
+                    .push(EngineEvent::Alarm(format!("保护单状态同步失败：{error}")));
+            }
+            self.ensure_paper_stop_order(now);
 
             self.events.push(EngineEvent::Filled {
                 order: tp_order.client_id.clone(),
@@ -790,7 +850,10 @@ impl PaperEngine {
         let Some(stop_price) = set.stop_price else {
             return;
         };
-        let protection_at = set.protection_placed_at.unwrap_or(set.opened_at);
+        let protection_at = set
+            .stop_placed_at
+            .or(set.protection_placed_at)
+            .unwrap_or(set.opened_at);
 
         // 阶段 1：是否已触发？
         let triggered =
@@ -814,7 +877,13 @@ impl PaperEngine {
         }
 
         let stop_order = Order {
-            client_id: ClientOrderId::new("paper-stop", 0),
+            client_id: self
+                .state
+                .open_orders()
+                .into_iter()
+                .find(|tracked| tracked.order.purpose == OrderPurpose::StopLoss)
+                .map(|tracked| tracked.order.client_id.clone())
+                .unwrap_or_else(|| ClientOrderId::new("paper-stop", 0)),
             symbol: self.config.instrument.symbol.clone(),
             purpose: OrderPurpose::StopLoss,
             side: close_side,
@@ -844,9 +913,42 @@ impl PaperEngine {
         let fee = fill_px * qty.get() * self.config.instrument.fees.maker_rate;
         self.total_fees += fee;
 
-        let working_refs: Vec<_> = working.to_vec();
+        let working_refs: Vec<_> = working.iter().collect();
         let set = self.position_set.as_mut().expect("已判存在");
-        on_stop_filled(set, &working_refs);
+        let fixes = on_stop_filled(set, &working_refs);
+        if let Err(error) = self.state.apply(
+            ExecEvent::Filled(Fill {
+                trade_id: format!("paper-{}", stop_order.client_id),
+                client_id: stop_order.client_id.clone(),
+                quantity: qty,
+                price: Price::new(fill_px),
+                fee,
+                fee_asset: self.config.instrument.settlement_asset.clone(),
+                at: now,
+            }),
+            now,
+        ) {
+            self.events
+                .push(EngineEvent::Alarm(format!("止损成交状态同步失败：{error}")));
+        }
+        if let Err(error) = apply_paper_protection_fixes(&mut self.state, fixes, now) {
+            self.events.push(EngineEvent::Alarm(format!(
+                "止损后撤单状态同步失败：{error}"
+            )));
+        }
+        self.ensure_paper_stop_order(now);
+        // 模拟止损成交后清理当前止损单，避免旧保护单留在下一笔交易里。
+        let remaining = self
+            .state
+            .open_orders()
+            .into_iter()
+            .filter(|t| t.order.reduce_only())
+            .map(|t| ProtectionFix::Cancel(t.order.client_id.clone()))
+            .collect();
+        if let Err(error) = apply_paper_protection_fixes(&mut self.state, remaining, now) {
+            self.events
+                .push(EngineEvent::Alarm(format!("止损单清理失败：{error}")));
+        }
 
         let gross = match side {
             Side::Buy => (fill_px - entry_px) * qty.get(),
@@ -871,6 +973,42 @@ impl PaperEngine {
         self.position_source = None;
         self.events.push(EngineEvent::StateChanged);
         let _ = now;
+    }
+
+    fn ensure_paper_stop_order(&mut self, now: DateTime<Utc>) {
+        if self
+            .state
+            .open_orders()
+            .iter()
+            .any(|tracked| tracked.order.purpose == OrderPurpose::StopLoss)
+        {
+            return;
+        }
+        let Some(set) = self.position_set.as_ref() else {
+            return;
+        };
+        let Some(stop_price) = set.stop_price else {
+            return;
+        };
+        let order = Order {
+            client_id: ClientOrderId::new("paper-stop-sync", now.timestamp_millis() as u64),
+            symbol: set.symbol.clone(),
+            purpose: OrderPurpose::StopLoss,
+            side: set.side.opposite(),
+            quantity: set.quantity,
+            limit_price: stop_price,
+            tif: domain::TimeInForce::PostOnly,
+            parent: None,
+        };
+        if self.state.register(order.clone(), now).is_ok() {
+            let _ = self.state.apply(
+                ExecEvent::Accepted {
+                    client_id: order.client_id,
+                    exchange_id: "paper".into(),
+                },
+                now,
+            );
+        }
     }
 
     /// 止损是否已触发（阶段 1）。
@@ -990,7 +1128,7 @@ impl PaperEngine {
         preview_manual(
             &self.config.instrument,
             plan,
-            self.equity(),
+            &self.margin_account(),
             mark,
             &self.config.limits,
         )
@@ -1175,13 +1313,51 @@ impl PaperEngine {
             stop_price: set.stop_price,
         };
         let working: Vec<_> = self.state.open_orders();
-        let report = check_consistency(&pos, &working);
+        // 止盈单按原始仓位分档挂出，止损单是同一仓位的替代保护出口；
+        // 检查止损剩余量时不能把互斥的止盈出口重复相加。
+        let stop_only: Vec<_> = working
+            .into_iter()
+            .filter(|tracked| tracked.order.purpose == OrderPurpose::StopLoss)
+            .collect();
+        let report = check_consistency(&pos, &stop_only);
         report.problem
     }
 
     /// 当前权益（已实现盈亏 + 未实现盈亏 + 初始权益）。
     pub fn equity(&self) -> Decimal {
         self.config.initial_equity + self.realized_pnl + self.unrealized_pnl()
+    }
+
+    /// 当前持仓的全仓强平估算。
+    ///
+    /// 资产不一致时返回 `None` 而不是编造一个数字——那种情况本身要作为
+    /// 告警暴露（见 `domain::MarginError::AssetMismatch`）。
+    pub fn position_liquidation(&self) -> Option<domain::CrossLiquidation> {
+        let set = self.position_set.as_ref()?;
+        domain::cross_liquidation(
+            &self.config.instrument,
+            &self.margin_account(),
+            set.side,
+            set.entry_price.get(),
+            set.quantity,
+        )
+        .ok()
+    }
+
+    /// 全仓保证金账户。
+    ///
+    /// 本项目统一全仓：账户余额就是引擎权益，强平价由钱包余额与持仓数量
+    /// 共同决定（见 `domain::margin`）。
+    ///
+    /// `wallet_balance` 用**已实现**口径（初始权益 + 已实现盈亏），不含未实现
+    /// 盈亏——因为 `domain::margin` 的公式已经通过入场价把本仓浮盈亏算进去了，
+    /// 再加一次未实现盈亏会双重计入。已占用初始保证金恒为 0：`place()` 在已有
+    /// 持仓或在途单时直接拒绝，单仓不变量保证不会同时占用两笔。
+    pub fn margin_account(&self) -> MarginAccount {
+        MarginAccount::flat(
+            self.config.instrument.margin_asset.clone(),
+            self.config.initial_equity + self.realized_pnl,
+        )
     }
 
     /// 未实现盈亏。
@@ -1267,6 +1443,8 @@ impl PaperEngine {
             safety: self.safety,
             auto_maker: self.auto_maker(),
             position_source: self.position_source,
+            margin_mode: domain::MarginMode::Cross,
+            position_liquidation: self.position_liquidation(),
         }
     }
 
@@ -1313,6 +1491,37 @@ impl PaperEngine {
             })
             .collect()
     }
+}
+
+/// 模拟盘撤旧挂新后同步委托列表。新 ID 避免覆盖订单历史。
+fn apply_paper_protection_fixes(
+    state: &mut OrderBookState,
+    fixes: Vec<ProtectionFix>,
+    now: DateTime<Utc>,
+) -> Result<(), domain::DomainError> {
+    // ProtectionFix 已在领域层完成一致性计算；这里执行模拟盘的撤旧挂新。
+    for fix in fixes {
+        let (id, replacement) = match fix {
+            ProtectionFix::Cancel(id) => (id, None),
+            ProtectionFix::Replace(order) => (order.client_id.clone(), Some(order)),
+            ProtectionFix::Nothing => continue,
+        };
+        if let Some(tracked) = state.get(&id).filter(|tracked| tracked.state.is_open()) {
+            let filled = tracked.filled;
+            state.apply(
+                ExecEvent::Cancelled {
+                    client_id: id.clone(),
+                    filled,
+                },
+                now,
+            )?;
+        }
+        if let Some(mut order) = replacement {
+            order.client_id = id.child(&format!("r{}", now.timestamp_millis()));
+            state.register(*order, now)?;
+        }
+    }
+    Ok(())
 }
 
 fn state_tag(s: &OrderState) -> &'static str {
@@ -1639,6 +1848,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn break_even_after_first_rung_does_not_consume_old_trades_or_block_second_rung() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        let mut plan = manual_plan(Side::Buy, dec!(3200), dec!(3192), dec!(0.1));
+        plan.take_profit = TpPlan::Ladder {
+            rungs: vec![
+                TpRung {
+                    pct: dec!(0.0025),
+                    fraction: dec!(0.4),
+                },
+                TpRung {
+                    pct: dec!(0.005),
+                    fraction: dec!(0.3),
+                },
+                TpRung {
+                    pct: dec!(0.0075),
+                    fraction: dec!(0.3),
+                },
+            ],
+        };
+        plan.break_even = Some(domain::BreakEvenSpec {
+            trigger_r: Decimal::ONE,
+            offset: Decimal::ZERO,
+        });
+        let _ = e.submit_manual(&plan, t0());
+        e.on_market_event(trade(1000, dec!(3200), true));
+        e.on_market_event(trade(2000, dec!(3208), false));
+
+        let first = e.snapshot().position.expect("第一档后仍有持仓");
+        assert_eq!(first.quantity, dec!(0.06));
+        assert_eq!(first.stop_price.unwrap().get(), dec!(3200));
+        assert!(!first.stop_triggered, "改价前的入场成交不能触发新止损");
+        let first_orders = e.snapshot().open_orders;
+        let first_stop = first_orders
+            .iter()
+            .find(|order| order.purpose == OrderPurpose::StopLoss)
+            .unwrap();
+        assert_eq!(first_stop.limit_price, dec!(3200));
+        assert_eq!(first_stop.quantity, dec!(0.06));
+        assert_eq!(
+            first_orders
+                .iter()
+                .filter(|order| order.purpose == OrderPurpose::TakeProfit)
+                .count(),
+            2
+        );
+
+        e.on_market_event(trade(3000, dec!(3216), false));
+        let second = e.snapshot().position.expect("第二档后仍有持仓");
+        assert_eq!(second.quantity, dec!(0.03));
+        assert_eq!(second.stop_price.unwrap().get(), dec!(3200));
+        assert!(second.rungs[0].filled && second.rungs[1].filled && !second.rungs[2].filled);
+        assert!(!second.stop_triggered);
+        let second_orders = e.snapshot().open_orders;
+        let second_stop = second_orders
+            .iter()
+            .find(|order| order.purpose == OrderPurpose::StopLoss)
+            .unwrap();
+        assert_eq!(second_stop.limit_price, dec!(3200));
+        assert_eq!(second_stop.quantity, dec!(0.03));
+        assert_eq!(
+            second_orders
+                .iter()
+                .filter(|order| order.purpose == OrderPurpose::TakeProfit)
+                .count(),
+            1
+        );
+
+        e.on_market_event(trade(4000, dec!(3200), false));
+        assert!(e.snapshot().position.is_none());
+        assert!(
+            e.snapshot().open_orders.is_empty(),
+            "止损成交后清理剩余保护单"
+        );
+    }
+
     /// 止损成交后仓位归零，且产生一笔完整交易记录。
     #[test]
     fn stop_fill_closes_position_and_records_trade() {
@@ -1784,6 +2070,30 @@ mod tests {
         assert_eq!(snap.realized_pnl, Decimal::ZERO);
     }
 
+    /// 快照必须标明保证金模式；全仓下默认参数的多头持仓不会被强平。
+    #[test]
+    fn snapshot_reports_cross_margin_and_liquidation() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+
+        // 空仓时没有强平可言
+        let snap = e.snapshot();
+        assert_eq!(snap.margin_mode, domain::MarginMode::Cross);
+        assert!(snap.margin_mode.label() == "全仓");
+        assert!(snap.position_liquidation.is_none());
+
+        // 建立多头持仓：权益 10000、数量 0.1、入场 3200。
+        // 全仓下 3200×0.1 = 320 « 10000，余额覆盖得住 → Never。
+        let plan = manual_plan(Side::Buy, dec!(3200), dec!(3192), dec!(0.1));
+        let _ = e.submit_manual(&plan, t0());
+        e.on_market_event(trade(1000, dec!(3200), true));
+        assert_eq!(
+            e.snapshot().position_liquidation,
+            Some(domain::CrossLiquidation::Never),
+            "全仓下余额远大于名义价值，不该估算出强平价"
+        );
+    }
+
     /// 成交模型信息必须可查询——界面要展示结论有多可信。
     #[test]
     fn fill_model_info_is_exposed() {
@@ -1883,12 +2193,15 @@ mod tests {
     }
 
     /// 实盘安全闸门默认未武装——重启不能自动回到可交易状态。
+    ///
+    /// 保证金模式也在前置条件里：重启后必须重新观测交易所侧是否为全仓。
     #[test]
     fn safety_starts_disarmed() {
         let e = engine();
         assert!(!e.safety().is_armed());
         assert!(!e.safety().can_submit());
-        assert_eq!(e.safety().blocking_reasons().len(), 3);
+        assert!(!e.safety().margin_is_cross(), "重启后保证金模式未观测");
+        assert_eq!(e.safety().blocking_reasons().len(), 4);
     }
 
     /// 一致性检查在无持仓时返回 None。

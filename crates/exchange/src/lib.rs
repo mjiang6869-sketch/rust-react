@@ -32,9 +32,10 @@ pub mod stream;
 
 pub use binance::{
     AcceptedOrder, AccountFeeResponse, BinanceError, ContractSpec, ExchangeInfoResponse,
-    OrderRequest, OrderResponse, RateLimitHint, RawSymbol, TriggerProtectVerdict,
-    check_trigger_protect, classify_api_error, classify_api_error_with, fee_schedule_from_account,
-    find_contract, parse_all_contracts, parse_contract, reject_reason_from_code, side_tag,
+    MarginTypeChange, OrderRequest, OrderResponse, RateLimitHint, RawSymbol, SymbolMarginState,
+    TriggerProtectVerdict, check_trigger_protect, classify_api_error, classify_api_error_with,
+    fee_schedule_from_account, find_contract, margin_type_change_outcome, parse_all_contracts,
+    parse_contract, parse_position_margin, reject_reason_from_code, side_tag,
 };
 pub use client::{
     BinanceClient, Mode, PRODUCTION_URL, TESTNET_URL, exchange_mode_for, parse_available_balance,

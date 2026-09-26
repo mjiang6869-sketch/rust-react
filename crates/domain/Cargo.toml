@@ -14,3 +14,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 rust_decimal_macros = "1"
+# 仅测试用：验证 DTO 的序列化写法（CROSS 等标签）。生产代码不碰 JSON。
+serde_json.workspace = true

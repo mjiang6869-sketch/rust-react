@@ -244,6 +244,46 @@ pub struct StateDto {
     pub auto_maker: AutoMakerDto,
     /// 当前持仓的来源（手动 / 自动化做市）；无持仓时为 `None`。
     pub position_source: Option<&'static str>,
+    /// 保证金模式。本项目统一全仓，界面必须显示出来。
+    pub margin_mode: &'static str,
+    pub margin_mode_label: &'static str,
+    /// 当前持仓的全仓强平估算。`NONE` 表示不会强平。
+    pub position_liquidation: LiquidationEstimateDto,
+}
+
+/// 全仓强平估算。
+///
+/// 它是**估算值**，不是订单价，所以不经过 `Precision` 量化，也不参与任何
+/// 价格比较——只用于展示。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct LiquidationEstimateDto {
+    /// `PRICE`（有估算价）/ `NONE`（余额覆盖得住，不会强平）/ `IMMEDIATE`（开仓即在强平线下）。
+    pub kind: &'static str,
+    pub kind_label: &'static str,
+    /// 估算强平价。只有 `kind == "PRICE"` 时非空。
+    pub price: Option<String>,
+}
+
+/// 把强平估算转成 DTO。
+pub fn liquidation_dto(estimate: Option<domain::CrossLiquidation>) -> LiquidationEstimateDto {
+    match estimate {
+        Some(domain::CrossLiquidation::At(p)) => LiquidationEstimateDto {
+            kind: "PRICE",
+            kind_label: "有估算价",
+            price: Some(num(p)),
+        },
+        Some(domain::CrossLiquidation::Immediate) => LiquidationEstimateDto {
+            kind: "IMMEDIATE",
+            kind_label: "开仓即强平",
+            price: None,
+        },
+        // 无持仓，或余额覆盖得住——两种都表现为「不会强平」。
+        Some(domain::CrossLiquidation::Never) | None => LiquidationEstimateDto {
+            kind: "NONE",
+            kind_label: "无（余额覆盖名义价值）",
+            price: None,
+        },
+    }
 }
 
 /// 合约信息。
@@ -353,6 +393,10 @@ pub struct ManualPlanDto {
     pub take_profit: Option<Vec<TakeProfitRungDto>>,
     /// 单档止盈百分比（当 `take_profit` 为 `None` 时使用）。
     pub take_profit_pct: Option<String>,
+    /// 分批指定目标价；与百分比止盈字段互斥。
+    pub take_profit_prices: Option<Vec<TakeProfitPriceRungDto>>,
+    /// 单档指定目标价；与百分比止盈字段互斥。
+    pub take_profit_price: Option<String>,
     pub break_even: Option<BreakEvenDto>,
     pub trailing: Option<TrailingDto>,
     /// 挂单超时自动撤销的秒数。
@@ -366,6 +410,12 @@ pub struct TakeProfitRungDto {
     /// 距入场价的百分比。
     pub pct: String,
     /// 该档平仓比例。
+    pub fraction: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TakeProfitPriceRungDto {
+    pub price: String,
     pub fraction: String,
 }
 
@@ -390,7 +440,12 @@ pub struct ManualPreviewDto {
     pub quantity: String,
     pub notional: String,
     pub margin_required: String,
-    /// 止损距估算强平价的缓冲比例。
+    /// 保证金模式。本项目统一全仓。
+    pub margin_mode: &'static str,
+    pub margin_mode_label: &'static str,
+    /// 全仓强平估算。
+    pub liquidation: LiquidationEstimateDto,
+    /// 止损距估算强平价的缓冲比例。`None` 表示不会强平。
     pub liquidation_buffer_pct: Option<String>,
     pub take_profits: Vec<RungPreviewDto>,
     /// 是否通过风控。
@@ -866,6 +921,9 @@ pub fn preview_dto(p: &ManualPreview) -> ManualPreviewDto {
         quantity: num(p.quantity.get()),
         notional: num(p.notional),
         margin_required: num(p.margin_required),
+        margin_mode: p.margin_mode.tag(),
+        margin_mode_label: p.margin_mode.label(),
+        liquidation: liquidation_dto(Some(p.liquidation)),
         liquidation_buffer_pct: p.liquidation_buffer_pct.map(num),
         take_profits: p
             .take_profits
@@ -1049,8 +1107,24 @@ pub fn parse_manual_plan(dto: &ManualPlanDto, now: DateTime<Utc>) -> Result<Manu
         ));
     }
 
-    let take_profit = match &dto.take_profit {
-        Some(rungs) => {
+    let target_pct = |price: Decimal| -> Result<Decimal, ApiError> {
+        if entry <= Decimal::ZERO || price <= Decimal::ZERO {
+            return Err(ApiError::BadRequest("入场价和止盈目标价必须大于 0".into()));
+        }
+        let distance = match dto.side {
+            Side::Buy if price > entry => price - entry,
+            Side::Sell if price < entry => entry - price,
+            _ => return Err(ApiError::BadRequest("止盈目标价必须位于盈利方向".into())),
+        };
+        Ok(distance / entry)
+    };
+    let take_profit = match (
+        &dto.take_profit,
+        &dto.take_profit_pct,
+        &dto.take_profit_prices,
+        &dto.take_profit_price,
+    ) {
+        (Some(rungs), None, None, None) => {
             if rungs.is_empty() {
                 return Err(ApiError::BadRequest("分批止盈不能为空".into()));
             }
@@ -1066,14 +1140,41 @@ pub fn parse_manual_plan(dto: &ManualPlanDto, now: DateTime<Utc>) -> Result<Manu
                     .collect::<Result<Vec<_>, ApiError>>()?,
             }
         }
-        None => {
-            let pct = dto.take_profit_pct.as_deref().ok_or_else(|| {
-                ApiError::BadRequest("必须指定 take_profit 或 take_profit_pct".into())
-            })?;
-            domain::TpPlan::Single {
-                pct: dec(pct, "take_profit_pct")?,
+        (None, Some(pct), None, None) => domain::TpPlan::Single {
+            pct: dec(pct, "take_profit_pct")?,
+        },
+        (None, None, Some(rungs), None) => {
+            if rungs.is_empty() {
+                return Err(ApiError::BadRequest("分批止盈不能为空".into()));
+            }
+            domain::TpPlan::LadderPrices {
+                rungs: rungs
+                    .iter()
+                    .map(|r| {
+                        let price = dec(&r.price, "take_profit_prices.price")?;
+                        Ok(domain::TpPriceRung {
+                            price,
+                            pct: target_pct(price)?,
+                            fraction: dec(&r.fraction, "take_profit_prices.fraction")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ApiError>>()?,
             }
         }
+        (None, None, None, Some(price)) => {
+            let price = dec(price, "take_profit_price")?;
+            domain::TpPlan::SinglePrice {
+                price,
+                pct: target_pct(price)?,
+            }
+        }
+        (None, None, None, None) => {
+            return Err(ApiError::BadRequest(
+                "必须指定 take_profit、take_profit_pct、take_profit_prices 或 take_profit_price"
+                    .into(),
+            ));
+        }
+        _ => return Err(ApiError::BadRequest("必须且只能指定一种止盈方式".into())),
     };
     take_profit
         .validate()
@@ -1168,6 +1269,8 @@ mod tests {
             stop_distance_bp: None,
             take_profit: None,
             take_profit_pct: Some("0.0025".into()),
+            take_profit_prices: None,
+            take_profit_price: None,
             break_even: None,
             trailing: None,
             cancel_unfilled_after_secs: Some(120),
@@ -1383,6 +1486,72 @@ mod tests {
         assert!(e.to_string().contains("take_profit"), "{e}");
     }
 
+    #[test]
+    fn parses_fixed_target_prices_and_rejects_wrong_side_or_mixed_modes() {
+        for (side, entry, prices) in [
+            (Side::Buy, "3200", ["3210", "3220"]),
+            (Side::Sell, "3200", ["3190", "3180"]),
+        ] {
+            let mut dto = base_dto();
+            dto.side = side;
+            dto.entry = entry.into();
+            dto.take_profit_pct = None;
+            dto.take_profit_prices = Some(vec![
+                TakeProfitPriceRungDto {
+                    price: prices[0].into(),
+                    fraction: "0.4".into(),
+                },
+                TakeProfitPriceRungDto {
+                    price: prices[1].into(),
+                    fraction: "0.6".into(),
+                },
+            ]);
+            let plan = parse_manual_plan(&dto, Utc::now()).unwrap();
+            assert_eq!(
+                plan.take_profit
+                    .rung_price(0, dec!(3201), side)
+                    .unwrap()
+                    .to_string(),
+                prices[0]
+            );
+            assert_eq!(
+                plan.take_profit
+                    .rung_price(1, dec!(3201), side)
+                    .unwrap()
+                    .to_string(),
+                prices[1]
+            );
+
+            dto.take_profit_prices = None;
+            dto.take_profit_price = Some(prices[0].into());
+            let single = parse_manual_plan(&dto, Utc::now()).unwrap();
+            assert_eq!(
+                single
+                    .take_profit
+                    .rung_price(0, dec!(3201), side)
+                    .unwrap()
+                    .to_string(),
+                prices[0]
+            );
+
+            dto.take_profit_price = Some(entry.into());
+            assert!(
+                parse_manual_plan(&dto, Utc::now())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("盈利方向")
+            );
+
+            dto.take_profit_pct = Some("0.01".into());
+            assert!(
+                parse_manual_plan(&dto, Utc::now())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("只能指定一种")
+            );
+        }
+    }
+
     /// 分批止盈各档比例之和超过 1 必须被拒绝——否则会超卖。
     #[test]
     fn rejects_ladder_fractions_over_one() {
@@ -1516,6 +1685,8 @@ mod tests {
             quantity: Qty::new(dec!(0.1)),
             notional: dec!(320.01),
             margin_required: dec!(106.67),
+            margin_mode: domain::MarginMode::Cross,
+            liquidation: domain::CrossLiquidation::At(dec!(3120)),
             liquidation_buffer_pct: Some(dec!(0.01)),
             accepted: true,
             reject_reason: None,
@@ -1536,6 +1707,8 @@ mod tests {
             quantity: Qty::new(dec!(0.1)),
             notional: dec!(320),
             margin_required: dec!(106.67),
+            margin_mode: domain::MarginMode::Cross,
+            liquidation: domain::CrossLiquidation::Never,
             liquidation_buffer_pct: None,
             accepted: false,
             reject_reason: Some("止损价晚于估算强平价".into()),
@@ -1588,6 +1761,8 @@ mod tests {
             StandDownReason::StopInsideLiquidation,
             StandDownReason::RiskRewardTooLow,
             StandDownReason::InsufficientEquity,
+            StandDownReason::InsufficientMargin,
+            StandDownReason::MarginAssetMismatch,
             StandDownReason::OutsideTradingHours,
         ] {
             assert!(!stand_down_message(r).is_empty());

@@ -84,10 +84,19 @@ pub struct ModeParseError {
 /// 第 3 条尤其重要：任何异常都只能向更安全的状态切换，不能自动回到
 /// 可交易状态。旧实现把这套逻辑散在 `main.rs` 的 supervisor 里，导致
 /// 一次网络抖动就 disarm 且需要人工恢复，而重启后又可能忘记重新检查。
+///
+/// # 前置条件为什么是「账户对账」而不是第四个布尔
+///
+/// 本项目统一全仓：交易所侧的 `marginType` 若不是全仓，本地的强平估算与
+/// 风控裁决全部不成立。它和「持仓是否对得上」是同一件事的两面——都是
+/// 「账户状态与本地认知一致吗」——所以并进 `account_reconciled`，而不是
+/// 新增一个可以被忘记检查的独立开关。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveSafety {
     user_stream_connected: bool,
     account_reconciled: bool,
+    /// 交易所侧的保证金模式是全仓。默认 `false`：**重启后必须重新观测**。
+    margin_cross: bool,
     armed: bool,
 }
 
@@ -112,12 +121,28 @@ impl LiveSafety {
         }
     }
 
+    /// 记录观测到的保证金模式。
+    ///
+    /// 不是全仓（含「未知」）时立即解除武装：无法估算强平价的情况下继续
+    /// 交易是在赌一个未知的风险敞口。
+    pub fn mark_margin_mode(&mut self, observed: crate::margin::ObservedMarginMode) {
+        self.margin_cross = observed == crate::margin::ObservedMarginMode::Cross;
+        if !self.margin_cross {
+            self.armed = false;
+        }
+    }
+
+    /// 交易所侧的保证金模式是否为全仓（已观测且确认）。
+    pub fn margin_is_cross(&self) -> bool {
+        self.margin_cross
+    }
+
     /// 主动开启交易。
     ///
-    /// **仅当两个前置条件都满足时才生效**——返回 `false` 表示开启失败，
+    /// **仅当全部前置条件都满足时才生效**——返回 `false` 表示开启失败，
     /// 调用方应把原因告知用户（缺哪一项）。
     pub fn arm(&mut self) -> bool {
-        if self.user_stream_connected && self.account_reconciled {
+        if self.user_stream_connected && self.account_reconciled && self.margin_cross {
             self.armed = true;
             true
         } else {
@@ -132,7 +157,7 @@ impl LiveSafety {
 
     /// 是否允许提交订单。
     pub fn can_submit(&self) -> bool {
-        self.user_stream_connected && self.account_reconciled && self.armed
+        self.user_stream_connected && self.account_reconciled && self.margin_cross && self.armed
     }
 
     pub fn is_armed(&self) -> bool {
@@ -143,7 +168,13 @@ impl LiveSafety {
         self.user_stream_connected
     }
 
+    /// 账户已对账，**且**保证金模式确认为全仓。
     pub fn account_reconciled(&self) -> bool {
+        self.account_reconciled && self.margin_cross
+    }
+
+    /// 持仓/余额是否已对账（不含保证金模式）。界面要能区分这两件事。
+    pub fn positions_reconciled(&self) -> bool {
         self.account_reconciled
     }
 
@@ -156,6 +187,9 @@ impl LiveSafety {
         if !self.account_reconciled {
             v.push("账户未对账——本地持仓可能与交易所不一致");
         }
+        if !self.margin_cross {
+            v.push("交易所侧保证金模式不是全仓——买卖前必须先切换为全仓（本项目统一全仓）");
+        }
         if !self.armed {
             v.push("未开启交易（ARM）");
         }
@@ -166,6 +200,7 @@ impl LiveSafety {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::margin::ObservedMarginMode;
 
     #[test]
     fn default_mode_is_paper() {
@@ -199,9 +234,9 @@ mod tests {
         assert!(!ServiceMode::Paper.is_live());
     }
 
-    /// 三个条件必须同时满足才能下单。
+    /// 全部前置条件必须同时满足才能下单。
     #[test]
-    fn all_three_conditions_are_required_before_submitting() {
+    fn all_preconditions_are_required_before_submitting() {
         let mut s = LiveSafety::new();
         assert!(!s.can_submit(), "初始状态不能下单");
 
@@ -212,8 +247,59 @@ mod tests {
         assert!(!s.can_submit());
 
         s.mark_account_reconciled(true);
-        assert!(s.arm(), "两个前置条件满足后可以开启");
+        assert!(!s.arm(), "保证金模式未确认是全仓时仍不能开启");
+
+        s.mark_margin_mode(ObservedMarginMode::Cross);
+        assert!(s.arm(), "全部前置条件满足后可以开启");
         assert!(s.can_submit());
+    }
+
+    /// 表驱动：观测到的保证金模式决定能否武装。
+    #[test]
+    fn margin_mode_gates_arming() {
+        for (observed, can_arm) in [
+            (ObservedMarginMode::Cross, true),
+            (ObservedMarginMode::Isolated, false),
+            // 未知也不能开：无法估算强平价时继续交易是在赌未知敞口
+            (ObservedMarginMode::Unknown, false),
+        ] {
+            let mut s = LiveSafety::new();
+            s.mark_user_stream_connected(true);
+            s.mark_account_reconciled(true);
+            s.mark_margin_mode(observed);
+            assert_eq!(s.arm(), can_arm, "观测到 {} 时", observed.label());
+            assert_eq!(s.can_submit(), can_arm, "观测到 {} 时", observed.label());
+        }
+    }
+
+    /// 已在运行时观测到逐仓必须**自动解除武装**。
+    #[test]
+    fn observing_isolated_disarms_automatically() {
+        let mut s = LiveSafety::new();
+        s.mark_user_stream_connected(true);
+        s.mark_account_reconciled(true);
+        s.mark_margin_mode(ObservedMarginMode::Cross);
+        assert!(s.arm());
+
+        s.mark_margin_mode(ObservedMarginMode::Isolated);
+        assert!(!s.is_armed(), "观测到逐仓必须立即解除武装");
+        assert!(!s.can_submit());
+        assert!(!s.margin_is_cross());
+    }
+
+    /// 重启后（默认状态）不能武装，且原因里必须写明「不是全仓」。
+    #[test]
+    fn restart_requires_fresh_margin_observation() {
+        let s = LiveSafety::default();
+        let reasons = s.blocking_reasons();
+        assert!(
+            reasons.iter().any(|r| r.contains("全仓")),
+            "重启后必须提示需要确认保证金模式：{reasons:?}"
+        );
+        assert!(
+            reasons.len() >= 3,
+            "数据流、对账、保证金模式都要各自说明：{reasons:?}"
+        );
     }
 
     /// **数据流断线必须自动解除武装。**
@@ -223,6 +309,7 @@ mod tests {
         let mut s = LiveSafety::new();
         s.mark_user_stream_connected(true);
         s.mark_account_reconciled(true);
+        s.mark_margin_mode(ObservedMarginMode::Cross);
         s.arm();
         assert!(s.can_submit());
 
@@ -252,7 +339,8 @@ mod tests {
         let s = LiveSafety::new();
         assert!(!s.is_armed());
         assert!(!s.can_submit());
-        assert_eq!(s.blocking_reasons().len(), 3, "三项原因都要能列出");
+        // 数据流、对账、保证金模式、ARM —— 四项都要能列出
+        assert_eq!(s.blocking_reasons().len(), 4, "四项原因都要能列出");
     }
 
     #[test]
@@ -260,6 +348,13 @@ mod tests {
         let mut s = LiveSafety::new();
         s.mark_user_stream_connected(true);
         s.mark_account_reconciled(true);
+        // 只剩「保证金模式未确认」与「未 ARM」两项
+        let reasons = s.blocking_reasons();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons.iter().any(|r| r.contains("全仓")), "{reasons:?}");
+        assert!(reasons.iter().any(|r| r.contains("ARM")), "{reasons:?}");
+
+        s.mark_margin_mode(ObservedMarginMode::Cross);
         let reasons = s.blocking_reasons();
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains("ARM"), "应明确提示缺 ARM：{reasons:?}");
@@ -273,11 +368,13 @@ mod tests {
         let mut s = LiveSafety::new();
         s.mark_user_stream_connected(true);
         s.mark_account_reconciled(true);
+        s.mark_margin_mode(ObservedMarginMode::Cross);
         s.arm();
         s.disarm();
         assert!(!s.can_submit());
         assert!(s.user_stream_connected(), "解除武装不改变连接状态");
         assert!(s.account_reconciled());
+        assert!(s.margin_is_cross(), "解除武装不改变已观测到的保证金模式");
     }
 
     #[test]

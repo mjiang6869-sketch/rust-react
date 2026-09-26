@@ -616,6 +616,53 @@ impl BinanceClient {
         Ok(parse_available_balance(&body, asset))
     }
 
+    /// 读取某交易对在交易所侧的保证金模式与杠杆。
+    ///
+    /// # 为什么走 REST 而不是 WS
+    ///
+    /// ws-fapi 的 `account.position` 有等价能力，但仓库里还没有 ws-fapi 的
+    /// 请求-响应客户端，而这里只在**实盘对账时调用一次**（不轮询）。长期持续
+    /// 监控应该改用用户数据流的 `ACCOUNT_UPDATE` 推送。
+    ///
+    /// 注意：v3 版 `positionRisk` 已去掉 `marginType` 字段，所以这里用 v2。
+    pub async fn position_margin_state(
+        &self,
+        symbol: &str,
+    ) -> Result<crate::binance::SymbolMarginState, ExchangeError> {
+        let body = self
+            .get_signed(
+                "/fapi/v2/positionRisk",
+                vec![("symbol", symbol.to_string())],
+            )
+            .await?;
+        Ok(crate::binance::parse_position_margin(&body, symbol))
+    }
+
+    /// 请求把某交易对的保证金模式切换为**全仓**。
+    ///
+    /// # 调用前提
+    ///
+    /// 币安要求该交易对**没有持仓也没有挂单**才能切换，否则分别返回
+    /// -4048 / -4047。调用方应只在空仓且无挂单时调用；**不要为了切换而
+    /// 先撤单或平仓**——那是另一个决策，必须由操作者做。
+    ///
+    /// 走 REST 的理由同上（ws-fapi 没有对应方法）。权重 1。
+    pub async fn set_margin_type_crossed(
+        &self,
+        symbol: &str,
+    ) -> Result<crate::binance::MarginTypeChange, ExchangeError> {
+        let result = self
+            .post_signed(
+                "/fapi/v1/marginType",
+                vec![
+                    ("symbol", symbol.to_string()),
+                    ("marginType", "CROSSED".to_string()),
+                ],
+            )
+            .await;
+        crate::binance::margin_type_change_outcome(result)
+    }
+
     /// 提交订单。
     ///
     /// `newOrderRespType=RESULT` 让币安直接返回成交状态——比 ACK 少一次查询，

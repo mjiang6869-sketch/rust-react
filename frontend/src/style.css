@@ -1517,39 +1517,70 @@ tbody tr:hover {
 .date-wrap input::-webkit-calendar-picker-indicator { display: none; }
 .date-trigger { min-width: 40px; }
 
-/* 下单面板：参数分区，整块随页面滚动；确认区吸附在视野底部，随时能提交。
-   面板的 overflow 必须放开（覆盖 .panel 的 hidden）：否则 sticky 的滚动
-   容器会变成面板自己，确认区就吸不住了。 */
+/* 下单表单保留价格、仓位和保护单；预览进入弹窗，不占右侧栏高度。 */
 .manual-panel { display: flex; flex-direction: column; overflow: visible; }
-.manual-panel > .panel-head { flex-shrink: 0; padding: 14px 16px; }
-.manual-body { border: 0; margin: 0; padding: 0 16px; min-width: 0; }
-.manual-direction { margin: 14px 0 0; }
-.manual-section { display: grid; gap: 12px; padding: 18px 0; border-bottom: 1px solid var(--border); }
-.manual-section h3 { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-.manual-section h3 > span { color: var(--text-dim); font: 11px var(--mono); }
-.manual-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-.manual-body .field { gap: 6px; }
-.manual-body .input-wrap input { padding: 8px; }
+.manual-body { min-width: 0; margin: 0; padding: 0 12px; border: 0; }
+.manual-direction { margin: 12px 0; }
+.manual-fields { display: grid; gap: 10px; padding-bottom: 12px; }
+.manual-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.manual-body .field { gap: 4px; }
+.manual-body .input-wrap input { min-height: 36px; padding: 6px 8px; font-size: 12px; }
+.manual-body .input-action { min-height: 36px; }
 .size-presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
-.size-presets button { min-height: 30px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-input); color: var(--text-dim); font: 12px var(--mono); }
-.size-presets button[aria-pressed='true'], .manual-section .segmented button[aria-pressed='true'] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
-.manual-section .segmented { margin: 0; }
+.size-presets button { min-height: 28px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-input); color: var(--text-dim); font: 12px var(--mono); }
+.size-presets button[aria-pressed='true'], .manual-tp-choice .segmented button[aria-pressed='true'] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.manual-tp-choice { display: flex; align-items: center; gap: 10px; color: var(--text); font-size: 12px; }
+.manual-tp-choice > span { flex-shrink: 0; }
+.manual-tp-choice .segmented { flex: 1; margin: 0; padding: 3px; }
+.manual-tp-choice .segmented button { min-height: 30px; font-size: 12px; }
+.manual-mode { display: flex; align-items: center; gap: 10px; color: var(--text); font-size: 12px; }
+.manual-mode > span { flex-shrink: 0; }
+.manual-mode .segmented { flex: 1; margin: 0; padding: 3px; }
+.manual-mode .segmented button { min-height: 30px; font-size: 12px; }
+.manual-mode .segmented button[aria-pressed='true'] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.manual-unit-hint { margin: 0; color: var(--text-dim); font-size: 11px; }
 .manual-rungs .rungs-head, .manual-rungs .rung-row { grid-template-columns: 24px minmax(0, 1fr) minmax(0, 1fr) 28px; gap: 6px; }
-.manual-rungs .rung-row { margin-top: 8px; }
+.manual-rungs .rungs-head { margin-bottom: 4px; }
+.manual-rungs .rung-row { margin-top: 6px; }
 .manual-rungs .icon-btn { width: 28px; }
-.manual-rungs .rungs-foot { margin-top: 8px; }
-.manual-break-even { padding: 12px; border-radius: 8px; background: var(--bg-input); }
-.manual-review { border-bottom: 0; }
-.manual-review .preview { margin: 0; padding: 0; border: 0; background: transparent; }
-.manual-review .preview .kv { margin: 8px 0; }
-.manual-review .kv > div { padding: 7px 0; }
-.manual-review .mini-table { min-width: 350px; }
-.manual-preview-status { color: var(--text-dim); font-size: 12px; padding: 12px 0; }
-/* 面板不再裁剪圆角（overflow: visible），底角自己画圆，和 .panel 的 16px 对齐。 */
-.manual-submit { position: sticky; bottom: 0; flex-shrink: 0; display: grid; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border-strong); border-bottom-left-radius: 15px; border-bottom-right-radius: 15px; background: var(--bg-panel); }
-.manual-submit > p { font-size: 12px; color: var(--text-dim); }
+.manual-rungs .rungs-foot { margin-top: 6px; padding-top: 6px; }
+.manual-break-even { align-items: center; min-height: 38px; padding: 7px 10px; border-radius: 8px; background: var(--bg-input); }
+.manual-break-even input { margin: 0; }
+.manual-break-even small { margin-top: 0; }
+.manual-submit { position: sticky; z-index: 2; bottom: 0; flex-shrink: 0; display: grid; gap: 6px; padding: 10px 12px; border-top: 1px solid var(--border-strong); border-bottom-left-radius: 15px; border-bottom-right-radius: 15px; background: var(--bg-panel); }
+.manual-submit > p { font-size: 11px; color: var(--text-dim); }
 .manual-submit > .field-error { color: var(--neg); }
-.manual-submit .primary { width: 100%; min-height: 44px; }
+.manual-submit .primary { width: 100%; min-height: 42px; }
+
+.manual-dialog { width: min(560px, calc(100vw - 24px)); max-width: none; max-height: min(82dvh, 760px); margin: auto; padding: 0; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--border-strong); border-radius: 14px; background: var(--bg-panel); color: var(--text); box-shadow: 0 24px 80px #000b; }
+.manual-dialog::backdrop { background: #05080cbd; backdrop-filter: blur(2px); }
+.manual-dialog-head { position: sticky; z-index: 2; top: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 17px 20px; border-bottom: 1px solid var(--border); background: var(--bg-panel); }
+.manual-dialog-head h2 { font-size: 16px; }
+.manual-dialog-head span { color: var(--text-dim); font-size: 12px; }
+.manual-dialog-head .icon-btn { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; }
+.manual-dialog-content { padding: 16px 20px; }
+.manual-dialog-intent { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-bottom: 14px; color: var(--text-dim); font-size: 11px; }
+.manual-dialog-content .notice { margin: 0 0 14px; }
+.manual-dialog-content .notice .link-btn { margin-left: 8px; }
+.manual-dialog-verdict { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 12px; font-size: 11px; color: var(--text-dim); }
+.manual-dialog .preview { margin: 0; border: 0; background: transparent; }
+.manual-dialog .preview .kv { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0 0 14px; padding: 0; }
+.manual-dialog .preview .kv > div { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-input); }
+.manual-dialog .preview .kv dd { color: var(--text-bright); font-size: 13px; text-align: left; }
+.manual-dialog .preview .kv dd.neg { color: var(--neg); }
+.manual-dialog .preview .mini-table { min-width: 430px; }
+.manual-dialog .preview .warnings { padding: 12px 0 0 20px; }
+.manual-dialog-loading { display: grid; place-items: center; min-height: 180px; color: var(--text-dim); font-size: 13px; }
+.manual-dialog-actions { position: sticky; z-index: 2; bottom: 0; display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--border); background: var(--bg-panel); }
+.manual-dialog-actions button { min-height: 40px; min-width: 112px; }
+@media (max-width: 600px) {
+  .manual-body .input-wrap input, .manual-body .input-action { min-height: 44px; }
+  .size-presets button, .manual-tp-choice .segmented button { min-height: 40px; }
+  .manual-dialog-content { padding: 14px; }
+  .manual-dialog-head { padding: 14px; }
+  .manual-dialog-actions { padding: 12px 14px; }
+  .manual-dialog-actions button { flex: 1; min-width: 0; }
+}
 
 .context-menu { position: fixed; z-index: 1000; min-width: 220px; max-width: calc(100vw - 16px); padding: 6px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--bg-elevated); box-shadow: 0 12px 40px #0008; }
 
@@ -1609,9 +1640,6 @@ tbody tr:hover {
   .ui-input, .input-action, .date-trigger, .size-presets button { min-height: 44px; }
   .ui-input { font-size: 16px; }
 }
-
-.manual-submit-summary { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--text-dim); }
-.manual-submit-summary strong { color: var(--text); font-family: var(--mono); font-weight: 500; }
 
 /* 数据页按工作顺序：概览与任务在上，下载配置与本地覆盖并排。 */
 .data-layout {

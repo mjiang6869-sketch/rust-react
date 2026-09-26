@@ -73,6 +73,8 @@ pub struct PositionSet {
     pub completed_rungs: Vec<usize>,
     /// 当前止损价（保本/移动止损会更新）。
     pub stop_price: Option<Price>,
+    /// 当前止损价生效时刻；改价后不得用此前的成交触发新止损。
+    pub stop_placed_at: Option<DateTime<Utc>>,
     /// 止损是否已触发但未成交（maker-only 的裸露风险）。
     pub stop_triggered_at: Option<DateTime<Utc>>,
     /// 保护单挂出的时刻。
@@ -101,6 +103,7 @@ impl PositionSet {
             tp,
             completed_rungs: Vec::new(),
             stop_price: position.stop_price,
+            stop_placed_at: None,
             stop_triggered_at: None,
             protection_placed_at: None,
             tp_order_ids: Vec::new(),
@@ -219,8 +222,6 @@ pub fn on_take_profit_filled(
         )));
     }
 
-    set.completed_rungs.push(rung);
-
     // 扣减持仓
     let new_qty = set.quantity.get() - filled_qty.get();
     if new_qty < Decimal::ZERO {
@@ -229,6 +230,7 @@ pub fn on_take_profit_filled(
             set.quantity
         )));
     }
+    set.completed_rungs.push(rung);
     set.quantity = Qty::new(new_qty);
 
     let mut fixes = Vec::new();
@@ -242,26 +244,16 @@ pub fn on_take_profit_filled(
         return Ok(fixes);
     }
 
-    // 按新的持仓量修正止损单数量
-    if let Some(stop) = working
-        .iter()
-        .find(|t| t.order.purpose == OrderPurpose::StopLoss && t.state.is_open())
-    {
-        let want = new_qty;
-        let have = stop.order.quantity.get() - stop.filled.get();
-        if have != want {
-            let mut corrected = stop.order.clone();
-            corrected.quantity = Qty::new(want);
-            fixes.push(ProtectionFix::Replace(Box::new(corrected)));
-        }
-    }
-
     // 判定是否触发保本止损：第一档止盈成交后即可考虑
     if let Some(be) = set.plan.break_even {
         if let Some(stop_price) = set.stop_price {
             let risk = (set.entry_price.get() - stop_price.get()).abs();
             // 分批止盈的第一档成交本身就意味着价格已经走出了一段
-            let reached = set.tp.rungs()[rung].0 * set.entry_price.get();
+            let reached = set
+                .tp
+                .rung_price(rung, set.entry_price.get(), set.side)
+                .map(|target| (target - set.entry_price.get()).abs())
+                .unwrap_or(Decimal::ZERO);
             if risk > Decimal::ZERO && reached >= risk * be.trigger_r {
                 let new_stop = match set.side {
                     Side::Buy => set.entry_price.get() + be.offset,
@@ -275,6 +267,22 @@ pub fn on_take_profit_filled(
                     set.stop_price = Some(Price::new(new_stop));
                 }
             }
+        }
+    }
+
+    // 保本判断完成后一次性给出新止损单，数量与价格必须同时与剩余持仓一致。
+    if let Some(stop) = working
+        .iter()
+        .find(|t| t.order.purpose == OrderPurpose::StopLoss && t.state.is_open())
+    {
+        let want = new_qty;
+        let have = stop.order.quantity.get() - stop.filled.get();
+        let desired_price = set.stop_price.unwrap_or(stop.order.limit_price);
+        if have != want || stop.order.limit_price != desired_price {
+            let mut corrected = stop.order.clone();
+            corrected.quantity = Qty::new(want);
+            corrected.limit_price = desired_price;
+            fixes.push(ProtectionFix::Replace(Box::new(corrected)));
         }
     }
 
@@ -370,14 +378,16 @@ impl PositionSet {
             .rungs()
             .iter()
             .enumerate()
-            .map(|(i, (pct, fraction))| {
-                let price = match self.side {
-                    Side::Buy => entry * (Decimal::ONE + pct),
-                    Side::Sell => entry * (Decimal::ONE - pct),
+            .map(|(i, (_, fraction))| {
+                let price = self.tp.rung_price(i, entry, self.side).unwrap_or(entry);
+                let pct = if entry > Decimal::ZERO {
+                    (price - entry).abs() / entry
+                } else {
+                    Decimal::ZERO
                 };
                 RungView {
                     rung: i,
-                    pct: *pct,
+                    pct,
                     fraction: *fraction,
                     price,
                     filled: self.completed_rungs.contains(&i),
@@ -449,7 +459,11 @@ pub struct ManualPreview {
     /// 预估保证金占用。
     #[serde(with = "rust_decimal::serde::str")]
     pub margin_required: Decimal,
-    /// 止损距估算强平价的缓冲比例。`None` 表示无法估算（杠杆过高）。
+    /// 保证金模式。本项目统一全仓。
+    pub margin_mode: crate::margin::MarginMode,
+    /// 全仓强平估算。`Never` 表示余额覆盖得住，`Immediate` 表示开仓即在强平线下。
+    pub liquidation: crate::margin::CrossLiquidation,
+    /// 止损距估算强平价的缓冲比例。`None` 表示不会强平。
     pub liquidation_buffer_pct: Option<Decimal>,
     /// 风控是否通过。
     pub accepted: bool,
@@ -477,10 +491,13 @@ pub struct RungPreview {
 ///
 /// 这是**唯一**把 `ManualPlan` 变成具体价格的函数，`/preview` 与 `/submit`
 /// 都调用它，所以界面看到的与实际的必然一致。
+///
+/// 账户按**全仓**传入：强平价由钱包余额与持仓数量决定，杠杆不参与（见
+/// [`crate::margin`]）。`account` 的资产必须与合约的 `margin_asset` 一致。
 pub fn preview_manual(
     instrument: &crate::instrument::Instrument,
     plan: &ManualPlan,
-    equity: Decimal,
+    account: &crate::margin::MarginAccount,
     mark_price: Decimal,
     limits: &crate::risk::RiskLimits,
 ) -> Result<ManualPreview, DomainError> {
@@ -502,7 +519,8 @@ pub fn preview_manual(
         Some(q) => instrument.precision.quantity_or_zero(q.get())?,
         None => {
             let pct = plan.size_pct.unwrap_or(Decimal::new(1, 1));
-            let notional = equity * pct * plan.leverage;
+            // 按比例下单以**可用保证金**为基准：这是唯一能拿来承担新仓位的钱。
+            let notional = account.available() * pct * plan.leverage;
             if entry.get() <= Decimal::ZERO {
                 return Err(DomainError::NonPositivePrice(entry.get()));
             }
@@ -520,6 +538,8 @@ pub fn preview_manual(
             quantity,
             notional: Decimal::ZERO,
             margin_required: Decimal::ZERO,
+            margin_mode: crate::margin::MarginMode::Cross,
+            liquidation: crate::margin::CrossLiquidation::Never,
             liquidation_buffer_pct: None,
             accepted: false,
             reject_reason: Some("数量低于交易所最小步长，无法下单".into()),
@@ -528,7 +548,7 @@ pub fn preview_manual(
     }
 
     let notional = quantity.get() * entry.get();
-    let margin_required = notional / plan.leverage.max(Decimal::ONE);
+    let margin_required = crate::margin::initial_margin(notional, plan.leverage);
 
     // 止损
     let stop = instrument
@@ -538,11 +558,11 @@ pub fn preview_manual(
     // 分批止盈
     plan.take_profit.validate()?;
     let mut take_profits = Vec::new();
-    for (i, (pct, fraction)) in plan.take_profit.rungs().iter().enumerate() {
-        let raw = match plan.side {
-            Side::Buy => entry.get() * (Decimal::ONE + pct),
-            Side::Sell => entry.get() * (Decimal::ONE - pct),
-        };
+    for (i, (_, fraction)) in plan.take_profit.rungs().iter().enumerate() {
+        let raw = plan
+            .take_profit
+            .rung_price(i, entry.get(), plan.side)
+            .ok_or_else(|| DomainError::IllegalTransition(format!("止盈档位 {i} 缺少目标价")))?;
         let price = instrument
             .precision
             .price_for(close_side, raw, PriceRole::TakeProfit)?;
@@ -565,7 +585,7 @@ pub fn preview_manual(
             price,
             quantity: qty,
             gross_profit: gross,
-            distance_bp: pct * Decimal::from(10_000),
+            distance_bp: (price.get() - entry.get()).abs() / entry.get() * Decimal::from(10_000),
         });
     }
 
@@ -576,11 +596,17 @@ pub fn preview_manual(
         .unwrap_or(entry.get());
     let verdict = crate::risk::check_entry(
         instrument,
+        &crate::margin::EntryExposure {
+            account,
+            side: plan.side,
+            entry: entry.get(),
+            quantity,
+            leverage: plan.leverage,
+        },
         plan.side,
         entry.get(),
         stop.get(),
         tp_first,
-        plan.leverage,
         limits,
     );
     let (accepted, reject_reason) = match verdict {
@@ -588,18 +614,30 @@ pub fn preview_manual(
         crate::risk::RiskVerdict::Reject(r) => (false, Some(r.message().to_string())),
     };
 
-    // 强平缓冲提示
-    let is_long = plan.side == Side::Buy;
-    let liq = instrument.liquidation_price_estimate(entry.get(), plan.leverage, is_long);
-    let liquidation_buffer_pct = liq.map(|l| (l - stop.get()).abs() / entry.get());
-    if let Some(b) = liquidation_buffer_pct {
-        if b < Decimal::new(1, 3) {
-            warnings.push(format!(
-                "止损距估算强平价仅 {}，仓位在此止损前有被强平的风险",
-                b
-            ));
+    // 全仓强平估算。资产不一致时这里会报错——那种情况下没有可展示的强平价，
+    // 用一句明确的警告代替，而不是编造一个数字。
+    let (liquidation, liquidation_buffer_pct) = match crate::risk::liquidation_warning(
+        instrument,
+        account,
+        plan.side,
+        entry.get(),
+        stop.get(),
+        quantity,
+    ) {
+        Ok(w) => {
+            if w.dangerous {
+                warnings.push(format!(
+                    "止损距估算强平价仅 {}，仓位在此止损前有被强平的风险",
+                    w.buffer_pct.unwrap_or_default()
+                ));
+            }
+            (w.estimate, w.buffer_pct)
         }
-    }
+        Err(e) => {
+            warnings.push(e.message().to_string());
+            (crate::margin::CrossLiquidation::Never, None)
+        }
+    };
 
     // triggerProtect 提示。
     //
@@ -634,6 +672,8 @@ pub fn preview_manual(
         quantity,
         notional,
         margin_required,
+        margin_mode: crate::margin::MarginMode::Cross,
+        liquidation,
         liquidation_buffer_pct,
         accepted,
         reject_reason,
@@ -659,6 +699,7 @@ pub fn rung_distribution(rungs: &[(ClientOrderId, ProtectionRole)]) -> BTreeMap<
 mod tests {
     use super::*;
     use crate::instrument::{ContractKind, FeeSchedule, FeeSource, Instrument};
+    use crate::margin::MarginAccount;
     use crate::precision::Precision;
     use crate::protection::{BreakEvenSpec, StopSpec, TpRung};
     use crate::state::TrackedOrder;
@@ -981,6 +1022,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ladder_fills_update_stop_quantity_and_only_move_price_at_one_r() {
+        for (first_pct, first_stop, second_stop) in [
+            (dec!(0.0025), dec!(3200), dec!(3200)),
+            (dec!(0.00125), dec!(3192), dec!(3200)),
+        ] {
+            let mut s = set();
+            s.stop_price = Some(Price::new(dec!(3192)));
+            s.plan.stop = StopSpec::Structural { price: dec!(3192) };
+            s.tp = TpPlan::Ladder {
+                rungs: vec![
+                    TpRung {
+                        pct: first_pct,
+                        fraction: dec!(0.4),
+                    },
+                    TpRung {
+                        pct: dec!(0.0025),
+                        fraction: dec!(0.3),
+                    },
+                    TpRung {
+                        pct: dec!(0.005),
+                        fraction: dec!(0.3),
+                    },
+                ],
+            };
+            let mut stop = tracked("stop", OrderPurpose::StopLoss, Side::Sell, dec!(1), dec!(0));
+            stop.order.limit_price = Price::new(dec!(3192));
+            let first = on_take_profit_filled(&mut s, 0, Qty::new(dec!(0.4)), &[&stop]).unwrap();
+            assert_eq!(s.quantity.get(), dec!(0.6));
+            assert_eq!(s.stop_price.unwrap().get(), first_stop);
+            assert!(
+                first
+                    .iter()
+                    .any(|fix| matches!(fix, ProtectionFix::Replace(order)
+                if order.quantity.get() == dec!(0.6) && order.limit_price.get() == first_stop))
+            );
+
+            stop.order.quantity = Qty::new(dec!(0.6));
+            stop.order.limit_price = Price::new(first_stop);
+            let second = on_take_profit_filled(&mut s, 1, Qty::new(dec!(0.3)), &[&stop]).unwrap();
+            assert_eq!(s.quantity.get(), dec!(0.3));
+            assert_eq!(s.stop_price.unwrap().get(), second_stop);
+            assert!(
+                second
+                    .iter()
+                    .any(|fix| matches!(fix, ProtectionFix::Replace(order)
+                if order.quantity.get() == dec!(0.3) && order.limit_price.get() == second_stop))
+            );
+        }
+    }
+
     // ---------- 手动计划预览 ----------
 
     fn manual(side: Side, entry: Decimal, stop: Decimal) -> ManualPlan {
@@ -1006,10 +1098,11 @@ mod tests {
     fn preview_produces_quantized_prices() {
         let i = instrument();
         let p = manual(Side::Buy, dec!(3200), dec!(3190));
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         let pv = preview_manual(
             &i,
             &p,
-            dec!(10000),
+            &acct,
             dec!(3200),
             &crate::risk::RiskLimits::default(),
         )
@@ -1032,10 +1125,11 @@ mod tests {
         let i = instrument();
         let mut p = manual(Side::Buy, dec!(3200), dec!(3190));
         p.quantity = Some(Qty::new(dec!(0.00001)));
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         let pv = preview_manual(
             &i,
             &p,
-            dec!(10000),
+            &acct,
             dec!(3200),
             &crate::risk::RiskLimits::default(),
         )
@@ -1050,10 +1144,11 @@ mod tests {
         let i = instrument();
         // 多头但止损放在入场价上方
         let p = manual(Side::Buy, dec!(3200), dec!(3210));
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         let pv = preview_manual(
             &i,
             &p,
-            dec!(10000),
+            &acct,
             dec!(3200),
             &crate::risk::RiskLimits::default(),
         )
@@ -1067,10 +1162,11 @@ mod tests {
     fn preview_warns_about_trigger_protect() {
         let i = instrument();
         let p = manual(Side::Buy, dec!(3200), dec!(3190));
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         let pv = preview_manual(
             &i,
             &p,
-            dec!(10000),
+            &acct,
             dec!(3200),
             &crate::risk::RiskLimits::default(),
         )
@@ -1087,10 +1183,11 @@ mod tests {
     fn preview_computes_margin_requirement() {
         let i = instrument();
         let p = manual(Side::Buy, dec!(3200), dec!(3190));
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         let pv = preview_manual(
             &i,
             &p,
-            dec!(10000),
+            &acct,
             dec!(3200),
             &crate::risk::RiskLimits::default(),
         )
@@ -1104,20 +1201,71 @@ mod tests {
         );
     }
 
-    /// 空仓时强平缓冲应可估算，供界面提示。
+    /// 全仓下余额充裕时不会强平：缓冲为 `None`，`Never` 而不是编一个数字。
     #[test]
-    fn preview_reports_liquidation_buffer() {
+    fn preview_reports_never_liquidated_with_ample_balance() {
         let i = instrument();
         let p = manual(Side::Buy, dec!(3200), dec!(3190));
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         let pv = preview_manual(
             &i,
             &p,
-            dec!(10000),
+            &acct,
             dec!(3200),
             &crate::risk::RiskLimits::default(),
         )
         .unwrap();
+        assert_eq!(pv.margin_mode, crate::margin::MarginMode::Cross);
+        assert_eq!(pv.liquidation, crate::margin::CrossLiquidation::Never);
+        assert!(pv.liquidation_buffer_pct.is_none());
+    }
+
+    /// 余额很薄时空头仍会被强平，缓冲应当算得出来。
+    #[test]
+    fn preview_reports_liquidation_buffer_when_thin() {
+        let i = instrument();
+        let mut p = manual(Side::Sell, dec!(3200), dec!(3232));
+        p.quantity = Some(Qty::new(dec!(1)));
+        let acct = MarginAccount::flat("USDC", dec!(160));
+        let pv = preview_manual(
+            &i,
+            &p,
+            &acct,
+            dec!(3200),
+            &crate::risk::RiskLimits {
+                max_stop_pct: dec!(5),
+                ..crate::risk::RiskLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(pv.liquidation, crate::margin::CrossLiquidation::At(_)),
+            "{:?}",
+            pv.liquidation
+        );
         assert!(pv.liquidation_buffer_pct.is_some());
+    }
+
+    /// 资产不一致时给出明确警告，而不是编造强平价。
+    #[test]
+    fn preview_warns_when_asset_mismatch() {
+        let i = instrument();
+        let p = manual(Side::Buy, dec!(3200), dec!(3190));
+        let usdt = MarginAccount::flat("USDT", dec!(10000));
+        let pv = preview_manual(
+            &i,
+            &p,
+            &usdt,
+            dec!(3200),
+            &crate::risk::RiskLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            pv.warnings.iter().any(|w| w.contains("资产")),
+            "应警告资产不一致：{:?}",
+            pv.warnings
+        );
+        assert!(!pv.accepted, "资产不一致必须被拒绝");
     }
 
     /// 按权益比例下单时数量应由权益与杠杆算出。
@@ -1128,10 +1276,11 @@ mod tests {
         p.quantity = None;
         p.size_pct = Some(dec!(0.1));
         p.leverage = Decimal::from(3);
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         let pv = preview_manual(
             &i,
             &p,
-            dec!(10000),
+            &acct,
             dec!(3200),
             &crate::risk::RiskLimits::default(),
         )

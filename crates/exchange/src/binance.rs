@@ -333,6 +333,135 @@ pub struct BinanceError {
     pub msg: String,
 }
 
+// ---------------------------------------------------------------------------
+// 保证金模式
+// ---------------------------------------------------------------------------
+
+/// 单个交易对在交易所侧的保证金状态。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SymbolMarginState {
+    pub margin_mode: domain::ObservedMarginMode,
+    /// 交易所侧的杠杆。全仓下只影响初始保证金占用，不影响强平价。
+    pub leverage: Option<Decimal>,
+    /// 当前持仓量（带符号，正为多）。
+    pub position_amt: Decimal,
+}
+
+/// 解析 `GET /fapi/v2/positionRisk`。
+///
+/// 对账只关心「是不是全仓」。任何不能确定的输入都返回
+/// [`domain::ObservedMarginMode::Unknown`]——**Unknown 同样是阻止武装的理由**，
+/// 所以宁可未知也不要猜。对冲模式（`positionSide` 为 LONG/SHORT）下同一
+/// 交易对会出现多条记录，两条的 `marginType` 不一致时同样返回 Unknown。
+pub fn parse_position_margin(body: &str, symbol: &str) -> SymbolMarginState {
+    #[derive(Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default, rename = "marginType")]
+        margin_type: String,
+        #[serde(default)]
+        leverage: String,
+        #[serde(default, rename = "positionAmt")]
+        position_amt: String,
+    }
+
+    let unknown = SymbolMarginState {
+        margin_mode: domain::ObservedMarginMode::Unknown,
+        leverage: None,
+        position_amt: Decimal::ZERO,
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<Entry>>(body) else {
+        return unknown;
+    };
+    let matched: Vec<&Entry> = entries.iter().filter(|e| e.symbol == symbol).collect();
+    if matched.is_empty() {
+        return unknown;
+    }
+
+    let mut mode: Option<domain::ObservedMarginMode> = None;
+    for e in &matched {
+        let this = match e.margin_type.to_ascii_lowercase().as_str() {
+            // v2 返回 "cross"；个别版本写作 "crossed"。两者都是全仓。
+            "cross" | "crossed" => domain::ObservedMarginMode::Cross,
+            "isolated" => domain::ObservedMarginMode::Isolated,
+            _ => domain::ObservedMarginMode::Unknown,
+        };
+        match mode {
+            // 同一交易对的多条记录必须一致，否则无法判断，按未知处理。
+            Some(prev) if prev != this => {
+                return SymbolMarginState {
+                    margin_mode: domain::ObservedMarginMode::Unknown,
+                    leverage: None,
+                    position_amt: Decimal::ZERO,
+                };
+            }
+            _ => mode = Some(this),
+        }
+    }
+
+    SymbolMarginState {
+        margin_mode: mode.unwrap_or(domain::ObservedMarginMode::Unknown),
+        leverage: matched.first().and_then(|e| e.leverage.parse().ok()),
+        position_amt: matched
+            .first()
+            .and_then(|e| e.position_amt.parse().ok())
+            .unwrap_or(Decimal::ZERO),
+    }
+}
+
+/// 切换保证金模式的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarginTypeChange {
+    /// 已切换（或发起成功）。
+    Changed,
+    /// 本来就是全仓，无需切换（币安错误码 -4046）。
+    AlreadyCrossed,
+    /// 有挂单，不能切换（-4047）。**不要撤单去凑**——那是另一个决策。
+    BlockedByOpenOrders,
+    /// 有持仓，不能切换（-4048）。必须先平仓。
+    BlockedByPosition,
+}
+
+impl MarginTypeChange {
+    /// 面向用户的中文说明。
+    pub fn message(self) -> &'static str {
+        match self {
+            MarginTypeChange::Changed => "保证金模式已切换为全仓",
+            MarginTypeChange::AlreadyCrossed => "保证金模式本来就是全仓",
+            MarginTypeChange::BlockedByOpenOrders => {
+                "该交易对还有挂单，币安不允许此时切换保证金模式；请先撤单"
+            }
+            MarginTypeChange::BlockedByPosition => {
+                "该交易对还有持仓，币安不允许此时切换保证金模式；请先平仓"
+            }
+        }
+    }
+}
+
+/// 把切换保证金模式的响应分类。
+///
+/// `Unknown`（超时/5xx）与限流原样返回：**调用方必须先重新查询再决定**，
+/// 不能直接重发。
+pub fn margin_type_change_outcome(
+    result: Result<String, ExchangeError>,
+) -> Result<MarginTypeChange, ExchangeError> {
+    match result {
+        Ok(_) => Ok(MarginTypeChange::Changed),
+        Err(ExchangeError::Definitive(msg)) if msg.contains("-4046") => {
+            // 本来就是全仓，不是错误。
+            Ok(MarginTypeChange::AlreadyCrossed)
+        }
+        Err(ExchangeError::Definitive(msg)) if msg.contains("-4047") => {
+            Ok(MarginTypeChange::BlockedByOpenOrders)
+        }
+        Err(ExchangeError::Definitive(msg)) if msg.contains("-4048") => {
+            Ok(MarginTypeChange::BlockedByPosition)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// 限流响应里能用来算等待时间的原始信息。
 ///
 /// 单独成类型而不是给 `classify_api_error` 加两个 `&str` 参数：两个裸字符串
@@ -978,5 +1107,156 @@ mod tests {
         let (map, errors) = parse_all_contracts(&resp);
         assert!(map.is_empty(), "两条都缺过滤器");
         assert_eq!(errors.len(), 2, "每个失败都要被报告，不能静默跳过");
+    }
+
+    // ---- 保证金模式 ----
+
+    /// 表驱动：positionRisk 的解析结果。
+    ///
+    /// 对账只认「是全仓」这一件事；任何不确定的输入都必须是 Unknown，因为
+    /// Unknown 同样会阻止武装——宁可未知也不要猜。
+    #[test]
+    fn position_margin_parsing_table() {
+        use domain::ObservedMarginMode as M;
+        let rows: [(&str, M, Option<Decimal>, Decimal); 6] = [
+            (
+                r#"[{"symbol":"ETHUSDC","marginType":"cross","leverage":"3","positionAmt":"0.5"}]"#,
+                M::Cross,
+                Some(dec!(3)),
+                dec!(0.5),
+            ),
+            // 个别版本写 crossed，同样是全仓
+            (
+                r#"[{"symbol":"ETHUSDC","marginType":"crossed","positionAmt":"0"}]"#,
+                M::Cross,
+                None,
+                Decimal::ZERO,
+            ),
+            (
+                r#"[{"symbol":"ETHUSDC","marginType":"isolated","leverage":"20","positionAmt":"-1"}]"#,
+                M::Isolated,
+                Some(dec!(20)),
+                dec!(-1),
+            ),
+            // 大小写不敏感
+            (
+                r#"[{"symbol":"ETHUSDC","marginType":"ISOLATED"}]"#,
+                M::Isolated,
+                None,
+                Decimal::ZERO,
+            ),
+            // 找不到该交易对
+            (
+                r#"[{"symbol":"BTCUSDT","marginType":"cross"}]"#,
+                M::Unknown,
+                None,
+                Decimal::ZERO,
+            ),
+            // 空数组
+            ("[]", M::Unknown, None, Decimal::ZERO),
+        ];
+        for (body, mode, leverage, amt) in rows {
+            let got = parse_position_margin(body, "ETHUSDC");
+            assert_eq!(got.margin_mode, mode, "{body}");
+            assert_eq!(got.leverage, leverage, "{body}");
+            assert_eq!(got.position_amt, amt, "{body}");
+        }
+    }
+
+    /// 解析不了的一律 Unknown，不能猜成全仓。
+    #[test]
+    fn unparseable_position_margin_is_unknown() {
+        for body in ["not json", r#"{"code":-1}"#, ""] {
+            assert_eq!(
+                parse_position_margin(body, "ETHUSDC").margin_mode,
+                domain::ObservedMarginMode::Unknown,
+                "{body}"
+            );
+        }
+    }
+
+    /// 未知的 marginType 取值不能当作全仓——币安改名时必须暴露为未知。
+    #[test]
+    fn unknown_margin_type_value_is_unknown() {
+        let body = r#"[{"symbol":"ETHUSDC","marginType":"portfolio"}]"#;
+        assert_eq!(
+            parse_position_margin(body, "ETHUSDC").margin_mode,
+            domain::ObservedMarginMode::Unknown
+        );
+    }
+
+    /// 对冲模式下同一交易对有多条记录且模式不一致时，无法判断 → Unknown。
+    #[test]
+    fn conflicting_hedge_mode_records_are_unknown() {
+        let body = r#"[{"symbol":"ETHUSDC","marginType":"cross"},{"symbol":"ETHUSDC","marginType":"isolated"}]"#;
+        assert_eq!(
+            parse_position_margin(body, "ETHUSDC").margin_mode,
+            domain::ObservedMarginMode::Unknown
+        );
+        // 两条一致时仍可判断
+        let same = r#"[{"symbol":"ETHUSDC","marginType":"cross"},{"symbol":"ETHUSDC","marginType":"cross"}]"#;
+        assert_eq!(
+            parse_position_margin(same, "ETHUSDC").margin_mode,
+            domain::ObservedMarginMode::Cross
+        );
+    }
+
+    /// 切换结果的分类：-4046/-4047/-4048 各有明确含义。
+    #[test]
+    fn margin_type_change_outcomes_table() {
+        let rows = [
+            (Ok("{}".to_string()), Ok(MarginTypeChange::Changed)),
+            (
+                Err(ExchangeError::Definitive(
+                    "币安拒绝（-4046）：No need to change margin type.".into(),
+                )),
+                Ok(MarginTypeChange::AlreadyCrossed),
+            ),
+            (
+                Err(ExchangeError::Definitive(
+                    "币安拒绝（-4047）：Margin type cannot be changed if there exists open orders."
+                        .into(),
+                )),
+                Ok(MarginTypeChange::BlockedByOpenOrders),
+            ),
+            (
+                Err(ExchangeError::Definitive(
+                    "币安拒绝（-4048）：Margin type cannot be changed if there exists position."
+                        .into(),
+                )),
+                Ok(MarginTypeChange::BlockedByPosition),
+            ),
+        ];
+        for (input, want) in rows {
+            assert_eq!(margin_type_change_outcome(input), want);
+        }
+
+        // 超时属于「状态未知」：原样返回，调用方必须重新查询再决定。
+        let unknown = margin_type_change_outcome(Err(ExchangeError::Unknown("超时".into())));
+        assert!(matches!(unknown, Err(ExchangeError::Unknown(_))));
+
+        // 其它确定性的拒绝照常报错。
+        let other = margin_type_change_outcome(Err(ExchangeError::Definitive(
+            "币安拒绝（-1102）：bad param".into(),
+        )));
+        assert!(matches!(other, Err(ExchangeError::Definitive(_))));
+    }
+
+    /// 每一种结果都要有面向用户的中文说明。
+    #[test]
+    fn margin_type_change_messages_are_user_facing() {
+        for c in [
+            MarginTypeChange::Changed,
+            MarginTypeChange::AlreadyCrossed,
+            MarginTypeChange::BlockedByOpenOrders,
+            MarginTypeChange::BlockedByPosition,
+        ] {
+            assert!(!c.message().is_empty());
+        }
+        assert!(
+            MarginTypeChange::BlockedByPosition
+                .message()
+                .contains("持仓")
+        );
     }
 }

@@ -305,18 +305,16 @@ pub fn run(
             // 4b. 止盈判定（按当前档位）
             let rungs = pos.tp.rungs();
             let rung = rungs.get(pos.rungs_done);
-            let tp_hit = rung.map(|(pct, _)| {
-                let tp_raw = match pos.side {
-                    Side::Buy => pos.entry_price * (Decimal::ONE + pct),
-                    Side::Sell => pos.entry_price * (Decimal::ONE - pct),
-                };
-                config
-                    .instrument
-                    .precision
-                    .price_for(close_side, tp_raw, domain::PriceRole::TakeProfit)
-                    .map(|p| p.get())
-                    .unwrap_or(tp_raw)
-            });
+            let tp_hit = rung
+                .and_then(|_| pos.tp.rung_price(pos.rungs_done, pos.entry_price, pos.side))
+                .map(|tp_raw| {
+                    config
+                        .instrument
+                        .precision
+                        .price_for(close_side, tp_raw, domain::PriceRole::TakeProfit)
+                        .map(|p| p.get())
+                        .unwrap_or(tp_raw)
+                });
 
             // 止损优先：同一根 K 线内无法判断先后时取更保守的结果。
             // 这是旧实现 `stop_filled` 先于 `target_filled` 检查的同一个原则。
@@ -464,27 +462,52 @@ pub fn run(
                                 };
                                 let tp_first = req
                                     .take_profit
-                                    .rungs()
-                                    .first()
-                                    .map(|(pct, _)| match req.side {
-                                        Side::Buy => req.entry * (Decimal::ONE + pct),
-                                        Side::Sell => req.entry * (Decimal::ONE - pct),
-                                    })
+                                    .rung_price(0, req.entry, req.side)
                                     .unwrap_or(req.entry);
                                 let leverage = match req.size {
                                     domain::SizeHint::EquityFraction { leverage, .. } => leverage,
                                     domain::SizeHint::Fixed(_) => Decimal::ONE,
                                 };
 
-                                let verdict = check_entry(
-                                    &config.instrument,
-                                    req.side,
-                                    req.entry,
-                                    req.stop,
-                                    tp_first,
-                                    leverage,
-                                    &config.limits,
-                                );
+                                // 数量必须先定：全仓下强平价取决于持仓数量，
+                                // 初始保证金检查也要用到它。
+                                let qty = match entry_px > Decimal::ZERO {
+                                    true => resolve_size(
+                                        req.size,
+                                        Price::new(entry_px),
+                                        equity,
+                                        &config.instrument.precision,
+                                    ),
+                                    false => None,
+                                };
+
+                                let verdict = match qty {
+                                    None => {
+                                        RiskVerdict::Reject(StandDownReason::InsufficientEquity)
+                                    }
+                                    Some(qty) => {
+                                        // 回测里引擎恒为单仓，账户就是当前权益。
+                                        let account = domain::MarginAccount::flat(
+                                            config.instrument.margin_asset.clone(),
+                                            equity,
+                                        );
+                                        check_entry(
+                                            &config.instrument,
+                                            &domain::EntryExposure {
+                                                account: &account,
+                                                side: req.side,
+                                                entry: req.entry,
+                                                quantity: qty,
+                                                leverage,
+                                            },
+                                            req.side,
+                                            req.entry,
+                                            req.stop,
+                                            tp_first,
+                                            &config.limits,
+                                        )
+                                    }
+                                };
 
                                 match verdict {
                                     RiskVerdict::Reject(reason) => {
@@ -506,12 +529,7 @@ pub fn run(
                                             if crossed {
                                                 // 币安错误码 5022：post-only 会立即成交被拒
                                                 latency.rejected_post_only += 1;
-                                            } else if let Some(qty) = resolve_size(
-                                                req.size,
-                                                Price::new(entry_px),
-                                                equity,
-                                                &config.instrument.precision,
-                                            ) {
+                                            } else if let Some(qty) = qty {
                                                 order_seq += 1;
                                                 let order = Order {
                                                     client_id: ClientOrderId::new(
@@ -885,13 +903,38 @@ mod tests {
             let range = reference_range(view.candles, view.candles.len().min(5))?;
             let entry = range.low;
             let stop = entry * (Decimal::ONE - self.stop_pct);
+            // 测试策略固定 1 倍杠杆、按 10% 权益下单，数量用于全仓风控。
+            let account =
+                domain::MarginAccount::flat(view.instrument.margin_asset.clone(), view.equity);
+            let quantity = match resolve_size(
+                domain::SizeHint::EquityFraction {
+                    pct: dec!(0.1),
+                    leverage: Decimal::ONE,
+                },
+                Price::new(entry),
+                view.equity,
+                &view.instrument.precision,
+            ) {
+                Some(q) => q,
+                None => {
+                    return Some(StrategyIntent::StandDown {
+                        reason: StandDownReason::InsufficientEquity,
+                    });
+                }
+            };
             if !check_entry(
                 view.instrument,
+                &domain::EntryExposure {
+                    account: &account,
+                    side: Side::Buy,
+                    entry,
+                    quantity,
+                    leverage: Decimal::ONE,
+                },
                 Side::Buy,
                 entry,
                 stop,
                 entry * (Decimal::ONE + self.tp_pct),
-                Decimal::ONE,
                 &RiskLimits {
                     max_stop_pct: dec!(0.05),
                     min_reward_risk: dec!(1),

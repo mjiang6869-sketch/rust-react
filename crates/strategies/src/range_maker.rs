@@ -321,15 +321,40 @@ impl Strategy for RangeMaker {
             domain::Side::Sell => entry * (Decimal::ONE - tp_ratio),
         };
 
-        // 风控。注意这里用了真实的维持保证金率——旧实现硬编码 0.4% 会让
-        // 这个检查在高杠杆下误判并静默拒绝信号。
+        // 仓位规模必须**先于**风控确定：全仓下强平价取决于持仓数量，
+        // 而初始保证金检查也要用到数量。
+        let size = SizeHint::EquityFraction {
+            pct: p.equity_pct,
+            leverage: p.leverage,
+        };
+        let Some(quantity) = resolve_size(
+            size,
+            domain::Price::new(entry),
+            view.equity,
+            &view.instrument.precision,
+        ) else {
+            return Some(StrategyIntent::StandDown {
+                reason: StandDownReason::InsufficientEquity,
+            });
+        };
+
+        // 风控。全仓口径：强平价由钱包余额与数量决定，杠杆只影响初始保证金。
+        // 维持保证金率用合约里来自交易所的真实值（2.5%），不是硬编码常数。
+        let account =
+            domain::MarginAccount::flat(view.instrument.margin_asset.clone(), view.equity);
         let verdict = check_entry(
             view.instrument,
+            &domain::EntryExposure {
+                account: &account,
+                side,
+                entry,
+                quantity,
+                leverage: p.leverage,
+            },
             side,
             entry,
             stop,
             tp_price,
-            p.leverage,
             &domain::RiskLimits {
                 // 区间做市的止损天然较窄（区间边界外一点点），
                 // 但极端行情下区间本身可能很宽，所以上限放宽到 1%。
@@ -341,24 +366,6 @@ impl Strategy for RangeMaker {
         );
         if let domain::RiskVerdict::Reject(reason) = verdict {
             return Some(StrategyIntent::StandDown { reason });
-        }
-
-        // 仓位规模
-        let size = SizeHint::EquityFraction {
-            pct: p.equity_pct,
-            leverage: p.leverage,
-        };
-        if resolve_size(
-            size,
-            domain::Price::new(entry),
-            view.equity,
-            &view.instrument.precision,
-        )
-        .is_none()
-        {
-            return Some(StrategyIntent::StandDown {
-                reason: StandDownReason::InsufficientEquity,
-            });
         }
 
         let protection = ProtectionPlan {
@@ -455,13 +462,39 @@ impl Strategy for RangeMakerLadder {
             domain::Side::Buy => entry * (Decimal::ONE + tp_ratio),
             domain::Side::Sell => entry * (Decimal::ONE - tp_ratio),
         };
+
+        // 与单档版本一致：先定仓位规模，再走全仓风控（强平价取决于数量）。
+        let quantity = match resolve_size(
+            SizeHint::EquityFraction {
+                pct: p.equity_pct,
+                leverage: p.leverage,
+            },
+            domain::Price::new(entry),
+            view.equity,
+            &view.instrument.precision,
+        ) {
+            Some(q) => q,
+            None => {
+                return Some(StrategyIntent::StandDown {
+                    reason: StandDownReason::InsufficientEquity,
+                });
+            }
+        };
+        let account =
+            domain::MarginAccount::flat(view.instrument.margin_asset.clone(), view.equity);
         if let domain::RiskVerdict::Reject(reason) = check_entry(
             view.instrument,
+            &domain::EntryExposure {
+                account: &account,
+                side,
+                entry,
+                quantity,
+                leverage: p.leverage,
+            },
             side,
             entry,
             stop,
             tp_price,
-            p.leverage,
             &domain::RiskLimits {
                 max_stop_pct: Decimal::new(1, 2),
                 min_reward_risk: Decimal::ONE,

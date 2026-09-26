@@ -175,6 +175,12 @@ async fn state_exposes_engine_snapshot() {
     assert_eq!(d["instrument"]["margin_asset"], "USDC");
     assert_eq!(d["instrument"]["maint_margin_pct"], "2.5");
 
+    // 保证金模式统一全仓，界面要显示
+    assert_eq!(d["margin_mode"], "CROSS");
+    assert_eq!(d["margin_mode_label"], "全仓");
+    // 空仓时没有强平可言
+    assert_eq!(d["position_liquidation"]["kind"], "NONE");
+
     // 费率来源必须标注为未对账——整个 edge 依赖这个假设
     assert_eq!(d["instrument"]["fee_source"], "PROMOTIONAL_ASSUMED");
     assert_eq!(d["instrument"]["fee_is_authoritative"], false);
@@ -186,7 +192,11 @@ async fn state_exposes_engine_snapshot() {
     // 安全闸门默认未武装，且列出全部阻止原因
     assert_eq!(d["safety"]["armed"], false);
     let reasons = d["safety"]["blocking_reasons"].as_array().unwrap();
-    assert_eq!(reasons.len(), 3, "三项前置条件都要列出：{reasons:?}");
+    assert_eq!(reasons.len(), 4, "四项前置条件都要列出：{reasons:?}");
+    assert!(
+        reasons.iter().any(|r| r.as_str().unwrap().contains("全仓")),
+        "保证金模式必须作为前置条件列出：{reasons:?}"
+    );
 }
 
 #[tokio::test]
@@ -316,6 +326,25 @@ async fn preview_returns_quantized_prices() {
         .map(|t| t["quantity"].as_str().unwrap().parse::<Decimal>().unwrap())
         .sum();
     assert_eq!(total, dec!(0.1), "各档合计应等于下总量");
+}
+
+#[tokio::test]
+async fn preview_accepts_fixed_target_prices_without_changing_them() {
+    let s = test_state();
+    let mut plan = valid_plan();
+    plan.as_object_mut().unwrap().remove("take_profit");
+    plan["take_profit_prices"] = serde_json::json!([
+        { "price": "3210.12", "fraction": "0.4" },
+        { "price": "3220.12", "fraction": "0.6" }
+    ]);
+    let (status, body) = post_json(&s, "/api/v1/manual/preview", plan).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let preview = &body["data"];
+    assert_eq!(preview["accepted"], true, "{preview}");
+    assert_eq!(preview["take_profits"][0]["price"], "3210.12");
+    assert_eq!(preview["take_profits"][1]["price"], "3220.12");
+    assert_eq!(preview["take_profits"][0]["quantity"], "0.04");
+    assert_eq!(preview["take_profits"][1]["quantity"], "0.06");
 }
 
 /// 距离意图必须沿用保护单规划器的方向量化，旧止损价格请求仍然等价。
@@ -730,7 +759,7 @@ async fn arm_fails_without_prerequisites() {
 
     assert_eq!(body["data"]["armed"], false, "前置条件未满足时不能开启");
     let reasons = body["data"]["blocking_reasons"].as_array().unwrap();
-    assert_eq!(reasons.len(), 3);
+    assert_eq!(reasons.len(), 4);
 }
 
 #[tokio::test]

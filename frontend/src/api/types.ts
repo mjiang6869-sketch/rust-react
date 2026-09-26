@@ -266,6 +266,8 @@ export interface ManualPlanRequest {
   stop_distance_bp?: string
   take_profit?: Array<{ pct: string; fraction: string }>
   take_profit_pct?: string
+  take_profit_prices?: Array<{ price: string; fraction: string }>
+  take_profit_price?: string
   break_even?: { trigger_r: string; offset: string }
   trailing?: { distance: string; activate_at?: string }
   cancel_unfilled_after_secs?: number

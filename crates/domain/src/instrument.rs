@@ -91,151 +91,16 @@ pub struct Instrument {
     pub fees: FeeSchedule,
 }
 
-impl Instrument {
-    /// 给定入场价与杠杆，估算强平价（简化版，仅用于止损前置校验）。
-    ///
-    /// 隔离维持保证金后，多头的强平触发价近似为：
-    /// `entry * (1 - 1/leverage + maint_margin)`
-    ///
-    /// 真实强平还涉及账户全仓保证金、其他持仓与资金费，所以这里只做
-    /// **保守的下界估计**：它的用途是"止损是否明显晚于强平"，不是精确风控。
-    pub fn liquidation_price_estimate(
-        &self,
-        entry: Decimal,
-        leverage: Decimal,
-        is_long: bool,
-    ) -> Option<Decimal> {
-        if leverage <= Decimal::ZERO || entry <= Decimal::ZERO {
-            return None;
-        }
-        let maint = self.maint_margin_pct / Decimal::ONE_HUNDRED;
-        let buffer = Decimal::ONE / leverage - maint;
-        if buffer <= Decimal::ZERO {
-            // 杠杆高到维持保证金已吃掉全部缓冲，任何仓位都会立即强平。
-            return None;
-        }
-        let factor = if is_long {
-            Decimal::ONE - buffer
-        } else {
-            Decimal::ONE + buffer
-        };
-        let price = entry * factor;
-        (price > Decimal::ZERO).then_some(price)
-    }
-
-    /// 校验止损价是否先于强平价触发。
-    ///
-    /// 返回 `Err` 时调用方**必须把原因暴露给用户**，不能像旧实现那样
-    /// 静默丢弃信号。
-    pub fn stop_precedes_liquidation(
-        &self,
-        entry: Decimal,
-        stop: Decimal,
-        leverage: Decimal,
-        is_long: bool,
-    ) -> Result<(), String> {
-        let Some(liq) = self.liquidation_price_estimate(entry, leverage, is_long) else {
-            return Err(format!(
-                "杠杆 {leverage} 下维持保证金率 {} 已无缓冲空间，无法安全开仓",
-                self.maint_margin_pct
-            ));
-        };
-        let ok = if is_long { stop > liq } else { stop < liq };
-        if ok {
-            Ok(())
-        } else {
-            Err(format!(
-                "止损价 {stop} 不早于估算强平价 {liq}（入场 {entry}，杠杆 {leverage}，\
-                 维持保证金率 {}%），该仓位会在止损前被强平",
-                self.maint_margin_pct
-            ))
-        }
-    }
-}
+// 强平估算**不在这里**：它属于 `crate::margin`。
+//
+// 这里曾有一对逐仓公式（`liquidation_price_estimate` /
+// `stop_precedes_liquidation`），只看杠杆、不看账户余额。本项目统一用全仓，
+// 强平价由钱包余额与持仓数量共同决定，所以整套计算搬到了 `domain::margin`，
+// 逐仓公式已删除——留着它就会出现两份强平公式，而两份公式必然分叉。
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precision::Precision;
-    use rust_decimal_macros::dec;
-
-    fn instrument(maint: Decimal) -> Instrument {
-        Instrument {
-            symbol: "ETHUSDC".into(),
-            kind: ContractKind::CryptoPerp,
-            base_asset: "ETH".into(),
-            quote_asset: "USDC".into(),
-            margin_asset: "USDC".into(),
-            settlement_asset: "USDC".into(),
-            precision: Precision {
-                tick_size: dec!(0.01),
-                step_size: dec!(0.001),
-                min_qty: dec!(0.001),
-                min_notional: dec!(5),
-            },
-            maint_margin_pct: maint,
-            required_margin_pct: dec!(5),
-            liquidation_fee: dec!(0.0125),
-            fees: FeeSchedule {
-                maker_rate: Decimal::ZERO,
-                taker_rate: dec!(0.0005),
-                source: FeeSource::PromotionalAssumed,
-                observed_at: Utc::now(),
-            },
-        }
-    }
-
-    /// 币安真实的 maintMarginPercent 是 2.5%。
-    #[test]
-    fn liquidation_estimate_uses_real_maintenance_margin() {
-        let inst = instrument(dec!(2.5));
-        // 10 倍杠杆：buffer = 0.1 - 0.025 = 0.075 -> 多头强平约在 92.5%
-        let liq = inst
-            .liquidation_price_estimate(dec!(3200), dec!(10), true)
-            .unwrap();
-        assert_eq!(liq, dec!(2960.00));
-    }
-
-    /// 旧实现硬编码 0.4% 维持保证金，误算强平价。这个测试用真实的 2.5%
-    /// 并断言两者结论不同——即"用错常数会改变风控裁决"。
-    #[test]
-    fn hardcoded_wrong_margin_would_change_verdict() {
-        let entry = dec!(3200);
-        let leverage = dec!(20);
-        // 20 倍杠杆下真实 buffer = 0.05 - 0.025 = 0.025，强平约在 3120
-        let real = instrument(dec!(2.5));
-        let liq_real = real
-            .liquidation_price_estimate(entry, leverage, true)
-            .unwrap();
-        assert_eq!(liq_real, dec!(3120.00));
-
-        // 错误的 0.4% 会给出 0.05 - 0.004 = 0.046，强平约在 3052.8——差了 67 点
-        let wrong = instrument(dec!(0.4));
-        let liq_wrong = wrong
-            .liquidation_price_estimate(entry, leverage, true)
-            .unwrap();
-        assert_ne!(liq_real, liq_wrong);
-        assert!(liq_wrong < liq_real, "低估维持保证金会算出更远的强平价");
-    }
-
-    #[test]
-    fn stop_inside_liquidation_is_rejected_with_reason() {
-        let inst = instrument(dec!(2.5));
-        // 20 倍杠杆强平约 3120，止损放 3100 就晚于强平了
-        let err = inst
-            .stop_precedes_liquidation(dec!(3200), dec!(3100), dec!(20), true)
-            .unwrap_err();
-        assert!(err.contains("强平"), "错误信息必须说清原因：{err}");
-    }
-
-    #[test]
-    fn stop_outside_liquidation_passes() {
-        let inst = instrument(dec!(2.5));
-        assert!(
-            inst.stop_precedes_liquidation(dec!(3200), dec!(3150), dec!(20), true)
-                .is_ok()
-        );
-    }
 
     #[test]
     fn only_exchange_sourced_fees_are_authoritative() {

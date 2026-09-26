@@ -10,12 +10,17 @@
 //! 本模块的契约：
 //! 1. 所有拒绝都返回**可编程的原因枚举**，不是字符串。
 //! 2. 每个原因都有面向用户的中文说明，必须能被展示。
-//! 3. 强平距离用 `Instrument` 里来自交易所的真实维持保证金率。
+//! 3. 强平距离按**全仓**口径算（[`crate::margin`]）：钱包余额与持仓数量共同
+//!    决定强平价，来自交易所的真实维持保证金率。杠杆**不参与**强平估算，
+//!    它只决定初始保证金占用与仓位规模。
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::instrument::Instrument;
+use crate::margin::{
+    CrossLiquidation, EntryExposure, MarginError, cross_liquidation, initial_margin,
+};
 use crate::market::Candle;
 use crate::money::Price;
 use crate::order::Side;
@@ -87,18 +92,21 @@ pub fn feed_is_fresh(
 /// 开仓前的全部确定性检查。
 ///
 /// 检查项与顺序（顺序有实际意义，先报最根本的问题）：
-/// 1. 行情新鲜度
-/// 2. 价格与止损的合法性（正数、方向正确）
-/// 3. 止损距离不超过上限
-/// 4. 止损早于估算强平价（用真实维持保证金率）
+/// 1. 价格与止损的合法性（正数、方向正确）
+/// 2. 止损距离不超过上限
+/// 3. 可用保证金足以支付初始保证金（**杠杆只在这一步起作用**）
+/// 4. 止损早于全仓估算强平价
 /// 5. 盈亏比达标
+///
+/// 行情新鲜度不在这里查——它由 [`feed_is_fresh`] 单独判断，因为「行情断了」
+/// 与「这笔单不合规」是两种不同的让位原因，混在一起会让日志无法区分。
 pub fn check_entry(
     instrument: &Instrument,
+    exposure: &EntryExposure<'_>,
     side: Side,
     entry: Decimal,
     stop: Decimal,
     take_profit: Decimal,
-    leverage: Decimal,
     limits: &RiskLimits,
 ) -> RiskVerdict {
     if entry <= Decimal::ZERO || stop <= Decimal::ZERO {
@@ -122,14 +130,36 @@ pub fn check_entry(
         return RiskVerdict::Reject(StandDownReason::StopTooWide);
     }
 
-    // 止损必须早于强平。这里用的是 `Instrument` 里来自 exchangeInfo 的
-    // 真实 maintMarginPercent，不是硬编码常数。
-    let is_long = side == Side::Buy;
-    if instrument
-        .stop_precedes_liquidation(entry, stop, leverage, is_long)
-        .is_err()
-    {
-        return RiskVerdict::Reject(StandDownReason::StopInsideLiquidation);
+    // 初始保证金是否付得起。全仓下杠杆只影响这里与仓位规模，不影响强平价。
+    let required = initial_margin(exposure.quantity.get() * entry, exposure.leverage);
+    if required > exposure.account.available() {
+        return RiskVerdict::Reject(StandDownReason::InsufficientMargin);
+    }
+
+    // 止损必须早于全仓强平价。用的是交易所的真实 maintMarginPercent，
+    // 以及账户钱包余额——不是硬编码常数，也不是只看杠杆的逐仓公式。
+    match cross_liquidation(instrument, exposure.account, side, entry, exposure.quantity) {
+        Err(MarginError::AssetMismatch) => {
+            return RiskVerdict::Reject(StandDownReason::MarginAssetMismatch);
+        }
+        Err(MarginError::NonPositive) => {
+            return RiskVerdict::Reject(StandDownReason::StopTooWide);
+        }
+        // 钱包连维持保证金都不够：这个仓位开出来就在强平线之下。
+        Ok(CrossLiquidation::Immediate) => {
+            return RiskVerdict::Reject(StandDownReason::InsufficientMargin);
+        }
+        Ok(CrossLiquidation::Never) => {}
+        Ok(CrossLiquidation::At(liq)) => {
+            let ok = if side == Side::Buy {
+                stop > liq
+            } else {
+                stop < liq
+            };
+            if !ok {
+                return RiskVerdict::Reject(StandDownReason::StopInsideLiquidation);
+            }
+        }
     }
 
     // 盈亏比
@@ -228,39 +258,49 @@ pub fn resolve_exit_prices(
 ///
 /// maker-only 下这个提示尤其重要：止损是挂单、可能不成交，所以"止损离强平
 /// 有多远"直接决定了裸露风险的上限。
+///
+/// 全仓下强平价由钱包余额与数量决定，所以这里必须拿到数量；杠杆不出现在
+/// 参数里，因为它影响不到强平。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiquidationWarning {
-    pub liquidation_price: Option<Price>,
+    /// 估算结果。`Never` 表示余额覆盖得住，`Immediate` 表示开仓即在强平线下。
+    pub estimate: CrossLiquidation,
     pub stop_price: Price,
-    /// 止损到强平价的距离占入场价的比例。越小越危险。
+    /// 止损到强平价的距离占入场价的比例。`None` 表示不会强平。
     pub buffer_pct: Option<Decimal>,
     pub dangerous: bool,
 }
 
 pub fn liquidation_warning(
     instrument: &Instrument,
+    account: &crate::margin::MarginAccount,
     side: Side,
     entry: Decimal,
     stop: Decimal,
-    leverage: Decimal,
-) -> LiquidationWarning {
-    let is_long = side == Side::Buy;
-    let liq = instrument.liquidation_price_estimate(entry, leverage, is_long);
+    quantity: crate::money::Qty,
+) -> Result<LiquidationWarning, MarginError> {
+    let estimate = cross_liquidation(instrument, account, side, entry, quantity)?;
+    let liq = match estimate {
+        CrossLiquidation::At(p) => Some(p),
+        // 不会强平，或开仓即在强平线下——两者都没有"止损距强平"可谈。
+        CrossLiquidation::Never | CrossLiquidation::Immediate => None,
+    };
     let buffer_pct = liq.map(|l| ((l - stop).abs()) / entry);
     // 止损距强平不足入场价的 0.1% 视为危险
     let dangerous = buffer_pct.is_some_and(|b| b < Decimal::new(1, 3));
-    LiquidationWarning {
-        liquidation_price: liq.map(Price::new),
+    Ok(LiquidationWarning {
+        estimate,
         stop_price: Price::new(stop),
         buffer_pct,
         dangerous,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::instrument::{ContractKind, FeeSchedule, FeeSource};
+    use crate::margin::MarginAccount;
     use crate::precision::Precision;
     use rust_decimal_macros::dec;
 
@@ -302,10 +342,25 @@ mod tests {
         }
     }
 
+    /// 构造待开仓位的暴露。默认账户有 10000 USDC、数量 1、3 倍杠杆。
+    fn exposure<'a>(
+        account: &'a MarginAccount,
+        qty: Decimal,
+        leverage: Decimal,
+    ) -> EntryExposure<'a> {
+        EntryExposure {
+            account,
+            side: Side::Buy,
+            entry: dec!(3200),
+            quantity: crate::money::Qty::new(qty),
+            leverage,
+        }
+    }
+
     /// 默认盈亏比必须是 1:1 而非 2:1。
     ///
     /// 做市的止盈止损都是 bp 级，2:1 会让挂单普遍被静默拒绝。这条测试锁住
-    /// 这个默认值，避免以后有人按"方向性交易的直觉"把它改回去。
+    /// 这个默认值，避免以后有人按"方向性交易直觉"把它改回去。
     #[test]
     fn default_reward_risk_suits_market_making_not_directional_trading() {
         let l = RiskLimits::default();
@@ -315,15 +370,18 @@ mod tests {
             "做市策略的盈亏比天然接近 1:1，默认要求高于此会让挂单普遍被拒"
         );
 
+        let acct = MarginAccount::flat("USDC", dec!(10000));
+        let exp = exposure(&acct, dec!(1), dec!(3));
+
         // 典型做市参数：止损 2bp、止盈 4bp —— 盈亏比 2，应当通过
         let i = instr();
         let v = check_entry(
             &i,
+            &exp,
             Side::Buy,
             dec!(3200),
             dec!(3199.36), // 2bp
             dec!(3201.28), // 4bp
-            dec!(3),
             &l,
         );
         assert!(v.is_pass(), "典型做市参数应通过：{v:?}");
@@ -331,11 +389,11 @@ mod tests {
         // 1:1 的做市参数（止损止盈都是 4bp）也应当通过
         let v2 = check_entry(
             &i,
+            &exp,
             Side::Buy,
             dec!(3200),
             dec!(3198.72), // 4bp
             dec!(3201.28), // 4bp
-            dec!(3),
             &l,
         );
         assert!(v2.is_pass(), "1:1 的做市参数应通过：{v2:?}");
@@ -344,14 +402,14 @@ mod tests {
     #[test]
     fn reasonable_entry_passes_all_checks() {
         let i = instr();
-        // 入场 3200，止损 3180（0.625%... 超过 0.5% 上限），调整：止损 3190
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         let v = check_entry(
             &i,
+            &exposure(&acct, dec!(1), dec!(10)),
             Side::Buy,
             dec!(3200),
             dec!(3190), // 0.3125% 距离
             dec!(3240), // 盈亏比 (40/10) = 4
-            dec!(10),
             &RiskLimits::default(),
         );
         assert!(v.is_pass(), "合理参数应通过：{v:?}");
@@ -360,14 +418,15 @@ mod tests {
     #[test]
     fn stop_on_wrong_side_is_rejected() {
         let i = instr();
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         // 多头但止损放在入场价上方 -> 方向错误
         let v = check_entry(
             &i,
+            &exposure(&acct, dec!(1), dec!(10)),
             Side::Buy,
             dec!(3200),
             dec!(3210),
             dec!(3240),
-            dec!(10),
             &RiskLimits::default(),
         );
         assert_eq!(v, RiskVerdict::Reject(StandDownReason::StopTooWide));
@@ -376,80 +435,203 @@ mod tests {
     #[test]
     fn too_wide_stop_is_rejected() {
         let i = instr();
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         // 止损距离 1%，超过默认 0.5% 上限
         let v = check_entry(
             &i,
+            &exposure(&acct, dec!(1), dec!(10)),
             Side::Buy,
             dec!(3200),
             dec!(3168),
             dec!(3240),
-            dec!(10),
             &RiskLimits::default(),
         );
         assert_eq!(v, RiskVerdict::Reject(StandDownReason::StopTooWide));
     }
 
-    /// 这一条对应旧实现最严重的缺陷：用错维持保证金率会改变风控裁决。
-    /// 20 倍杠杆强平约 3120，止损 3130 距强平太近必须拒绝。
+    /// 全仓下强平价由钱包余额与数量决定，与杠杆无关。
+    ///
+    /// 这三行是本模块最重要的行为变化：同样的止损，在逐仓口径下会被判
+    /// 「晚于强平」而拒绝，在全仓口径下余额覆盖得住，根本不会强平。
     #[test]
-    fn stop_too_close_to_liquidation_is_rejected_with_correct_margin() {
+    fn liquidation_check_uses_cross_margin_not_leverage() {
         let i = instr();
-        let v = check_entry(
-            &i,
-            Side::Buy,
-            dec!(3200),
-            dec!(3150),
-            dec!(3400),
-            dec!(20),
-            &RiskLimits::default(),
-        );
-        // 20倍杠杆 buffer = 0.05 - 0.025 = 0.025 -> 强平 3120
-        // 止损 3150 在强平之上，距离 30 点 = 0.94% > 0.5% 上限，
-        // 所以先被 StopTooWide 拦下。放宽上限后应命中强平检查。
-        assert!(!v.is_pass());
-
         let loose = RiskLimits {
             max_stop_pct: dec!(5),
             ..RiskLimits::default()
         };
-        let v2 = check_entry(
-            &i,
-            Side::Buy,
-            dec!(3200),
-            dec!(3150),
-            dec!(3400),
-            dec!(20),
-            &loose,
-        );
-        assert!(v2.is_pass(), "止损 3150 在强平 3120 之前，应通过：{v2:?}");
 
-        // 止损放到 3110（低于强平 3120）必须被拒绝
-        let v3 = check_entry(
+        // 余额 10000、数量 1、入场 3200：全仓下不会强平（3200 − 10000 < 0），
+        // 止损放到 3110 依然合规；逐仓 20 倍会算出强平 3120 并拒绝。
+        let rich = MarginAccount::flat("USDC", dec!(10000));
+        let v = check_entry(
             &i,
+            &exposure(&rich, dec!(1), dec!(20)),
             Side::Buy,
             dec!(3200),
             dec!(3110),
             dec!(3400),
-            dec!(20),
+            &loose,
+        );
+        assert!(v.is_pass(), "全仓下余额覆盖得住，不该按逐仓强平拒绝：{v:?}");
+
+        // 余额只有 160 时，多头强平约 3117.95：止损 3150 在强平之上，通过；
+        // 止损 3110 低于强平价，必须拒绝。
+        let thin = MarginAccount::flat("USDC", dec!(160));
+        let ok = check_entry(
+            &i,
+            &exposure(&thin, dec!(1), dec!(20)),
+            Side::Buy,
+            dec!(3200),
+            dec!(3150),
+            dec!(3400),
+            &loose,
+        );
+        assert!(
+            ok.is_pass(),
+            "止损 3150 在强平 3117.95 之前，应通过：{ok:?}"
+        );
+
+        let bad = check_entry(
+            &i,
+            &exposure(&thin, dec!(1), dec!(20)),
+            Side::Buy,
+            dec!(3200),
+            dec!(3110),
+            dec!(3400),
             &loose,
         );
         assert_eq!(
-            v3,
+            bad,
             RiskVerdict::Reject(StandDownReason::StopInsideLiquidation)
         );
+    }
+
+    /// 空头方向上全仓强平在入场价上方，判断方向必须对称。
+    #[test]
+    fn short_side_liquidation_check_is_mirrored() {
+        let i = instr();
+        let loose = RiskLimits {
+            max_stop_pct: dec!(5),
+            ..RiskLimits::default()
+        };
+        // 余额 160、数量 1：空头强平约 3278.05
+        let thin = MarginAccount::flat("USDC", dec!(160));
+
+        let ok = check_entry(
+            &i,
+            &exposure(&thin, dec!(1), dec!(20)),
+            Side::Sell,
+            dec!(3200),
+            dec!(3250), // 低于强平 3278.05，安全
+            dec!(3100),
+            &loose,
+        );
+        assert!(ok.is_pass(), "空头止损 3250 在强平 3278.05 之前：{ok:?}");
+
+        let bad = check_entry(
+            &i,
+            &exposure(&thin, dec!(1), dec!(20)),
+            Side::Sell,
+            dec!(3200),
+            dec!(3290), // 高于强平，会被先强平
+            dec!(3100),
+            &loose,
+        );
+        assert_eq!(
+            bad,
+            RiskVerdict::Reject(StandDownReason::StopInsideLiquidation)
+        );
+    }
+
+    /// 杠杆在全仓下只决定初始保证金占用。
+    #[test]
+    fn leverage_only_gates_initial_margin() {
+        let i = instr();
+        let loose = RiskLimits {
+            max_stop_pct: dec!(5),
+            ..RiskLimits::default()
+        };
+        // 余额 1000、数量 1、入场 3200：3 倍时 IM = 1066.67 > 1000 → 付不起
+        let acct = MarginAccount::flat("USDC", dec!(1000));
+        let poor = check_entry(
+            &i,
+            &exposure(&acct, dec!(1), dec!(3)),
+            Side::Buy,
+            dec!(3200),
+            dec!(3150),
+            dec!(3400),
+            &loose,
+        );
+        assert_eq!(
+            poor,
+            RiskVerdict::Reject(StandDownReason::InsufficientMargin)
+        );
+
+        // 5 倍时 IM = 640，付得起；强平价 2256.41 远在止损之下 → 通过
+        let ok = check_entry(
+            &i,
+            &exposure(&acct, dec!(1), dec!(5)),
+            Side::Buy,
+            dec!(3200),
+            dec!(3150),
+            dec!(3400),
+            &loose,
+        );
+        assert!(ok.is_pass(), "5 倍下保证金够付且强平很远：{ok:?}");
+    }
+
+    /// 钱包连维持保证金都不够时，开仓即在强平线之下——拒绝。
+    #[test]
+    fn wallet_below_maintenance_margin_is_rejected() {
+        let i = instr();
+        let loose = RiskLimits {
+            max_stop_pct: dec!(5),
+            ..RiskLimits::default()
+        };
+        // 数量 1、入场 3200 的维持保证金是 80；余额 80 恰好落在强平线上
+        let acct = MarginAccount::flat("USDC", dec!(80));
+        let v = check_entry(
+            &i,
+            &exposure(&acct, dec!(1), dec!(50)),
+            Side::Buy,
+            dec!(3200),
+            dec!(3150),
+            dec!(3400),
+            &loose,
+        );
+        assert_eq!(v, RiskVerdict::Reject(StandDownReason::InsufficientMargin));
+    }
+
+    /// 账户资产与合约不符时必须明确拒绝，绝不折算合并。
+    #[test]
+    fn asset_mismatch_is_rejected_with_its_own_reason() {
+        let i = instr();
+        let usdt = MarginAccount::flat("USDT", dec!(10000));
+        let v = check_entry(
+            &i,
+            &exposure(&usdt, dec!(1), dec!(10)),
+            Side::Buy,
+            dec!(3200),
+            dec!(3190),
+            dec!(3240),
+            &RiskLimits::default(),
+        );
+        assert_eq!(v, RiskVerdict::Reject(StandDownReason::MarginAssetMismatch));
     }
 
     #[test]
     fn poor_reward_risk_is_rejected() {
         let i = instr();
-        // 止损 10 点，止盈 5 点 -> 盈亏比 0.5 < 2
+        let acct = MarginAccount::flat("USDC", dec!(10000));
+        // 止损 10 点，止盈 5 点 -> 盈亏比 0.5 < 1
         let v = check_entry(
             &i,
+            &exposure(&acct, dec!(1), dec!(10)),
             Side::Buy,
             dec!(3200),
             dec!(3190),
             dec!(3205),
-            dec!(10),
             &RiskLimits::default(),
         );
         assert_eq!(v, RiskVerdict::Reject(StandDownReason::RiskRewardTooLow));
@@ -458,14 +640,15 @@ mod tests {
     #[test]
     fn short_side_checks_are_mirrored() {
         let i = instr();
+        let acct = MarginAccount::flat("USDC", dec!(10000));
         // 空头：止损在入场价上方，止盈在下方
         let v = check_entry(
             &i,
+            &exposure(&acct, dec!(1), dec!(10)),
             Side::Sell,
             dec!(3200),
             dec!(3210),
             dec!(3160),
-            dec!(10),
             &RiskLimits::default(),
         );
         assert!(v.is_pass(), "空头合理参数应通过：{v:?}");
@@ -561,13 +744,53 @@ mod tests {
     #[test]
     fn liquidation_warning_flags_tight_buffers() {
         let i = instr();
-        // 20 倍杠杆强平约 3120。止损 3121 距离极近 -> 危险
-        let w = liquidation_warning(&i, Side::Buy, dec!(3200), dec!(3121), dec!(20));
-        assert!(w.liquidation_price.is_some());
-        assert!(w.dangerous, "止损距强平 1 点应标为危险：{w:?}");
+        // 余额 160、数量 1：多头强平约 3117.95
+        let thin = MarginAccount::flat("USDC", dec!(160));
+        let q = crate::money::Qty::new(dec!(1));
 
-        // 止损 3150 距强平 30 点 = 0.94% -> 不危险
-        let w2 = liquidation_warning(&i, Side::Buy, dec!(3200), dec!(3150), dec!(20));
+        // 止损 3118.5 距强平不到 0.1% -> 危险
+        let w = liquidation_warning(&i, &thin, Side::Buy, dec!(3200), dec!(3118.5), q).unwrap();
+        assert!(matches!(w.estimate, CrossLiquidation::At(_)));
+        assert!(w.dangerous, "止损距强平极近应标为危险：{w:?}");
+
+        // 止损 3150 距强平 30 点 ≈ 0.94% -> 不危险
+        let w2 = liquidation_warning(&i, &thin, Side::Buy, dec!(3200), dec!(3150), q).unwrap();
         assert!(!w2.dangerous);
+    }
+
+    /// 不会强平时没有「止损距强平」可言：缓冲为 `None`，也不报警。
+    #[test]
+    fn liquidation_warning_reports_none_when_never_liquidated() {
+        let i = instr();
+        let rich = MarginAccount::flat("USDC", dec!(10000));
+        let w = liquidation_warning(
+            &i,
+            &rich,
+            Side::Buy,
+            dec!(3200),
+            dec!(3100),
+            crate::money::Qty::new(dec!(1)),
+        )
+        .unwrap();
+        assert_eq!(w.estimate, CrossLiquidation::Never);
+        assert_eq!(w.buffer_pct, None);
+        assert!(!w.dangerous);
+    }
+
+    /// 资产不一致时提示函数也要报错，而不是给出一个凭空的强平价。
+    #[test]
+    fn liquidation_warning_rejects_asset_mismatch() {
+        let i = instr();
+        let usdt = MarginAccount::flat("USDT", dec!(10000));
+        let err = liquidation_warning(
+            &i,
+            &usdt,
+            Side::Buy,
+            dec!(3200),
+            dec!(3100),
+            crate::money::Qty::new(dec!(1)),
+        )
+        .unwrap_err();
+        assert_eq!(err, MarginError::AssetMismatch);
     }
 }

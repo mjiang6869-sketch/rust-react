@@ -92,6 +92,10 @@ pub enum StandDownReason {
     RiskRewardTooLow,
     /// 净值不足以开最低仓位。
     InsufficientEquity,
+    /// 可用保证金不足以支付该仓位的初始保证金（全仓）。
+    InsufficientMargin,
+    /// 账户保证金资产与合约保证金资产不一致。
+    MarginAssetMismatch,
     /// 交易时段外（TradFi 合约用；加密永续恒为可交易）。
     OutsideTradingHours,
 }
@@ -110,6 +114,10 @@ impl StandDownReason {
             StandDownReason::StopInsideLiquidation => "止损价晚于估算强平价，会在止损前被强平",
             StandDownReason::RiskRewardTooLow => "止盈止损比不达标",
             StandDownReason::InsufficientEquity => "净值不足以开出满足最小名义价值的仓位",
+            StandDownReason::InsufficientMargin => "可用保证金不足以支付该仓位的初始保证金（全仓）",
+            StandDownReason::MarginAssetMismatch => {
+                "账户保证金资产与合约保证金资产不一致，无法估算全仓强平"
+            }
             StandDownReason::OutsideTradingHours => "当前不在该合约的交易时段内",
         }
     }
@@ -308,6 +316,8 @@ mod tests {
             StandDownReason::StopInsideLiquidation,
             StandDownReason::RiskRewardTooLow,
             StandDownReason::InsufficientEquity,
+            StandDownReason::InsufficientMargin,
+            StandDownReason::MarginAssetMismatch,
             StandDownReason::OutsideTradingHours,
         ] {
             assert!(!r.message().is_empty(), "{r:?} 缺少说明");

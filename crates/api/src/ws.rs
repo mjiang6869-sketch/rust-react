@@ -279,6 +279,9 @@ async fn state_payload(state: &Arc<AppState>) -> serde_json::Value {
         },
         "auto_maker": serde_json::to_value(auto_maker_dto(&auto_maker_view)).unwrap_or(serde_json::Value::Null),
         "position_source": snap.position_source.map(|s| s.tag()),
+        "margin_mode": snap.margin_mode.tag(),
+        "margin_mode_label": snap.margin_mode.label(),
+        "position_liquidation": serde_json::to_value(liquidation_dto(snap.position_liquidation)).unwrap_or(serde_json::Value::Null),
     })
 }
 

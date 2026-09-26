@@ -60,6 +60,18 @@ pub struct TpRung {
     pub fraction: Decimal,
 }
 
+/// 手动指定目标价的一档止盈。`pct` 保留距离信息，供持仓展示与风控使用；
+/// 真正挂单价始终从 `price` 量化，不再由入场成交价反推。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TpPriceRung {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub pct: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub fraction: Decimal,
+}
+
 /// 止盈计划。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -68,6 +80,15 @@ pub enum TpPlan {
     Single { pct: Decimal },
     /// 分批止盈。各档 `fraction` 之和必须 ≤ 1。
     Ladder { rungs: Vec<TpRung> },
+    /// 指定单档目标价；`pct` 是按下单时入场价算出的展示距离。
+    SinglePrice {
+        #[serde(with = "rust_decimal::serde::str")]
+        price: Decimal,
+        #[serde(with = "rust_decimal::serde::str")]
+        pct: Decimal,
+    },
+    /// 指定每档目标价。
+    LadderPrices { rungs: Vec<TpPriceRung> },
 }
 
 impl TpPlan {
@@ -75,6 +96,14 @@ impl TpPlan {
     pub fn validate(&self) -> Result<(), DomainError> {
         match self {
             TpPlan::Single { .. } => Ok(()),
+            TpPlan::SinglePrice { price, pct } => {
+                if *price <= Decimal::ZERO || *pct <= Decimal::ZERO {
+                    return Err(DomainError::IllegalTransition(
+                        "止盈目标价和距离必须为正数".into(),
+                    ));
+                }
+                Ok(())
+            }
             TpPlan::Ladder { rungs } => {
                 if rungs.is_empty() {
                     return Err(DomainError::IllegalTransition("分批止盈不能为空".into()));
@@ -95,6 +124,29 @@ impl TpPlan {
                 }
                 Ok(())
             }
+            TpPlan::LadderPrices { rungs } => {
+                if rungs.is_empty() {
+                    return Err(DomainError::IllegalTransition("分批止盈不能为空".into()));
+                }
+                let total: Decimal = rungs.iter().map(|r| r.fraction).sum();
+                if total > Decimal::ONE {
+                    return Err(DomainError::IllegalTransition(format!(
+                        "分批止盈各档比例之和 {total} 超过 1"
+                    )));
+                }
+                for (i, r) in rungs.iter().enumerate() {
+                    if r.price <= Decimal::ZERO
+                        || r.fraction <= Decimal::ZERO
+                        || r.pct <= Decimal::ZERO
+                    {
+                        return Err(DomainError::IllegalTransition(format!(
+                            "第 {} 档的目标价、距离和比例必须为正数",
+                            i + 1
+                        )));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -103,6 +155,20 @@ impl TpPlan {
         match self {
             TpPlan::Single { pct } => vec![(*pct, Decimal::ONE)],
             TpPlan::Ladder { rungs } => rungs.iter().map(|r| (r.pct, r.fraction)).collect(),
+            TpPlan::SinglePrice { pct, .. } => vec![(*pct, Decimal::ONE)],
+            TpPlan::LadderPrices { rungs } => rungs.iter().map(|r| (r.pct, r.fraction)).collect(),
+        }
+    }
+
+    /// 未量化的止盈目标价。指定价格的计划不受实际入场成交价变化影响。
+    pub fn rung_price(&self, rung: usize, entry: Decimal, side: Side) -> Option<Decimal> {
+        match self {
+            TpPlan::SinglePrice { price, .. } if rung == 0 => Some(*price),
+            TpPlan::LadderPrices { rungs } => rungs.get(rung).map(|r| r.price),
+            _ => self.rungs().get(rung).map(|(pct, _)| match side {
+                Side::Buy => entry * (Decimal::ONE + pct),
+                Side::Sell => entry * (Decimal::ONE - pct),
+            }),
         }
     }
 }
@@ -225,11 +291,10 @@ impl ProtectionPlanner {
 
         // --- 止盈（可能多档）---
         let rungs = tp.rungs();
-        for (i, (pct, fraction)) in rungs.iter().enumerate() {
-            let tp_raw = match fill.side {
-                Side::Buy => entry * (Decimal::ONE + pct),
-                Side::Sell => entry * (Decimal::ONE - pct),
-            };
+        for (i, (_, fraction)) in rungs.iter().enumerate() {
+            let tp_raw = tp.rung_price(i, entry, fill.side).ok_or_else(|| {
+                DomainError::IllegalTransition(format!("止盈档位 {i} 缺少目标价"))
+            })?;
             let tp_price =
                 instrument
                     .precision
@@ -509,6 +574,52 @@ mod tests {
             side,
             price: Price::new(price),
             quantity: Qty::new(qty),
+        }
+    }
+
+    #[test]
+    fn specified_take_profit_prices_stay_fixed_when_entry_fill_changes() {
+        for (side, targets) in [
+            (Side::Buy, [dec!(3210.127), dec!(3220.125)]),
+            (Side::Sell, [dec!(3190.127), dec!(3180.125)]),
+        ] {
+            let tp = TpPlan::LadderPrices {
+                rungs: targets
+                    .into_iter()
+                    .map(|price| TpPriceRung {
+                        price,
+                        pct: dec!(0.003),
+                        fraction: dec!(0.5),
+                    })
+                    .collect(),
+            };
+            let actions = ProtectionPlanner::compile(
+                &instr(),
+                &entry(side, dec!(3201), dec!(1)),
+                &plan(StopSpec::FixedPct { pct: dec!(0.01) }),
+                &tp,
+            )
+            .unwrap();
+            let prices: Vec<_> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    ProtectionAction::Place(order) if order.purpose == OrderPurpose::TakeProfit => {
+                        Some(order.limit_price.get())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let expected: Vec<_> = targets
+                .into_iter()
+                .map(|raw| {
+                    instr()
+                        .precision
+                        .price_for(side.opposite(), raw, PriceRole::TakeProfit)
+                        .unwrap()
+                        .get()
+                })
+                .collect();
+            assert_eq!(prices, expected);
         }
     }
 

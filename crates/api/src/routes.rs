@@ -184,6 +184,9 @@ async fn get_state(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         },
         auto_maker: auto_maker_dto(&auto_maker_view),
         position_source: snap.position_source.map(|s| s.tag()),
+        margin_mode: snap.margin_mode.tag(),
+        margin_mode_label: snap.margin_mode.label(),
+        position_liquidation: liquidation_dto(snap.position_liquidation),
     };
 
     Json(ApiResponse::ok(dto))
