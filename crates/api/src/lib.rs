@@ -22,13 +22,15 @@
 //!
 //! - `GET  /api/v1/health`、`/state`、`/instrument`、`/strategies`、`/fill-models`
 //! - `POST /api/v1/manual/preview`、`/submit`、`/cancel-pending`、`/close`
+//! - `GET  /api/v1/auto-maker`、`PUT /api/v1/auto-maker`（自动化做市开关与参数）
 //! - `GET  /api/v1/orders`、`/fills`、`/pnl`、`/backtests`
 //! - `POST /api/v1/backtest`
 //! - `GET  /api/v1/data/coverage`、`POST /api/v1/data/download`
 //! - `POST /api/v1/live/arm`、`/disarm`、`PUT /api/v1/mode`
-//! - `GET  /api/v1/market/klines`、`/market/book`、`/market/trades`
-//! - `GET  /api/v1/ws`（引擎状态）、`/api/v1/market/stream`（盘口与成交推送）
+//! - `GET  /api/v1/market/klines`、`/market/book`
+//! - `GET  /api/v1/ws`（引擎状态）、`/api/v1/market/stream`（盘口与最新价推送）
 
+pub mod auto_maker;
 pub mod backtest;
 pub mod download_task;
 pub mod dto;

@@ -1,4 +1,4 @@
-//! 公开行情客户端：K 线、盘口、最近成交。
+//! 公开行情客户端：K 线、盘口。
 //!
 //! # 与 `client.rs` 的分工
 //!
@@ -9,7 +9,9 @@
 //! # 数据来源的边界
 //!
 //! 这里只走 REST，用于**补齐历史与初始快照**。实时推送走 WebSocket
-//! （见 `stream.rs`）——REST 轮询做实时更新既浪费配额又慢。
+//! （见 `stream.rs`）——REST 轮询做实时更新既浪费配额又慢。最近成交完全
+//! 不走 REST：那条接口权重 20，是全项目最贵的公开接口，而成交流只服务
+//! 一个已经由 WebSocket 覆盖的场景（见 `stream.rs` 的 `MarketView::trades`）。
 //!
 //! # TTL 是按"权重"定的，不是按"新鲜度"定的
 //!
@@ -19,13 +21,9 @@
 //! |---|---|---|
 //! | `/fapi/v1/depth` | 2（limit≤50）/ 5（≤100）/ 10（≤500） | 便宜 |
 //! | `/fapi/v1/klines` | 1（<100 根）/ 2（<500）/ 5（500–1000）/ 10（>1000） | 便宜 |
-//! | `/fapi/v1/aggTrades` | **20** | 比盘口贵 10 倍 |
-//!
-//! 事故里 `aggTrades` 按 1 秒轮询就是 1200 权重/分钟——**单个接口**吃掉
-//! 一半额度。所以它的 TTL 最长。见 [`AGG_TRADES_TTL_MS`]。
 
 use chrono::{DateTime, TimeZone, Utc};
-use domain::{AggTrade, BookSnapshot, Candle, Price, Qty};
+use domain::{BookSnapshot, Candle, Price};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
@@ -38,12 +36,6 @@ use crate::error::ExchangeError;
 /// 事故里前端的轮询间隔——也就是说**同样的界面刷新频率，上游请求量降到
 /// 前端数量的倒数**。
 pub const DEPTH_TTL_MS: i64 = 1_000;
-
-/// 成交流的缓存时长：2 秒。
-///
-/// 权重 20，是最贵的公开接口。2 秒把轮询成本压到 600 权重/分钟，且成交
-/// 流本身是给人看的滚动列表，2 秒延迟不可感知。
-pub const AGG_TRADES_TTL_MS: i64 = 2_000;
 
 /// K 线的缓存时长：2 秒。
 ///
@@ -262,53 +254,6 @@ impl BinanceClient {
 
         let now = Utc::now();
         Ok(rows.iter().map(|r| r.to_candle(now)).collect())
-    }
-
-    /// 拉取最近成交（用于界面底部的成交流）。
-    pub async fn recent_trades(
-        &self,
-        symbol: &str,
-        limit: u32,
-    ) -> Result<Vec<AggTrade>, ExchangeError> {
-        let limit = limit.clamp(1, 1000);
-        // 权重 20 —— 全项目最贵的公开接口，所以缓存最积极。
-        let body = self
-            .get_public_cached(
-                "/fapi/v1/aggTrades",
-                &format!("symbol={symbol}&limit={limit}"),
-                AGG_TRADES_TTL_MS,
-            )
-            .await?;
-
-        #[derive(Debug, Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Row {
-            #[serde(rename = "a")]
-            id: i64,
-            #[serde(rename = "p")]
-            price: String,
-            #[serde(rename = "q")]
-            qty: String,
-            #[serde(rename = "T")]
-            time: i64,
-            #[serde(rename = "m")]
-            is_buyer_maker: bool,
-        }
-
-        let rows: Vec<Row> = serde_json::from_str(&body)
-            .map_err(|e| ExchangeError::Fatal(format!("成交流响应无法解析：{e}")))?;
-
-        let now = Utc::now();
-        Ok(rows
-            .into_iter()
-            .map(|r| AggTrade {
-                trade_id: r.id.max(0) as u64,
-                price: Price::new(r.price.parse().unwrap_or(Decimal::ZERO)),
-                quantity: Qty::new(r.qty.parse().unwrap_or(Decimal::ZERO)),
-                is_buyer_maker: r.is_buyer_maker,
-                at: Utc.timestamp_millis_opt(r.time).single().unwrap_or(now),
-            })
-            .collect())
     }
 
     /// 拉取盘口快照（用于界面右侧的深度）。

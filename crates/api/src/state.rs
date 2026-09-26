@@ -169,6 +169,22 @@ impl AppState {
 
     pub async fn set_mode(&self, mode: ServiceMode) {
         *self.mode.lock().await = mode;
+
+        // 切到实盘时，把已启用的自动化做市关掉——见 AGENTS.md：不能因为
+        // 模式切换让一个此前对着模拟盘校准的策略突然对着真实资金跑。
+        //
+        // 锁顺序：`mode` 锁在上一行已经完全释放（赋值语句结束时 guard 就
+        // 被 drop 了），这里才去拿引擎锁——不会出现"持有 mode 锁等引擎锁"
+        // 的路径。这与 `auto_maker::put` 里"持有引擎锁、再短暂拿一次 mode
+        // 锁"是相反的方向，两个方向不会同时嵌套等待对方，所以不会死锁。
+        //
+        // 即便两个请求并发交错（一个在切模式，一个在开自动化做市），
+        // 由 `tokio::sync::Mutex` 的公平排队保证：无论谁先拿到引擎锁，
+        // 最终状态一定是一致的——自动化做市要么从未被打开，要么打开后
+        // 立刻被这里关掉，不会出现"实盘 + 自动化做市开着"的组合。
+        if mode.is_live() {
+            self.engine.lock().await.disable_auto_maker();
+        }
     }
 
     /// 该幂等键是否已处理过。
@@ -265,6 +281,26 @@ mod tests {
         let s = state();
         s.set_mode(ServiceMode::Live).await;
         assert_eq!(s.mode().await, ServiceMode::Live);
+    }
+
+    /// 切到实盘必须自动关闭已启用的自动化做市——不能让一个对着模拟盘
+    /// 校准的策略因为一次模式切换就突然对着真实资金跑。
+    #[tokio::test]
+    async fn set_mode_live_disables_auto_maker() {
+        let s = state();
+        s.engine
+            .lock()
+            .await
+            .configure_auto_maker(true, None)
+            .expect("默认参数应能开启");
+        assert!(s.engine.lock().await.auto_maker().enabled, "开启应生效");
+
+        s.set_mode(ServiceMode::Live).await;
+
+        assert!(
+            !s.engine.lock().await.auto_maker().enabled,
+            "切到实盘后自动化做市必须被关闭"
+        );
     }
 
     /// 幂等保护必须真的生效——手动面板双击是最常见的误操作。

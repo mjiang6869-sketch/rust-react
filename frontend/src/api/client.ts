@@ -20,6 +20,8 @@ import {
 } from './cooldown'
 import type {
   ApiResponse,
+  AutoMakerConfig,
+  AutoMakerParams,
   BacktestResult,
   BacktestRunSummary,
   Coverage,
@@ -32,7 +34,6 @@ import type {
   Health,
   ManualPlanRequest,
   ManualPreview,
-  RecentTrade,
   StrategyInfo,
 } from './types'
 
@@ -195,8 +196,17 @@ export const api = {
       idempotencyKey,
     }),
 
-  cancelPending: () =>
-    request<{ cancelled: boolean }>('/manual/cancel-pending', { method: 'POST' }),
+  /**
+   * 撤销在途开仓单。
+   *
+   * `clientId` 省略时撤当前在途单（不校验 ID），与旧行为一致；指定但不
+   * 匹配当前在途单时，后端返回 409 带中文原因（例如已成交或已过期）。
+   */
+  cancelPending: (clientId?: string) =>
+    request<{ cancelled: boolean; source: 'MANUAL' | 'STRATEGY' | null }>(
+      `/manual/cancel-pending${clientId !== undefined ? `?client_id=${encodeURIComponent(clientId)}` : ''}`,
+      { method: 'POST' },
+    ),
 
   closePosition: () =>
     request<{ closed: boolean; pnl: string }>('/manual/close', { method: 'POST' }),
@@ -249,13 +259,6 @@ export const api = {
     return request<BookSnapshotResponse>(`/market/book?${q.toString()}`)
   },
 
-  /** 最近成交。后端已按时间倒序（最新的在前）。 */
-  recentTrades: (params: { symbol: string; limit?: number }) => {
-    const q = new URLSearchParams({ symbol: params.symbol })
-    if (params.limit !== undefined) q.set('limit', String(params.limit))
-    return request<RecentTrade[]>(`/market/trades?${q.toString()}`)
-  },
-
   coverage: () => request<Coverage>('/data/coverage'),
 
   startDownload: (req: DownloadRequest) =>
@@ -275,5 +278,19 @@ export const api = {
     request<{ mode: string; mode_label: string }>('/mode', {
       method: 'PUT',
       body: JSON.stringify({ mode }),
+    }),
+
+  /** 自动化做市（区间做市策略）的开关、参数与可编辑字段说明。 */
+  autoMaker: () => request<AutoMakerConfig>('/auto-maker'),
+
+  /**
+   * 切换自动化做市开关，可选一并更新参数。
+   *
+   * `params` 省略时只切换开关，参数保持引擎当前生效值不变。
+   */
+  setAutoMaker: (req: { enabled: boolean; params?: AutoMakerParams }) =>
+    request<AutoMakerConfig>('/auto-maker', {
+      method: 'PUT',
+      body: JSON.stringify(req),
     }),
 }

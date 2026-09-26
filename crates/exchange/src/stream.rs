@@ -434,18 +434,6 @@ impl MarketView {
         self.trades.truncate(RECENT_TRADES_CAP);
         true
     }
-
-    /// 并入一批成交（REST 补的开屏数据）。按成交 ID 去重、新的在前。
-    ///
-    /// 与 [`Self::push_trade`] 分开：推送来的成交只会更新，补数据来的可能比
-    /// 已有的旧，需要插到中间而不是被丢弃。
-    pub fn merge_trades(&mut self, batch: impl IntoIterator<Item = AggTrade>) {
-        let mut all: Vec<AggTrade> = self.trades.drain(..).chain(batch).collect();
-        all.sort_by_key(|t| std::cmp::Reverse(t.trade_id));
-        all.dedup_by_key(|t| t.trade_id);
-        all.truncate(RECENT_TRADES_CAP);
-        self.trades = all.into();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -690,21 +678,6 @@ impl MarketStreams {
             ));
         }
         rx
-    }
-
-    /// 用 REST 拉到的成交给视图补底。
-    ///
-    /// 推送只带**连上之后**的成交；刚打开页面时成交流是空的，冷门交易对可能
-    /// 要空很久。补底只在视图里还没有该交易对时生效——没人订阅就不补。
-    pub fn seed_trades(&self, symbol: &str, trades: Vec<AggTrade>) {
-        let symbol = symbol.to_ascii_uppercase();
-        let tx = match self.hub.feeds.lock() {
-            Ok(feeds) => feeds.get(&symbol).cloned(),
-            Err(_) => None,
-        };
-        if let Some(tx) = tx {
-            tx.send_modify(|v| v.merge_trades(trades));
-        }
     }
 
     /// 当前有上游连接的交易对数量。
@@ -1252,17 +1225,6 @@ mod tests {
         assert!(!v.push_trade(trade(5)), "更旧的成交");
         let ids: Vec<u64> = v.trades.iter().map(|t| t.trade_id).collect();
         assert_eq!(ids, vec![11, 10], "新的在前");
-    }
-
-    /// REST 补底的成交比推送来的旧，必须插到后面，而不是被当成"更旧"丢掉。
-    #[test]
-    fn seeded_trades_merge_behind_live_ones() {
-        let mut v = MarketView::default();
-        v.push_trade(trade(100));
-        v.merge_trades([trade(98), trade(99), trade(100)]);
-        let ids: Vec<u64> = v.trades.iter().map(|t| t.trade_id).collect();
-        assert_eq!(ids, vec![100, 99, 98]);
-        assert!(v.push_trade(trade(101)), "补底之后推送照常追加");
     }
 
     #[test]

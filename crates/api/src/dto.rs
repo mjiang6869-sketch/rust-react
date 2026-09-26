@@ -19,7 +19,7 @@
 use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use domain::{
-    AggTrade, BookSnapshot, Candle, ManualPlan, ManualPreview, PositionView, ServiceMode, Side,
+    BookSnapshot, Candle, ManualPlan, ManualPreview, PositionView, ServiceMode, Side,
     StandDownReason,
 };
 use rust_decimal::Decimal;
@@ -240,6 +240,10 @@ pub struct StateDto {
     pub safety: SafetyDto,
     /// 合约的关键规则。
     pub instrument: InstrumentDto,
+    /// 自动化做市（区间做市策略）的开关、参数与运行状态。
+    pub auto_maker: AutoMakerDto,
+    /// 当前持仓的来源（手动 / 自动化做市）；无持仓时为 `None`。
+    pub position_source: Option<&'static str>,
 }
 
 /// 合约信息。
@@ -309,6 +313,14 @@ pub struct OrderDto {
     pub limit_price: String,
     pub filled: String,
     pub state: String,
+    /// 这张单是谁下的：`"MANUAL"` / `"STRATEGY"`。已登记的保护单沿用当前
+    /// 持仓的来源，理论上不应为 `None`；`None` 只出现在数据不一致的边缘情形。
+    pub source: Option<&'static str>,
+    pub source_label: Option<&'static str>,
+    /// 是否可撤销（目前只有在途开仓单可撤）。
+    pub cancellable: bool,
+    /// 到期自动撤销的时刻（仅在途开仓单有值）。
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// 实盘安全状态。
@@ -645,24 +657,6 @@ pub struct BookDto {
     pub asks: Vec<LevelDto>,
 }
 
-/// 最近成交一笔。
-#[derive(Debug, Serialize)]
-pub struct TradeDto {
-    pub trade_id: u64,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub price: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub quantity: Decimal,
-    /// 是否买方为挂单方（即**卖方主动**）。
-    pub is_buyer_maker: bool,
-    /// 成交时刻（Unix 毫秒，字符串）。
-    ///
-    /// 成交流按时间倒序展示，前端**不做时间算术**，只比较大小。传字符串是
-    /// 为了与其余数值字段一致——一旦将来精度到微秒，`i64` 转 `f64` 会静默
-    /// 丢位，而字符串不会。
-    pub time: String,
-}
-
 /// K 线查询参数。
 #[derive(Debug, Deserialize)]
 pub struct KlinesQuery {
@@ -721,18 +715,6 @@ impl CandleDto {
             closed: c.closed,
             change,
             change_percent,
-        }
-    }
-}
-
-impl TradeDto {
-    pub fn from_trade(t: &AggTrade) -> Self {
-        Self {
-            trade_id: t.trade_id,
-            price: t.price.get(),
-            quantity: t.quantity.get(),
-            is_buyer_maker: t.is_buyer_maker,
-            time: t.at.timestamp_millis().to_string(),
         }
     }
 }
@@ -900,6 +882,98 @@ pub fn preview_dto(p: &ManualPreview) -> ManualPreviewDto {
         accepted: p.accepted,
         reject_reason: p.reject_reason.clone(),
         warnings: p.warnings.clone(),
+    }
+}
+
+/// 自动化做市（区间做市策略）可编辑参数的白名单。
+///
+/// **只包含模拟盘会真正读取并生效的字段。** `RangeMakerParams` 里的
+/// `break_even`、`trailing`、`trailing_bp`、`one_signal_per_bar` 都不在这里：
+///
+/// - `break_even` 只在某一档止盈成交后被动态检查一次（见
+///   `domain::position_set::on_take_profit_filled`）；价格连续移动时的动态
+///   重算路径 `domain::protection::ProtectionPlanner::on_market` 目前只在
+///   该模块自己的单测里被调用，模拟盘的事件循环从未调用它。
+/// - `trailing` / `trailing_bp` 同样只依赖那条没人调用的动态重算路径，
+///   在模拟盘里完全不生效。
+/// - `one_signal_per_bar` 从未被 `RangeMaker::evaluate` 读取。
+///
+/// 开放这些字段编辑会让用户以为调整了它们就能改变行为——但改的是一个
+/// 没人读的数字，这比不开放更差（静默失效）。PUT 时这四个字段始终保持
+/// 引擎当前生效值不变。
+///
+/// 数值字段一律用字符串传输（与全局约束一致），`side_mode` 直接复用
+/// `strategies::SideMode` 的 `Serialize`/`Deserialize`（`"LONG_ONLY"` /
+/// `"SHORT_ONLY"`），避免在这里重复一份互斥的字符串常量。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoMakerParamsDto {
+    pub lookback: String,
+    pub take_profit_bp: String,
+    pub stop_buffer_bp: String,
+    pub side_mode: strategies::SideMode,
+    pub equity_pct: String,
+    pub leverage: String,
+    pub valid_minutes: String,
+}
+
+/// 把引擎当前生效的参数转成白名单 DTO。
+pub fn auto_maker_params_dto(p: &strategies::RangeMakerParams) -> AutoMakerParamsDto {
+    AutoMakerParamsDto {
+        lookback: p.lookback.to_string(),
+        take_profit_bp: num(p.take_profit_bp),
+        stop_buffer_bp: num(p.stop_buffer_bp),
+        side_mode: p.side_mode,
+        equity_pct: num(p.equity_pct),
+        leverage: num(p.leverage),
+        valid_minutes: p.valid_minutes.to_string(),
+    }
+}
+
+/// 自动化做市的完整视图：开关、参数、运行状态。
+#[derive(Debug, Serialize)]
+pub struct AutoMakerDto {
+    pub enabled: bool,
+    pub strategy_id: String,
+    pub strategy_name: String,
+    pub status: &'static str,
+    pub status_label: String,
+    pub params: AutoMakerParamsDto,
+    pub warmup_have: usize,
+    pub warmup_need: usize,
+    pub max_lookback: usize,
+}
+
+/// 把 `engine::AutoMakerView` 转成 DTO。
+pub fn auto_maker_dto(v: &engine::AutoMakerView) -> AutoMakerDto {
+    AutoMakerDto {
+        enabled: v.enabled,
+        strategy_id: v.strategy_id.to_string(),
+        strategy_name: v.strategy_name.to_string(),
+        status: v.status.tag(),
+        status_label: v.status.label(),
+        params: auto_maker_params_dto(&v.params),
+        warmup_have: v.warmup_have,
+        warmup_need: v.warmup_need,
+        max_lookback: v.max_lookback,
+    }
+}
+
+/// 把 `engine::OrderSnapshot` 转成 DTO。
+pub fn order_dto(o: &engine::OrderSnapshot) -> OrderDto {
+    OrderDto {
+        client_id: o.client_id.clone(),
+        purpose: purpose_tag(o.purpose),
+        purpose_label: purpose_label(o.purpose),
+        side: side_tag(o.side),
+        quantity: o.quantity.to_string(),
+        limit_price: o.limit_price.to_string(),
+        filled: o.filled.to_string(),
+        state: o.state.to_string(),
+        source: o.source.map(|s| s.tag()),
+        source_label: o.source.map(|s| s.label()),
+        cancellable: o.cancellable,
+        expires_at: o.expires_at,
     }
 }
 
@@ -1682,22 +1756,6 @@ mod tests {
             at: Utc::now(),
         };
         assert_eq!(BookDto::from_snapshot("X", book).mid, dec!(100.5));
-    }
-
-    /// 成交时间传字符串——将来精度到微秒时 `i64` 转 `f64` 会静默丢位。
-    #[test]
-    fn trade_time_is_a_string() {
-        let t = AggTrade {
-            trade_id: 42,
-            price: Price::new(dec!(2684.75)),
-            quantity: Qty::new(dec!(0.009)),
-            is_buyer_maker: true,
-            at: Utc::now(),
-        };
-        let dto = TradeDto::from_trade(&t);
-        assert_eq!(dto.trade_id, 42);
-        assert!(dto.is_buyer_maker, "卖方主动必须如实传递");
-        assert!(dto.time.parse::<i64>().is_ok(), "时间应为可解析的字符串");
     }
 
     // -----------------------------------------------------------------------

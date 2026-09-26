@@ -20,10 +20,10 @@ import { Input } from '../components/FormControls'
 import { ChartHost } from '../chart/ChartHost'
 import { useKlines } from '../chart/useKlines'
 import { num } from '../format'
+import { AutoMakerPanel } from './AutoMakerPanel'
 import { ManualPanel } from './ManualPanel'
 import { OrderBook } from './OrderBook'
 import { TradingActivity } from './TradingActivity'
-import { TradeTape } from './TradeTape'
 
 /** 图表初始周期。 */
 const DEFAULT_INTERVAL = '15m'
@@ -87,8 +87,8 @@ function MarketWorkspace({ engine, hasPosition, symbol }: MarketPageProps & { sy
     [engine.position, isEngineSymbol],
   )
 
-  // 后端按时间倒序推送成交；当前价取最新成交原始字符串。
-  const lastPrice = feed.trades[0]?.price ?? null
+  // 最新价来自推送帧的 last_price（服务端由成交流算出），不再用 REST 补底。
+  const lastPrice = feed.lastPrice
 
   return (
     <div className="market-page">
@@ -206,7 +206,7 @@ function MarketWorkspace({ engine, hasPosition, symbol }: MarketPageProps & { sy
           )
         )}
         <OrderBook book={feed.book} currentPrice={lastPrice} depth={9} />
-        <TradeTape trades={feed.trades} />
+        <AutoMakerPanel engine={engine} symbol={symbol} />
       </div>
       <TradingActivity engine={engine} />
     </div>

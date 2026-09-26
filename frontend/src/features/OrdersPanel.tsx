@@ -22,6 +22,8 @@ interface Props {
 
 export function OrdersPanel({ orders, title, symbol, compact = false }: Props) {
   const action = useAction()
+  const cancelAction = useAction()
+  const [cancelNotice, setCancelNotice] = useState<string | null>(null)
 
   // 成交历史需要单独请求（不在引擎状态里）。
   const [fills, setFills] = useState<FillRecord[]>([])
@@ -37,12 +39,34 @@ export function OrdersPanel({ orders, title, symbol, compact = false }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showFills])
 
+  const handleCancel = useCallback(
+    async (order: OrderInfo) => {
+      setCancelNotice(null)
+      const r = await cancelAction.run(() => api.cancelPending(order.client_id))
+      if (r?.cancelled === true && order.source === 'STRATEGY') {
+        setCancelNotice('自动化做市会在下一根 K 线收盘时重新评估。')
+      }
+    },
+    [cancelAction],
+  )
+
   return (
     <section className="panel" aria-labelledby={`orders-${title}`}>
       <div className="panel-head">
         <h2 id={`orders-${title}`}>{title}</h2>
         <span className="muted">{orders.length} 张</span>
       </div>
+
+      {cancelAction.error !== null && (
+        <p className="notice notice-error" role="alert">
+          {cancelAction.error}
+        </p>
+      )}
+      {cancelNotice !== null && (
+        <p className="notice notice-info" role="status">
+          {cancelNotice}
+        </p>
+      )}
 
       {orders.length === 0 ? (
         <p className="muted">当前没有在途订单。</p>
@@ -56,14 +80,20 @@ export function OrdersPanel({ orders, title, symbol, compact = false }: Props) {
                 <th scope="col" className="num">
                   价格
                 </th>
-                <th scope="col" className="num">
-                  数量
-                </th>
-                <th scope="col" className="num">
-                  已成交
-                </th>
+                {!compact && (
+                  <>
+                    <th scope="col" className="num">
+                      数量
+                    </th>
+                    <th scope="col" className="num">
+                      已成交
+                    </th>
+                  </>
+                )}
                 <th scope="col">状态</th>
-                <th scope="col">订单号</th>
+                <th scope="col">来源</th>
+                {!compact && <th scope="col">订单号</th>}
+                <th scope="col">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -74,13 +104,37 @@ export function OrdersPanel({ orders, title, symbol, compact = false }: Props) {
                     {o.side === 'BUY' ? '买' : '卖'}
                   </td>
                   <td className="num mono">{num(o.limit_price)}</td>
-                  <td className="num mono">{qty(o.quantity)}</td>
-                  <td className="num mono">{qty(o.filled)}</td>
+                  {!compact && (
+                    <>
+                      <td className="num mono">{qty(o.quantity)}</td>
+                      <td className="num mono">{qty(o.filled)}</td>
+                    </>
+                  )}
                   <td>
                     <span className="state-tag">{o.state}</span>
+                    {o.expires_at !== null && (
+                      <div className="muted small">到期：{time(o.expires_at)}</div>
+                    )}
                   </td>
-                  <td className="mono ellipsis" title={o.client_id}>
-                    {o.client_id}
+                  <td>{o.source_label ?? '—'}</td>
+                  {!compact && (
+                    <td className="mono ellipsis" title={o.client_id}>
+                      {o.client_id}
+                    </td>
+                  )}
+                  <td>
+                    {o.cancellable ? (
+                      <button
+                        type="button"
+                        className="link-btn"
+                        disabled={cancelAction.busy}
+                        onClick={() => void handleCancel(o)}
+                      >
+                        撤单
+                      </button>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
                   </td>
                 </tr>
               ))}

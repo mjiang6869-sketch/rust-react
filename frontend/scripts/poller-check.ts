@@ -573,7 +573,7 @@ const FRAME = (symbol: string) =>
     notice: null,
     cooldown_ms: 0,
     book: null,
-    trades: [],
+    last_price: null,
   })
 
 function socketHarness(clock: FakeClock, symbol = 'ETHUSDC') {

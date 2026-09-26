@@ -22,12 +22,13 @@ use domain::{
     ClientOrderId, EntryFill, ExecEvent, Fill, Instrument, LiveSafety, ManualPlan, ManualPreview,
     MarketEvent, MarketView, Order, OrderBookState, OrderPurpose, OrderState, Position,
     PositionSet, Price, ProtectionPlan, ProtectionPlanner, Qty, RiskLimits, ServiceMode, Side,
-    StandDownReason, StrategyIntent, TpPlan, check_consistency, on_stop_filled,
-    on_take_profit_filled, preview_manual,
+    SizeHint, StandDownReason, Strategy as _, StrategyIntent, TpPlan, check_consistency,
+    on_stop_filled, on_take_profit_filled, preview_manual,
 };
 use rust_decimal::Decimal;
 use sim::fill::{FillContext, FillModel, Optimism};
 use sim::liquidity::{Trade, TradeTape};
+use strategies::{RangeMaker, RangeMakerParams};
 
 /// 引擎配置。
 #[derive(Clone, Debug)]
@@ -96,6 +97,10 @@ pub struct EngineSnapshot {
     pub stand_down: Option<&'static str>,
     /// 实盘安全闸门状态。
     pub safety: LiveSafety,
+    /// 自动化做市开关、参数与当前运行状态。
+    pub auto_maker: AutoMakerView,
+    /// 当前持仓的来源（手动 / 自动化做市）；无持仓时为 `None`。
+    pub position_source: Option<OrderSource>,
 }
 
 /// 一张订单的展示快照。
@@ -108,6 +113,13 @@ pub struct OrderSnapshot {
     pub limit_price: Decimal,
     pub filled: Decimal,
     pub state: &'static str,
+    /// 这张单的来源——手动还是自动化做市。在途开仓单一定有值；已登记进
+    /// `OrderBookState` 的保护单沿用当前持仓的来源。
+    pub source: Option<OrderSource>,
+    /// 是否可撤销（目前只有在途开仓单可撤）。
+    pub cancellable: bool,
+    /// 到期自动撤销的时刻（仅在途开仓单有值）。
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// 提交结果。
@@ -119,6 +131,99 @@ pub enum SubmitOutcome {
     Rejected { reason: String },
 }
 
+/// 一张订单/一个持仓的来源：谁下的这张单。
+///
+/// **来源始终由调用方显式传入**（`submit_manual` 固定传 `Manual`，`decide`
+/// 固定传 `Strategy`），不从 `client_ref` 之类的用户可填字段推断——那个
+/// 字段用户可以填任意值，不能作为权威来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderSource {
+    /// 用户手动下单。
+    Manual,
+    /// 自动化做市策略下单。
+    Strategy,
+}
+
+impl OrderSource {
+    pub fn tag(self) -> &'static str {
+        match self {
+            OrderSource::Manual => "MANUAL",
+            OrderSource::Strategy => "STRATEGY",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OrderSource::Manual => "手动",
+            OrderSource::Strategy => "自动化做市",
+        }
+    }
+}
+
+/// 自动化做市当前的运行状态——回答"为什么现在没有自动挂单"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoMakerStatus {
+    /// 未启用。
+    Disabled,
+    /// 已挂出策略开仓单，等待成交。
+    Quoting,
+    /// 策略持仓中，等待止盈或止损。
+    InPosition,
+    /// 已有手动持仓或挂单，自动化做市让位等待其结束。
+    YieldingToManual,
+    /// 行情未连接，暂停开仓。
+    FeedDown,
+    /// K 线预热中，尚未攒够回看窗口。
+    WarmingUp { have: usize, need: usize },
+    /// 策略主动让位（风控拒绝、历史不足等）。
+    StandingDown(StandDownReason),
+    /// 一切就绪，等待下一根 K 线收盘产生信号。
+    Ready,
+}
+
+impl AutoMakerStatus {
+    pub fn tag(self) -> &'static str {
+        match self {
+            AutoMakerStatus::Disabled => "DISABLED",
+            AutoMakerStatus::Quoting => "QUOTING",
+            AutoMakerStatus::InPosition => "IN_POSITION",
+            AutoMakerStatus::YieldingToManual => "YIELDING_TO_MANUAL",
+            AutoMakerStatus::FeedDown => "FEED_DOWN",
+            AutoMakerStatus::WarmingUp { .. } => "WARMING_UP",
+            AutoMakerStatus::StandingDown(_) => "STANDING_DOWN",
+            AutoMakerStatus::Ready => "READY",
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            AutoMakerStatus::Disabled => "自动化做市未启用".to_string(),
+            AutoMakerStatus::Quoting => "策略挂单中".to_string(),
+            AutoMakerStatus::InPosition => "策略持仓中，等待止盈或止损".to_string(),
+            AutoMakerStatus::YieldingToManual => "已有手动持仓或挂单，等待其结束".to_string(),
+            AutoMakerStatus::FeedDown => "行情未连接，暂停开仓".to_string(),
+            AutoMakerStatus::WarmingUp { have, need } => {
+                format!("K 线预热中（{have}/{need} 根）")
+            }
+            AutoMakerStatus::StandingDown(reason) => reason.message().to_string(),
+            AutoMakerStatus::Ready => "运行中，等待下一根 1m K 线收盘".to_string(),
+        }
+    }
+}
+
+/// 自动化做市界面展示所需的完整视图。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoMakerView {
+    pub enabled: bool,
+    pub strategy_id: &'static str,
+    pub strategy_name: &'static str,
+    pub params: RangeMakerParams,
+    pub status: AutoMakerStatus,
+    pub warmup_have: usize,
+    pub warmup_need: usize,
+    pub max_lookback: usize,
+}
+
 /// 模拟盘引擎。
 pub struct PaperEngine {
     config: EngineConfig,
@@ -126,6 +231,8 @@ pub struct PaperEngine {
     state: OrderBookState,
     /// 当前持仓连同保护单。
     position_set: Option<PositionSet>,
+    /// 当前持仓的来源（手动 / 自动化做市）。随持仓一起建立与清空。
+    position_source: Option<OrderSource>,
     /// 已收盘 K 线滚动窗口。
     candles: Vec<domain::Candle>,
     /// 自某一时刻起的成交（用于成交模型判定）。
@@ -149,6 +256,11 @@ pub struct PaperEngine {
     pub(crate) last_event_at: Option<DateTime<Utc>>,
     /// 成交模型（模拟盘默认 M1，与回测的诚实基线一致）。
     fill_model: Box<dyn FillModel>,
+    /// 自动化做市开关。**不落库，重启即关闭**——见 AGENTS.md：不能因重启
+    /// 自动恢复风险状态，进程重启后必须由操作者重新确认并手动开启。
+    auto_maker_enabled: bool,
+    /// 自动化做市当前生效的参数。同样不落库，重启回到默认值。
+    auto_maker_params: RangeMakerParams,
 }
 
 /// 在途的开仓单。
@@ -161,6 +273,8 @@ struct PendingOrder {
     /// 已提交尝试次数（用于统计 post-only 拒单率）。
     attempts: usize,
     rejected: usize,
+    /// 这张单是谁下的——手动面板还是自动化做市策略。
+    source: OrderSource,
 }
 
 impl PaperEngine {
@@ -169,6 +283,7 @@ impl PaperEngine {
             config,
             state: OrderBookState::new(),
             position_set: None,
+            position_source: None,
             candles: Vec::new(),
             tape: TradeTape::default(),
             realized_pnl: Decimal::ZERO,
@@ -183,6 +298,9 @@ impl PaperEngine {
             // 模拟盘默认用诚实基线而非上界——用 M0 会让模拟盘过于乐观，
             // 那样模拟盘的结论与实盘预期不符。
             fill_model: Box::new(sim::M1TradeThroughQueue::default()),
+            // 自动化做市默认关闭——见字段文档：重启不能自动恢复风险状态。
+            auto_maker_enabled: false,
+            auto_maker_params: RangeMakerParams::default(),
         }
     }
 
@@ -288,6 +406,112 @@ impl PaperEngine {
     /// 当前已收盘 K 线窗口的根数（用于界面/日志展示预热进度）。
     pub fn candle_count(&self) -> usize {
         self.candles.len()
+    }
+
+    /// 配置自动化做市开关与参数。
+    ///
+    /// 校验失败时（参数越界，或回看根数超过引擎 K 线窗口上限）状态完全
+    /// 不变——调用方可以放心重试而不必担心中间状态。
+    ///
+    /// 参数确实发生变化，或开关状态发生变化时才会有实际效果：
+    /// - 若新参数与当前生效参数不同，且当前有一张来源为自动化做市的在途
+    ///   开仓单，会先撤掉它（新参数下这张单可能已经不再合理）。
+    /// - 关闭时会撤掉来源为自动化做市的在途单，并清空 `stand_down`——用户
+    ///   关闭之后不应该继续看到一条陈旧的"为什么不交易"提示。
+    ///
+    /// 手动挂单、持仓与保护单绝不会被这个方法触碰。
+    pub fn configure_auto_maker(
+        &mut self,
+        enabled: bool,
+        params: Option<RangeMakerParams>,
+    ) -> Result<(), String> {
+        if let Some(p) = params.as_ref() {
+            p.validate()?;
+            let cap = self.candle_cap();
+            if p.lookback > cap {
+                return Err(format!(
+                    "回看根数 {} 超过引擎 K 线窗口上限 {} 根",
+                    p.lookback, cap
+                ));
+            }
+        }
+
+        let params_changed = params
+            .as_ref()
+            .is_some_and(|p| *p != self.auto_maker_params);
+        let enabled_changed = enabled != self.auto_maker_enabled;
+        if !enabled_changed && !params_changed {
+            return Ok(());
+        }
+
+        if let Some(p) = params {
+            self.auto_maker_params = p;
+        }
+        self.auto_maker_enabled = enabled;
+
+        // 参数变化或关闭时，撤掉自动化做市自己的在途单——不动手动单。
+        if (!enabled || params_changed)
+            && self
+                .pending_intent
+                .as_ref()
+                .is_some_and(|p| p.source == OrderSource::Strategy)
+        {
+            self.pending_intent = None;
+        }
+        if !enabled {
+            self.stand_down = None;
+        }
+
+        self.events.push(EngineEvent::StateChanged);
+        Ok(())
+    }
+
+    /// 关闭自动化做市。等价于 `configure_auto_maker(false, None)`，不会失败。
+    pub fn disable_auto_maker(&mut self) {
+        let _ = self.configure_auto_maker(false, None);
+    }
+
+    /// 自动化做市当前的完整视图（开关、参数、运行状态），供界面展示。
+    pub fn auto_maker(&self) -> AutoMakerView {
+        let params = &self.auto_maker_params;
+        let strategy = RangeMaker::new(params.clone());
+
+        let status = if !self.auto_maker_enabled {
+            AutoMakerStatus::Disabled
+        } else if self
+            .pending_intent
+            .as_ref()
+            .is_some_and(|p| p.source == OrderSource::Strategy)
+        {
+            AutoMakerStatus::Quoting
+        } else if self.position_set.is_some() && self.position_source == Some(OrderSource::Strategy)
+        {
+            AutoMakerStatus::InPosition
+        } else if self.pending_intent.is_some() || self.position_set.is_some() {
+            AutoMakerStatus::YieldingToManual
+        } else if !self.feed_connected {
+            AutoMakerStatus::FeedDown
+        } else if self.candles.len() < params.lookback {
+            AutoMakerStatus::WarmingUp {
+                have: self.candles.len(),
+                need: params.lookback,
+            }
+        } else if let Some(reason) = self.stand_down {
+            AutoMakerStatus::StandingDown(reason)
+        } else {
+            AutoMakerStatus::Ready
+        };
+
+        AutoMakerView {
+            enabled: self.auto_maker_enabled,
+            strategy_id: strategy.id(),
+            strategy_name: strategy.name(),
+            params: params.clone(),
+            status,
+            warmup_have: self.candles.len(),
+            warmup_need: params.lookback,
+            max_lookback: self.candle_cap(),
+        }
     }
 
     /// 喂入一个行情事件。
@@ -432,6 +656,7 @@ impl PaperEngine {
         }
 
         self.position_set = Some(set);
+        self.position_source = Some(pending.source);
         // 保护单在这一刻挂出——记录时刻，后续判定只能用这之后的成交。
         if let Some(s) = self.position_set.as_mut() {
             s.protection_placed_at = Some(now);
@@ -543,6 +768,7 @@ impl PaperEngine {
                     exit_reason: ExitReason::TakeProfit,
                 });
                 self.position_set = None;
+                self.position_source = None;
             }
             self.events.push(EngineEvent::StateChanged);
             break; // 一次只处理一档，下一 tick 再处理
@@ -642,6 +868,7 @@ impl PaperEngine {
             exit_reason: ExitReason::StopLoss,
         });
         self.position_set = None;
+        self.position_source = None;
         self.events.push(EngineEvent::StateChanged);
         let _ = now;
     }
@@ -663,20 +890,20 @@ impl PaperEngine {
 
     /// 向策略索取意图并处理。
     fn decide(&mut self, now: DateTime<Utc>) {
+        if !self.auto_maker_enabled {
+            return;
+        }
         if self.pending_intent.is_some() || self.position_set.is_some() {
             return;
         }
-
-        let strategy = match strategies::by_id("range_maker") {
-            Some(s) => s,
-            None => return,
-        };
 
         // 行情不新鲜时明确让位——静默不交易是恶劣的失败模式。
         if !self.feed_is_fresh(now) {
             self.stand_down = Some(StandDownReason::StaleFeed);
             return;
         }
+
+        let strategy = RangeMaker::new(self.auto_maker_params.clone());
 
         let view = MarketView {
             instrument: &self.config.instrument,
@@ -700,13 +927,19 @@ impl PaperEngine {
             }
             StrategyIntent::Enter(req) => {
                 self.stand_down = None;
+                // 把策略的仓位规模提示映射到 `ManualPlan` 的数量字段——丢掉
+                // 这一步会让策略配置的仓位比例、杠杆完全不生效。
+                let (quantity, size_pct, leverage) = match req.size {
+                    SizeHint::EquityFraction { pct, leverage } => (None, Some(pct), leverage),
+                    SizeHint::Fixed(qty) => (Some(Qty::new(qty)), None, Decimal::ONE),
+                };
                 let plan = ManualPlan {
                     symbol: self.config.instrument.symbol.clone(),
                     side: req.side,
                     entry: req.entry,
-                    quantity: None,
-                    size_pct: None,
-                    leverage: Decimal::ONE,
+                    quantity,
+                    size_pct,
+                    leverage,
                     stop: req.stop,
                     take_profit: req.take_profit.clone(),
                     break_even: req.protection.break_even,
@@ -714,7 +947,7 @@ impl PaperEngine {
                     cancel_unfilled_after: req.protection.timed_cancel,
                     client_ref: "strategy".into(),
                 };
-                match self.place(&plan, now) {
+                match self.place(&plan, now, OrderSource::Strategy) {
                     SubmitOutcome::Accepted(_) => {}
                     SubmitOutcome::Rejected { reason } => {
                         self.events.push(EngineEvent::Rejected { reason });
@@ -722,14 +955,21 @@ impl PaperEngine {
                 }
             }
             StrategyIntent::ExitNow { .. } => {
-                self.pending_intent = None;
+                // 只撤自动化做市自己的在途单——绝不能误撤手动挂单。
+                if self
+                    .pending_intent
+                    .as_ref()
+                    .is_some_and(|p| p.source == OrderSource::Strategy)
+                {
+                    self.pending_intent = None;
+                }
             }
         }
     }
 
     /// 提交一份手动计划。策略与手动面板共用这条路径。
     pub fn submit_manual(&mut self, plan: &ManualPlan, now: DateTime<Utc>) -> SubmitOutcome {
-        self.place(plan, now)
+        self.place(plan, now, OrderSource::Manual)
     }
 
     /// 预览一份手动计划（不提交）。
@@ -757,12 +997,24 @@ impl PaperEngine {
     }
 
     /// 内部：把计划编译成订单并挂出。策略与手动共用。
-    fn place(&mut self, plan: &ManualPlan, now: DateTime<Utc>) -> SubmitOutcome {
+    fn place(
+        &mut self,
+        plan: &ManualPlan,
+        now: DateTime<Utc>,
+        source: OrderSource,
+    ) -> SubmitOutcome {
         // 已有持仓或在途单时拒绝——绝不能重复暴露。
         if self.position_set.is_some() || self.pending_intent.is_some() {
-            return SubmitOutcome::Rejected {
-                reason: "已有持仓或在途订单，请先平仓或撤单".into(),
+            let reason = if self
+                .pending_intent
+                .as_ref()
+                .is_some_and(|p| p.source == OrderSource::Strategy)
+            {
+                "自动化做市已有在途开仓单，请先撤单或停用自动化做市".to_string()
+            } else {
+                "已有持仓或在途订单，请先平仓或撤单".to_string()
             };
+            return SubmitOutcome::Rejected { reason };
         }
 
         let preview = match self.preview_manual_plan(plan, now) {
@@ -823,6 +1075,7 @@ impl PaperEngine {
                 .unwrap_or_else(|| now + Duration::minutes(2)),
             attempts: 1,
             rejected: 0,
+            source,
         });
 
         self.events.push(EngineEvent::StateChanged);
@@ -831,17 +1084,45 @@ impl PaperEngine {
 
     /// 撤掉在途开仓单。
     pub fn cancel_pending(&mut self) -> bool {
-        if self.pending_intent.take().is_some() {
-            self.events.push(EngineEvent::StateChanged);
-            true
-        } else {
-            false
+        matches!(self.cancel_pending_order(None), Ok(Some(_)))
+    }
+
+    /// 按客户端订单 ID 撤单，返回被撤单的来源。
+    ///
+    /// `client_id` 为 `None` 时撤掉当前在途单（不校验 ID，等价于旧的
+    /// `cancel_pending` 语义）；给了 `client_id` 但与当前在途单不符（或
+    /// 当前没有在途单）时返回 `Err`——调用方不能假装撤单成功了。
+    pub fn cancel_pending_order(
+        &mut self,
+        client_id: Option<&str>,
+    ) -> Result<Option<OrderSource>, String> {
+        match client_id {
+            None => match self.pending_intent.take() {
+                Some(p) => {
+                    self.events.push(EngineEvent::StateChanged);
+                    Ok(Some(p.source))
+                }
+                None => Ok(None),
+            },
+            Some(id) => {
+                let matches = self
+                    .pending_intent
+                    .as_ref()
+                    .is_some_and(|p| p.order.client_id.as_str() == id);
+                if !matches {
+                    return Err("该订单已不在途（可能已成交或过期）".into());
+                }
+                let p = self.pending_intent.take().expect("已判存在");
+                self.events.push(EngineEvent::StateChanged);
+                Ok(Some(p.source))
+            }
         }
     }
 
     /// 手动平仓（市价语义，但模拟盘按当前成交价成交）。
     pub fn close_position_manually(&mut self, now: DateTime<Utc>) -> Option<Decimal> {
         let set = self.position_set.take()?;
+        self.position_source = None;
         let price = self
             .tape
             .trades()
@@ -939,6 +1220,36 @@ impl PaperEngine {
             .or_else(|| self.candles.last().map(|c| Price::new(c.close)))
             .unwrap_or(Price::new(Decimal::ZERO));
 
+        // 在途开仓单放在最前面——它此前只登记进 `OrderBookState` 才可见，
+        // 导致成交前用户在界面上完全看不到这张单。
+        let mut open_orders = Vec::new();
+        if let Some(p) = self.pending_intent.as_ref() {
+            open_orders.push(OrderSnapshot {
+                client_id: p.order.client_id.to_string(),
+                purpose: OrderPurpose::Entry,
+                side: p.order.side,
+                quantity: p.order.quantity.get(),
+                limit_price: p.order.limit_price.get(),
+                filled: Decimal::ZERO,
+                state: "挂单中",
+                source: Some(p.source),
+                cancellable: true,
+                expires_at: Some(p.valid_until),
+            });
+        }
+        open_orders.extend(self.state.open_orders().iter().map(|t| OrderSnapshot {
+            client_id: t.order.client_id.to_string(),
+            purpose: t.order.purpose,
+            side: t.order.side,
+            quantity: t.order.quantity.get(),
+            limit_price: t.order.limit_price.get(),
+            filled: t.filled.get(),
+            state: state_tag(&t.state),
+            source: self.position_source,
+            cancellable: false,
+            expires_at: None,
+        }));
+
         EngineSnapshot {
             mode: ServiceMode::Paper,
             symbol: self.config.instrument.symbol.clone(),
@@ -949,24 +1260,13 @@ impl PaperEngine {
                 .position_set
                 .as_ref()
                 .map(|s| s.view(mark, self.realized_pnl)),
-            open_orders: self
-                .state
-                .open_orders()
-                .iter()
-                .map(|t| OrderSnapshot {
-                    client_id: t.order.client_id.to_string(),
-                    purpose: t.order.purpose,
-                    side: t.order.side,
-                    quantity: t.order.quantity.get(),
-                    limit_price: t.order.limit_price.get(),
-                    filled: t.filled.get(),
-                    state: state_tag(&t.state),
-                })
-                .collect(),
+            open_orders,
             feed_connected: self.feed_connected,
             last_event_at: self.last_event_at,
             stand_down: self.stand_down.map(|r| r.message()),
             safety: self.safety,
+            auto_maker: self.auto_maker(),
+            position_source: self.position_source,
         }
     }
 
@@ -1717,5 +2017,281 @@ mod tests {
 
         e.on_market_event(k);
         assert_eq!(e.candle_count(), 1, "重复的收盘 K 线不应被重复计入窗口");
+    }
+
+    // ------------------------------------------------------------------
+    // 自动化做市
+    // ------------------------------------------------------------------
+
+    /// 喂满 60 根区间不变的 K 线（区间做市默认 lookback=60）。
+    fn warm_range(e: &mut PaperEngine, n: i64) {
+        for i in 0..n {
+            e.on_market_event(kline(i, dec!(3190), dec!(3210)));
+        }
+    }
+
+    /// 默认关闭：喂满预热窗口也不应挂出任何策略单。
+    #[test]
+    fn auto_maker_is_off_by_default() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        warm_range(&mut e, 65);
+
+        assert!(
+            e.snapshot().open_orders.is_empty(),
+            "默认关闭时不应有在途单"
+        );
+        assert_eq!(e.auto_maker().status, AutoMakerStatus::Disabled);
+    }
+
+    /// 启用后，攒够回看窗口应挂出一张来源为 `Strategy` 的开仓单。
+    #[test]
+    fn enabled_auto_maker_places_strategy_order() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        e.configure_auto_maker(true, None)
+            .expect("默认参数应通过校验");
+        warm_range(&mut e, 60);
+
+        let snap = e.snapshot();
+        let entry = snap
+            .open_orders
+            .iter()
+            .find(|o| o.purpose == OrderPurpose::Entry)
+            .expect("攒够窗口后应挂出策略开仓单");
+        assert_eq!(entry.source, Some(OrderSource::Strategy));
+        assert!(entry.cancellable, "策略在途单必须可撤");
+        assert_eq!(entry.state, "挂单中");
+    }
+
+    /// 仓位规模必须来自 `RangeMakerParams` 的 `equity_pct` 与 `leverage`——
+    /// 这条测试锁住此前 `decide()` 把 `SizeHint` 丢在地上、永远用固定
+    /// 数量下单的 bug。权益 10000、入场价 3190（区间下沿）：
+    /// - 默认 equity_pct=0.1、leverage=3 -> notional 3000 -> qty 向下量化到
+    ///   步长 0.001 后为 0.940；
+    /// - equity_pct=0.2、leverage=3 -> notional 6000 -> qty 为 1.880。
+    #[test]
+    fn strategy_order_size_uses_equity_pct_and_leverage() {
+        let mut default_engine = engine();
+        default_engine.set_feed_connected(true);
+        default_engine
+            .configure_auto_maker(true, None)
+            .expect("默认参数应通过校验");
+        warm_range(&mut default_engine, 60);
+        let default_qty = default_engine.snapshot().open_orders[0].quantity;
+        assert_eq!(default_qty, dec!(0.940), "默认 10% 仓位应得到 0.940");
+
+        let mut doubled_engine = engine();
+        doubled_engine.set_feed_connected(true);
+        let params = strategies::RangeMakerParams {
+            equity_pct: dec!(0.2),
+            ..strategies::RangeMakerParams::default()
+        };
+        doubled_engine
+            .configure_auto_maker(true, Some(params))
+            .expect("0.2 仍在合法范围内");
+        warm_range(&mut doubled_engine, 60);
+        let doubled_qty = doubled_engine.snapshot().open_orders[0].quantity;
+        assert_eq!(doubled_qty, dec!(1.880), "仓位比例翻倍，数量也应翻倍");
+    }
+
+    /// 手动挂单此前只登记进 `OrderBookState` 才可见——挂单到成交之间的
+    /// 窗口里用户在界面上完全看不到它。这条测试锁住"在途单必须在快照里
+    /// 可见"这条行为。
+    #[test]
+    fn manual_pending_order_is_visible_in_snapshot() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        let plan = ok_plan();
+        let _ = e.submit_manual(&plan, t0());
+
+        let snap = e.snapshot();
+        let entry = snap
+            .open_orders
+            .iter()
+            .find(|o| o.purpose == OrderPurpose::Entry)
+            .expect("手动在途单必须在快照里可见");
+        assert_eq!(entry.source, Some(OrderSource::Manual));
+        assert_eq!(entry.state, "挂单中");
+        assert!(entry.cancellable);
+        assert!(entry.expires_at.is_some());
+    }
+
+    /// 订单来源只能由调用方显式传入，不能从用户可填的 `client_ref` 猜测——
+    /// 手动面板把 `client_ref` 填成 "strategy" 也不能被误判为策略单。
+    #[test]
+    fn manual_order_with_strategy_client_ref_is_still_manual() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        let mut plan = ok_plan();
+        plan.client_ref = "strategy".into();
+        let _ = e.submit_manual(&plan, t0());
+
+        let entry_source = e
+            .snapshot()
+            .open_orders
+            .into_iter()
+            .find(|o| o.purpose == OrderPurpose::Entry)
+            .map(|o| o.source);
+        assert_eq!(entry_source, Some(Some(OrderSource::Manual)));
+
+        // 关闭自动化做市只应撤策略单，绝不能误撤这张手动单。
+        e.disable_auto_maker();
+        assert!(
+            e.snapshot()
+                .open_orders
+                .iter()
+                .any(|o| o.purpose == OrderPurpose::Entry),
+            "disable_auto_maker 不应撤掉手动单，即使 client_ref 是 \"strategy\""
+        );
+    }
+
+    /// 关闭自动化做市只应撤策略自己的在途单。
+    #[test]
+    fn disabling_cancels_strategy_order_only() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        e.configure_auto_maker(true, None).unwrap();
+        warm_range(&mut e, 60);
+        assert!(
+            e.snapshot()
+                .open_orders
+                .iter()
+                .any(|o| o.purpose == OrderPurpose::Entry),
+            "前置条件：应已挂出策略单"
+        );
+
+        e.disable_auto_maker();
+
+        assert!(
+            e.snapshot().open_orders.is_empty(),
+            "关闭后应撤掉策略在途单"
+        );
+        assert_eq!(e.auto_maker().status, AutoMakerStatus::Disabled);
+    }
+
+    /// 参数发生变化时应撤掉旧的策略在途单；参数不变时不应撤单。
+    #[test]
+    fn changing_params_cancels_strategy_order_same_params_do_not() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        e.configure_auto_maker(true, None).unwrap();
+        warm_range(&mut e, 60);
+        assert!(
+            e.snapshot()
+                .open_orders
+                .iter()
+                .any(|o| o.purpose == OrderPurpose::Entry)
+        );
+
+        // 用完全相同的参数重新配置不应撤单。
+        e.configure_auto_maker(true, Some(strategies::RangeMakerParams::default()))
+            .unwrap();
+        assert!(
+            e.snapshot()
+                .open_orders
+                .iter()
+                .any(|o| o.purpose == OrderPurpose::Entry),
+            "参数未变不应撤掉在途单"
+        );
+
+        // 参数确实变化时应撤掉旧单。
+        let changed = strategies::RangeMakerParams {
+            equity_pct: dec!(0.2),
+            ..strategies::RangeMakerParams::default()
+        };
+        e.configure_auto_maker(true, Some(changed)).unwrap();
+        assert!(
+            e.snapshot().open_orders.is_empty(),
+            "参数变化应撤掉旧的策略在途单"
+        );
+    }
+
+    /// 回看根数不能超过引擎 K 线窗口上限；拒绝时状态必须完全不变。
+    #[test]
+    fn lookback_over_window_cap_is_rejected_and_state_unchanged() {
+        let mut e = engine();
+        let params = strategies::RangeMakerParams {
+            lookback: 200,
+            ..strategies::RangeMakerParams::default()
+        };
+
+        let err = e
+            .configure_auto_maker(true, Some(params))
+            .expect_err("回看窗口超过上限应被拒绝");
+        assert!(err.contains("120"), "错误信息应提到窗口上限：{err}");
+
+        assert!(!e.auto_maker().enabled, "被拒绝时开关不应改变");
+        assert_eq!(
+            e.auto_maker().params,
+            strategies::RangeMakerParams::default(),
+            "被拒绝时参数不应改变"
+        );
+    }
+
+    /// 状态视图必须能区分"行情未连接"与"K 线预热中"。
+    #[test]
+    fn status_reports_feed_down_and_warming_up() {
+        let mut e = engine();
+        e.configure_auto_maker(true, None).unwrap();
+
+        assert_eq!(e.auto_maker().status, AutoMakerStatus::FeedDown);
+
+        e.set_feed_connected(true);
+        warm_range(&mut e, 10); // 远少于默认 lookback=60
+
+        match e.auto_maker().status {
+            AutoMakerStatus::WarmingUp { have, need } => {
+                assert_eq!(have, 10);
+                assert_eq!(need, 60);
+            }
+            other => panic!("应处于预热状态：{other:?}"),
+        }
+    }
+
+    /// 已有手动持仓或挂单时，自动化做市必须让位并如实报告原因。
+    #[test]
+    fn manual_pending_blocks_strategy_and_reports_yielding() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        e.configure_auto_maker(true, None).unwrap();
+
+        let plan = ok_plan();
+        assert!(matches!(
+            e.submit_manual(&plan, t0()),
+            SubmitOutcome::Accepted(_)
+        ));
+
+        let entries: Vec<_> = e
+            .snapshot()
+            .open_orders
+            .into_iter()
+            .filter(|o| o.purpose == OrderPurpose::Entry)
+            .collect();
+        assert_eq!(entries.len(), 1, "不应叠加策略挂单");
+        assert_eq!(entries[0].source, Some(OrderSource::Manual));
+        assert_eq!(e.auto_maker().status, AutoMakerStatus::YieldingToManual);
+    }
+
+    /// `cancel_pending_order` 必须校验 `client_id`：错误的 ID 应被拒绝，
+    /// 正确的 ID 应成功撤单并报告来源。
+    #[test]
+    fn cancel_pending_order_checks_client_id() {
+        let mut e = engine();
+        e.set_feed_connected(true);
+        let plan = ok_plan();
+        let _ = e.submit_manual(&plan, t0());
+
+        let err = e
+            .cancel_pending_order(Some("does-not-exist"))
+            .expect_err("不存在的 ID 应被拒绝");
+        assert!(!err.is_empty());
+
+        let real_id = e.snapshot().open_orders[0].client_id.clone();
+        let source = e
+            .cancel_pending_order(Some(&real_id))
+            .expect("正确的 ID 应成功撤单");
+        assert_eq!(source, Some(OrderSource::Manual));
+        assert!(e.snapshot().open_orders.is_empty());
     }
 }

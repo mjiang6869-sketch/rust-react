@@ -219,6 +219,7 @@ async fn state_payload(state: &Arc<AppState>) -> serde_json::Value {
     let snap = engine.snapshot();
     let (fill_model, optimism) = engine.fill_model_info();
     let inst = engine.instrument();
+    let auto_maker_view = engine.auto_maker();
 
     serde_json::json!({
         "mode": mode_tag(mode),
@@ -232,16 +233,7 @@ async fn state_payload(state: &Arc<AppState>) -> serde_json::Value {
             serde_json::to_value(dto).unwrap_or(serde_json::Value::Null)
         }),
         "open_orders": snap.open_orders.iter().map(|o| {
-            serde_json::json!({
-                "client_id": o.client_id,
-                "purpose": purpose_tag(o.purpose),
-                "purpose_label": purpose_label(o.purpose),
-                "side": side_tag(o.side),
-                "quantity": o.quantity.to_string(),
-                "limit_price": o.limit_price.to_string(),
-                "filled": o.filled.to_string(),
-                "state": o.state,
-            })
+            serde_json::to_value(order_dto(o)).unwrap_or(serde_json::Value::Null)
         }).collect::<Vec<_>>(),
         "feed_connected": snap.feed_connected,
         "feed_fresh": engine.feed_is_fresh(chrono::Utc::now()),
@@ -262,6 +254,8 @@ async fn state_payload(state: &Arc<AppState>) -> serde_json::Value {
             "fee_source": format!("{:?}", inst.fees.source),
             "fee_is_authoritative": inst.fees.source.is_authoritative(),
         },
+        "auto_maker": serde_json::to_value(auto_maker_dto(&auto_maker_view)).unwrap_or(serde_json::Value::Null),
+        "position_source": snap.position_source.map(|s| s.tag()),
     })
 }
 

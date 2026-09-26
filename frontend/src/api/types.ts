@@ -85,6 +85,9 @@ export interface PositionInfo {
   realized_pnl: string
 }
 
+/** 这张单是谁下的。`null` 只出现在数据不一致的边缘情形。 */
+export type OrderSource = 'MANUAL' | 'STRATEGY'
+
 export interface OrderInfo {
   client_id: string
   purpose: OrderPurpose
@@ -94,6 +97,12 @@ export interface OrderInfo {
   limit_price: string
   filled: string
   state: string
+  source: OrderSource | null
+  source_label: string | null
+  /** 是否可撤销（目前只有在途开仓单可撤）。 */
+  cancellable: boolean
+  /** 到期自动撤销的时刻（仅在途开仓单有值）。 */
+  expires_at: string | null
 }
 
 export interface SafetyInfo {
@@ -101,6 +110,50 @@ export interface SafetyInfo {
   user_stream_connected: boolean
   account_reconciled: boolean
   blocking_reasons: string[]
+}
+
+/** 自动化做市（区间做市策略）的运行状态标签。 */
+export type AutoMakerStatus =
+  | 'DISABLED'
+  | 'QUOTING'
+  | 'IN_POSITION'
+  | 'YIELDING_TO_MANUAL'
+  | 'FEED_DOWN'
+  | 'WARMING_UP'
+  | 'STANDING_DOWN'
+  | 'READY'
+
+/**
+ * 自动化做市的可编辑参数。
+ *
+ * 数值一律是字符串（与全局约束一致）；`side_mode` 是互斥的字符串常量。
+ */
+export interface AutoMakerParams {
+  lookback: string
+  take_profit_bp: string
+  stop_buffer_bp: string
+  side_mode: 'LONG_ONLY' | 'SHORT_ONLY'
+  equity_pct: string
+  leverage: string
+  valid_minutes: string
+}
+
+/** 自动化做市的开关、参数与运行状态。 */
+export interface AutoMakerState {
+  enabled: boolean
+  strategy_id: string
+  strategy_name: string
+  status: AutoMakerStatus
+  status_label: string
+  params: AutoMakerParams
+  warmup_have: number
+  warmup_need: number
+  max_lookback: number
+}
+
+/** `GET/PUT /api/v1/auto-maker` 的响应：运行状态 + 可编辑字段说明。 */
+export interface AutoMakerConfig extends AutoMakerState {
+  fields: ParameterInfo[]
 }
 
 export interface EngineState {
@@ -124,6 +177,10 @@ export interface EngineState {
   fill_model_optimism: string
   safety: SafetyInfo
   instrument: InstrumentInfo
+  /** 自动化做市（区间做市策略）的开关、参数与运行状态。 */
+  auto_maker: AutoMakerState
+  /** 当前持仓的来源（手动 / 自动化做市）；无持仓时为 `null`。 */
+  position_source: OrderSource | null
 }
 
 export interface ParameterInfo {
@@ -389,16 +446,6 @@ export interface BookSnapshotResponse {
   asks: BookLevel[]
 }
 
-export interface RecentTrade {
-  trade_id: number
-  price: string
-  quantity: string
-  /** 买方是挂单方，即**卖方主动**成交。 */
-  is_buyer_maker: boolean
-  /** 成交时刻（Unix 毫秒，字符串）。只用于比较，不做算术。 */
-  time: string
-}
-
 export interface StreamCandle extends RawCandle {
   /** 交易所事件时间，毫秒字符串。 */
   event_ms: string
@@ -433,8 +480,8 @@ export interface MarketFrame {
   /** 上游限流的剩余冷却毫秒数。0 表示没有冷却。 */
   cooldown_ms: number
   book: BookSnapshotResponse | null
-  /** 新的在前。 */
-  trades: RecentTrade[]
+  /** 最新一笔成交的价格。连上后还没有任何成交时为 `null`——不用 REST 补底。 */
+  last_price: string | null
 }
 
 /** 图表支持的周期。与后端 `Interval` 一一对应。 */

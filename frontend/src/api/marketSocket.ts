@@ -177,7 +177,8 @@ function isMarketFrame(v: unknown): v is MarketFrame {
     v !== null &&
     (v as { type?: unknown }).type === 'market' &&
     typeof (v as { symbol?: unknown }).symbol === 'string' &&
-    Array.isArray((v as { trades?: unknown }).trades)
+    (typeof (v as { last_price?: unknown }).last_price === 'string' ||
+      (v as { last_price?: unknown }).last_price === null)
   )
 }
 

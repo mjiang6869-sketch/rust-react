@@ -23,4 +23,7 @@
 
 pub mod paper;
 
-pub use paper::{EngineConfig, EngineEvent, EngineSnapshot, PaperEngine, SubmitOutcome};
+pub use paper::{
+    AutoMakerStatus, AutoMakerView, EngineConfig, EngineEvent, EngineSnapshot, OrderSnapshot,
+    OrderSource, PaperEngine, SubmitOutcome,
+};

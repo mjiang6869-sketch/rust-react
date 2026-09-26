@@ -1,4 +1,4 @@
-//! 盘口与成交流的浏览器推送：`GET /api/v1/market/stream?symbol=ETHUSDC`。
+//! 盘口与最新价的浏览器推送：`GET /api/v1/market/stream?symbol=ETHUSDC`。
 //!
 //! # 为什么不复用 `/api/v1/ws`
 //!
@@ -10,13 +10,14 @@
 //!
 //! 上游盘口每 250ms 一帧，活跃交易对的成交每秒几十笔。每变一次就推一次会让
 //! 浏览器每秒重渲染几十次。这里最多每 [`PUSH_INTERVAL`] 推一次**最新的完整
-//! 视图**（盘口 + 最近成交），中间的变化合并掉——看盘只关心最新值。
+//! 视图**（盘口 + 最新价），中间的变化合并掉——看盘只关心最新值。
 //!
 //! # 开屏数据
 //!
-//! 推送只带连上之后的成交。视图里成交不满时，用 REST 补一次底（走共享缓存与
-//! 冷却，冷却期内直接跳过）。一个交易对的成交流满了之后，再开多少个标签页
-//! 都不会再打 REST。
+//! 不用 REST 补底：最新价只来自推送里的成交流。连上之前没有任何成交时，
+//! `last_price` 为 `null`；第一笔成交到达后才有值。冷门交易对可能要等一会
+//! 才看到第一个价——这是刻意的：REST 成交接口权重 20，是全项目最贵的公开
+//! 接口，为了「开屏立刻有个数」而打这条 REST 不值得。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,11 +27,11 @@ use axum::extract::ws::{
 };
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
-use exchange::{Interval, LinkState, MarketStreams, MarketView, RECENT_TRADES_CAP, StreamKind};
+use exchange::{Interval, LinkState, MarketStreams, MarketView, StreamKind};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::dto::{ApiError, BookDto, CandleDto, TradeDto, validate_symbol};
+use crate::dto::{ApiError, BookDto, CandleDto, validate_symbol};
 use crate::state::AppState;
 
 /// 向浏览器推送的最短间隔。
@@ -77,8 +78,10 @@ struct MarketFrame {
     /// 上游限流的剩余冷却毫秒数。0 表示没有冷却。
     cooldown_ms: u64,
     book: Option<BookDto>,
-    /// 新的在前。
-    trades: Vec<TradeDto>,
+    /// 最新一笔成交的价格。连上之后还没有任何成交时为 `null`——不用 REST
+    /// 补底（见模块文档「开屏数据」）。
+    #[serde(with = "rust_decimal::serde::str_option")]
+    last_price: Option<rust_decimal::Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     kline: Option<KlineFrame>,
 }
@@ -135,7 +138,7 @@ impl MarketFrame {
             notice: (!notices.is_empty()).then(|| notices.join("；")),
             cooldown_ms,
             book: v.book.clone().map(|b| BookDto::from_snapshot(symbol, b)),
-            trades: v.trades.iter().map(TradeDto::from_trade).collect(),
+            last_price: v.trades.front().map(|t| t.price.get()),
             kline: None,
         }
     }
@@ -183,10 +186,6 @@ async fn serve(
     let (mut sender, mut receiver) = socket.split();
     let mut rx = streams.subscribe(&symbol);
     let mut kline_rx = interval.map(|iv| streams.subscribe_klines(&symbol, iv));
-
-    if rx.borrow().trades.len() < RECENT_TRADES_CAP {
-        tokio::spawn(seed_trades(state.clone(), streams.clone(), symbol.clone()));
-    }
 
     let mut tick = tokio::time::interval(PUSH_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -254,19 +253,6 @@ async fn send(
     sender.send(Message::Text(text.into())).await
 }
 
-/// 用 REST 给成交流补底。失败只记日志：推送会自己把成交流填满。
-async fn seed_trades(state: Arc<AppState>, streams: MarketStreams, symbol: String) {
-    let Some(client) = state.market() else {
-        return;
-    };
-    // 冷却期内客户端本身会直接拒绝，不会发出请求。
-    let limit = u32::try_from(RECENT_TRADES_CAP).unwrap_or(30);
-    match client.recent_trades(&symbol, limit).await {
-        Ok(trades) => streams.seed_trades(&symbol, trades),
-        Err(e) => tracing::info!(symbol, "成交流补底未完成，等待推送填充：{e}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,8 +294,7 @@ mod tests {
         assert!(j["notice"].is_null());
         // 与 REST 的 `BookDto` 同一套序列化：保留小数位，(100 + 101) / 2 = "100.50"
         assert_eq!(j["book"]["mid"], "100.50");
-        assert_eq!(j["trades"][0]["price"], "100.5");
-        assert_eq!(j["trades"][0]["trade_id"], 7);
+        assert_eq!(j["last_price"], "100.5");
     }
 
     /// 上游不在线时，帧里必须带着原因——界面要说清为什么不是实时的。
@@ -336,6 +321,14 @@ mod tests {
         let frame = MarketFrame::from_view("ETHUSDC", &MarketView::default(), 0);
         assert!(!frame.live);
         assert!(frame.connecting);
+    }
+
+    /// 还没有任何成交到达时，最新价必须是 `null`——不用 REST 补一个假值。
+    #[test]
+    fn last_price_is_null_before_first_trade() {
+        let frame = MarketFrame::from_view("ETHUSDC", &MarketView::default(), 0);
+        let j = serde_json::to_value(ServerMessage::Market(Box::new(frame))).unwrap();
+        assert!(j["last_price"].is_null());
     }
 
     #[test]

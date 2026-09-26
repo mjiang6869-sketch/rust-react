@@ -40,6 +40,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/manual/submit", post(submit_manual))
         .route("/api/v1/manual/cancel-pending", post(cancel_pending))
         .route("/api/v1/manual/close", post(close_position))
+        // ---- 自动化做市 ----
+        .route(
+            "/api/v1/auto-maker",
+            get(crate::auto_maker::get).put(crate::auto_maker::put),
+        )
         // ---- 订单与历史 ----
         .route("/api/v1/orders", get(list_orders))
         .route("/api/v1/fills", get(list_fills))
@@ -47,10 +52,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // ---- 回测 ----
         .route("/api/v1/backtest", post(run_backtest))
         .route("/api/v1/backtests", get(list_backtests))
-        // ---- 行情（图表、盘口、成交流）----
+        // ---- 行情（图表、盘口、推送）----
         .route("/api/v1/market/klines", get(market_klines))
         .route("/api/v1/market/book", get(market_book))
-        .route("/api/v1/market/trades", get(market_trades))
         .route("/api/v1/market/stream", get(crate::market_stream::handler))
         // ---- 数据管理 ----
         .route("/api/v1/data/coverage", get(data_coverage))
@@ -123,6 +127,7 @@ async fn get_state(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     };
 
     let inst = engine.instrument();
+    let auto_maker_view = engine.auto_maker();
     let dto = StateDto {
         mode: mode_tag(mode),
         mode_label: mode_label(mode),
@@ -133,20 +138,7 @@ async fn get_state(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         unrealized_pnl: snap.unrealized_pnl.to_string(),
         total_fees: engine.total_fees().to_string(),
         position: snap.position.as_ref().map(position_dto),
-        open_orders: snap
-            .open_orders
-            .iter()
-            .map(|o| OrderDto {
-                client_id: o.client_id.clone(),
-                purpose: purpose_tag(o.purpose),
-                purpose_label: purpose_label(o.purpose),
-                side: side_tag(o.side),
-                quantity: o.quantity.to_string(),
-                limit_price: o.limit_price.to_string(),
-                filled: o.filled.to_string(),
-                state: o.state.to_string(),
-            })
-            .collect(),
+        open_orders: snap.open_orders.iter().map(order_dto).collect(),
         feed_connected: snap.feed_connected,
         feed_fresh: engine.feed_is_fresh(chrono::Utc::now()),
         last_event_at: snap.last_event_at,
@@ -184,6 +176,8 @@ async fn get_state(State(s): State<Arc<AppState>>) -> impl IntoResponse {
             },
             fee_is_authoritative: inst.fees.source.is_authoritative(),
         },
+        auto_maker: auto_maker_dto(&auto_maker_view),
+        position_source: snap.position_source.map(|s| s.tag()),
     };
 
     Json(ApiResponse::ok(dto))
@@ -286,12 +280,24 @@ async fn submit_manual(
     }
 }
 
-async fn cancel_pending(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+#[derive(Debug, Deserialize)]
+struct CancelPendingQuery {
+    /// 指定要撤的订单 ID。省略时撤当前在途单（不校验 ID），与旧行为一致。
+    client_id: Option<String>,
+}
+
+async fn cancel_pending(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<CancelPendingQuery>,
+) -> Result<impl IntoResponse, ApiError> {
     let mut engine = s.engine.lock().await;
-    let cancelled = engine.cancel_pending();
-    Json(ApiResponse::ok(
-        serde_json::json!({ "cancelled": cancelled }),
-    ))
+    let source = engine
+        .cancel_pending_order(q.client_id.as_deref())
+        .map_err(ApiError::Conflict)?;
+    Ok(Json(ApiResponse::ok(serde_json::json!({
+        "cancelled": source.is_some(),
+        "source": source.map(|s| s.tag()),
+    }))))
 }
 
 async fn close_position(State(s): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
@@ -492,7 +498,9 @@ async fn list_backtests(
 // # 为什么走 REST 而不是 WebSocket
 //
 // 画一张图需要几百根历史 K 线，WebSocket 只推增量——先 REST 取种子，再 WS
-// 接增量是唯一可行的顺序。这里的三个接口负责「种子」那一半。
+// 接增量是唯一可行的顺序。这里的两个接口负责「种子」那一半。最新价不需要
+// 这道种子：它直接来自推送里的成交流（见 `market_stream.rs`），不再有专门
+// 的 REST 接口。
 //
 // # 数据来源的边界
 //
@@ -571,27 +579,6 @@ async fn market_book(
         .map_err(|e| market_error("拉取盘口失败", e))?;
 
     Ok(Json(ApiResponse::ok(BookDto::from_snapshot(&symbol, book))))
-}
-
-async fn market_trades(
-    State(s): State<Arc<AppState>>,
-    Query(q): Query<BookQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    let symbol = validate_symbol(q.symbol.as_deref().unwrap_or(&s.symbol()))?;
-    let limit = q.limit.unwrap_or(50).clamp(1, 500);
-
-    let client = s
-        .market()
-        .ok_or_else(|| ApiError::Internal("行情客户端不可用".into()))?;
-
-    let trades = client
-        .recent_trades(&symbol, limit)
-        .await
-        .map_err(|e| market_error("拉取成交流失败", e))?;
-
-    // 币安返回按时间升序，界面成交流最新的在最上面，所以反转
-    let list: Vec<TradeDto> = trades.iter().rev().map(TradeDto::from_trade).collect();
-    Ok(Json(ApiResponse::ok(list)))
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +783,7 @@ mod tests {
             "/api/v1/manual/submit",
             "/api/v1/manual/cancel-pending",
             "/api/v1/manual/close",
+            "/api/v1/auto-maker",
             "/api/v1/orders",
             "/api/v1/fills",
             "/api/v1/pnl",
@@ -803,7 +791,6 @@ mod tests {
             "/api/v1/backtests",
             "/api/v1/market/klines",
             "/api/v1/market/book",
-            "/api/v1/market/trades",
             "/api/v1/market/stream",
             "/api/v1/data/coverage",
             "/api/v1/data/download",

@@ -12,7 +12,9 @@ use std::sync::Arc;
 use api::AppState;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use domain::{ContractKind, FeeSchedule, FeeSource, Instrument, Precision, RiskLimits};
+use domain::{
+    ContractKind, FeeSchedule, FeeSource, Instrument, Precision, RiskLimits, ServiceMode,
+};
 use engine::{EngineConfig, PaperEngine};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -105,6 +107,31 @@ async fn post_json_with_key(
     let res = app
         .oneshot(
             builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .expect("构造请求"),
+        )
+        .await
+        .expect("服务调用");
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("读取响应");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+async fn put_json(
+    state: &Arc<AppState>,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let app = api::router(state.clone());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header("Content-Type", "application/json")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .expect("构造请求"),
         )
@@ -421,6 +448,256 @@ async fn close_without_position_is_conflict() {
     );
 }
 
+/// 手动下的在途开仓单必须在状态里标记来源与可撤销——界面靠这两个字段
+/// 决定要不要显示撤单按钮，以及区分这是手动单还是自动化做市挂的单。
+#[tokio::test]
+async fn manual_open_order_is_tagged_manual_and_cancellable() {
+    let s = test_state();
+    let (_, body) = post_json_with_key(&s, "/api/v1/manual/submit", valid_plan(), Some("k1")).await;
+    assert_eq!(body["data"]["accepted"], true, "{body}");
+
+    let (_, state) = get(&s, "/api/v1/state").await;
+    let orders = state["data"]["open_orders"].as_array().unwrap();
+    assert_eq!(orders.len(), 1, "{orders:?}");
+    let order = &orders[0];
+    assert_eq!(order["purpose"], "ENTRY");
+    assert_eq!(order["source"], "MANUAL");
+    assert_eq!(order["cancellable"], true, "{order}");
+}
+
+/// 撤单必须支持按 `client_id` 精确撤销：错误的 ID 应是冲突（409），
+/// 正确的 ID 应成功并回显来源。
+#[tokio::test]
+async fn cancel_pending_by_client_id() {
+    let s = test_state();
+    let (_, body) = post_json_with_key(&s, "/api/v1/manual/submit", valid_plan(), Some("k1")).await;
+    assert_eq!(body["data"]["accepted"], true, "{body}");
+
+    let (_, state) = get(&s, "/api/v1/state").await;
+    let client_id = state["data"]["open_orders"][0]["client_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = post_json(
+        &s,
+        "/api/v1/manual/cancel-pending?client_id=nope",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let (status, body) = post_json(
+        &s,
+        &format!("/api/v1/manual/cancel-pending?client_id={client_id}"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["cancelled"], true);
+    assert_eq!(body["data"]["source"], "MANUAL");
+}
+
+// ---------------------------------------------------------------------------
+// 自动化做市
+// ---------------------------------------------------------------------------
+
+/// 一份合法的白名单参数，供各测试按需覆盖单个字段。
+fn default_auto_maker_params() -> serde_json::Value {
+    serde_json::json!({
+        "lookback": "60",
+        "take_profit_bp": "4",
+        "stop_buffer_bp": "2",
+        "side_mode": "LONG_ONLY",
+        "equity_pct": "0.1",
+        "leverage": "3",
+        "valid_minutes": "2",
+    })
+}
+
+/// 路由必须真的注册：GET 200、非法 PUT 400，两者都不能是 404。
+#[tokio::test]
+async fn auto_maker_routes_are_registered() {
+    let s = test_state();
+
+    let (status, body) = get(&s, "/api/v1/auto-maker").await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "bogus": true }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+    // `Json2` 保留 axum 对该请求体的原始判定：字段不匹配是
+    // `JsonRejection::JsonDataError`，映射到 422（语法合法但语义不对），
+    // 不是语法错误的 400——这与仓库里其它端点的既有行为一致。
+    assert!(status.is_client_error(), "{body}");
+}
+
+/// 默认必须是关闭状态，且带上文档化的可编辑字段说明。
+#[tokio::test]
+async fn auto_maker_default_is_disabled_with_documented_fields() {
+    let s = test_state();
+    let (status, body) = get(&s, "/api/v1/auto-maker").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let d = &body["data"];
+    assert_eq!(d["enabled"], false);
+    assert_eq!(d["status"], "DISABLED");
+    assert!(
+        d["status_label"].as_str().unwrap().contains("未启用"),
+        "{d}"
+    );
+
+    let fields = d["fields"].as_array().unwrap();
+    assert!(!fields.is_empty(), "可编辑字段说明不能为空");
+    let equity_pct = fields
+        .iter()
+        .find(|f| f["key"] == "equity_pct")
+        .expect("应有 equity_pct 字段说明");
+    assert_eq!(
+        equity_pct["display_as_percent"], true,
+        "仓位比例是百分比，前端要乘 100 显示"
+    );
+
+    assert_eq!(d["params"]["lookback"], "60", "默认回看根数");
+}
+
+/// 非法的 `lookback` 必须报错，且指出是哪个字段。
+#[tokio::test]
+async fn auto_maker_put_rejects_non_numeric_lookback() {
+    let s = test_state();
+    let mut params = default_auto_maker_params();
+    params["lookback"] = serde_json::json!("abc");
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "enabled": true, "params": params }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("lookback"),
+        "{body}"
+    );
+}
+
+/// 越界的 `take_profit_bp` 由引擎的 `RangeMakerParams::validate` 拒绝，
+/// 错误消息必须用面向用户的中文标签（"止盈距离"），不是内部字段名。
+#[tokio::test]
+async fn auto_maker_put_rejects_out_of_range_take_profit_bp() {
+    let s = test_state();
+    let mut params = default_auto_maker_params();
+    params["take_profit_bp"] = serde_json::json!("60");
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "enabled": true, "params": params }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("止盈距离"),
+        "{body}"
+    );
+}
+
+/// `lookback` 即便落在策略自身的范围内，也不能超过引擎的 K 线窗口上限
+/// （测试引擎配置的是 120 根）——否则策略会引用一段引擎根本没留着的历史。
+#[tokio::test]
+async fn auto_maker_put_rejects_lookback_over_engine_window() {
+    let s = test_state();
+    let mut params = default_auto_maker_params();
+    params["lookback"] = serde_json::json!("200");
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "enabled": true, "params": params }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("120"), "{body}");
+}
+
+/// 白名单之外的字段必须被拒绝，不能被静默忽略。
+#[tokio::test]
+async fn auto_maker_put_rejects_unknown_param_field() {
+    let s = test_state();
+    let mut params = default_auto_maker_params();
+    params["trailing_bp"] = serde_json::json!("10");
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "enabled": true, "params": params }),
+    )
+    .await;
+    // 未知字段属于结构性错误（`JsonRejection::JsonDataError`），axum 判定为
+    // 422，不是 400——见 `auto_maker_routes_are_registered` 的说明。
+    assert!(status.is_client_error(), "{body}");
+}
+
+/// 合法启用后 `/api/v1/state` 必须能看到 `auto_maker.enabled = true`；
+/// 随后关闭也必须成功。
+#[tokio::test]
+async fn auto_maker_can_be_enabled_and_disabled() {
+    let s = test_state();
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "enabled": true, "params": default_auto_maker_params() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["enabled"], true);
+
+    let (_, state) = get(&s, "/api/v1/state").await;
+    assert_eq!(state["data"]["auto_maker"]["enabled"], true, "{state}");
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["enabled"], false);
+}
+
+/// 实盘模式下：GET 必须显示未启用，PUT 启用必须被拒绝（409），
+/// PUT 关闭必须始终成功（关闭没有前提条件）。
+#[tokio::test]
+async fn auto_maker_cannot_be_enabled_in_live_mode() {
+    let s = test_state();
+    s.set_mode(ServiceMode::Live).await;
+
+    let (_, body) = get(&s, "/api/v1/auto-maker").await;
+    assert_eq!(body["data"]["enabled"], false);
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "enabled": true, "params": default_auto_maker_params() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let (status, body) = put_json(
+        &s,
+        "/api/v1/auto-maker",
+        serde_json::json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 // ---------------------------------------------------------------------------
 // 安全闸门
 // ---------------------------------------------------------------------------
@@ -584,7 +861,6 @@ async fn market_routes_are_registered() {
     for path in [
         "/api/v1/market/klines?symbol=%21%21&interval=1m",
         "/api/v1/market/book?symbol=%21%21",
-        "/api/v1/market/trades?symbol=%21%21",
         // 推送路由在升级为 WebSocket **之前**校验交易对，所以普通 GET 也能
         // 拿到 400——证明它注册了，且非法交易对到不了上游 URL。
         "/api/v1/market/stream?symbol=%21%21",

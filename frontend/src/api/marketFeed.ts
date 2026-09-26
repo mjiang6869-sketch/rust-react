@@ -2,8 +2,8 @@
 //
 // # 为什么从轮询改成推送（事故复盘）
 //
-// 之前这里每秒轮询一次 `/market/book` 与 `/market/trades`。后者对应币安
-// `/fapi/v1/aggTrades`，权重 20——光它一项每分钟 1200 权重。一个标签页合计
+// 之前这里每秒轮询一次 `/market/book` 与最近成交（对应币安
+// `/fapi/v1/aggTrades`），后者权重 20——光它一项每分钟 1200 权重。一个标签页合计
 // 约 1380 权重/分钟；切一次标签页多一条定时器链（见 `poller.ts` 文件头），
 // 就到了约 2760，越过 2400 的按 IP 上限 → 429 → 继续打 → 418 封禁 20 分钟。
 //
@@ -29,14 +29,15 @@ import { useEffect, useState } from 'react'
 import { ApiError } from './client'
 import { armCooldown } from './cooldown'
 import { browserDeps, createMarketSocket, marketStreamUrl } from './marketSocket'
-import type { BookSnapshotResponse, KlineFrame, RecentTrade } from './types'
+import type { BookSnapshotResponse, KlineFrame } from './types'
 
 
 export interface MarketFeed {
   kline: KlineFrame | null
   disconnected: boolean
   book: BookSnapshotResponse | null
-  trades: RecentTrade[]
+  /** 最新价，来自推送帧的 `last_price`。连上后还没有任何成交时为 `null`。 */
+  lastPrice: string | null
   /**
    * 为什么当前不是实时的。`null` 表示正常。
    *
@@ -58,7 +59,7 @@ export interface MarketFeed {
 }
 
 /**
- * 订阅盘口与最近成交。
+ * 订阅盘口与最新价。
  *
  * `enabled` 为 false 时不连接——页面切到「数据管理」时没必要占着推送。
  */
@@ -66,7 +67,7 @@ export function useMarketFeed(symbol: string, enabled: boolean, interval?: strin
   const [kline, setKline] = useState<KlineFrame | null>(null)
   const [disconnected, setDisconnected] = useState(false)
   const [book, setBook] = useState<BookSnapshotResponse | null>(null)
-  const [trades, setTrades] = useState<RecentTrade[]>([])
+  const [lastPrice, setLastPrice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [source, setSource] = useState<string | null>(null)
@@ -82,7 +83,7 @@ export function useMarketFeed(symbol: string, enabled: boolean, interval?: strin
     setKline(null)
     setDisconnected(false)
     setBook(null)
-    setTrades([])
+    setLastPrice(null)
     setError(null)
     setUpdatedAt(null)
 
@@ -94,7 +95,7 @@ export function useMarketFeed(symbol: string, enabled: boolean, interval?: strin
         setKline(frame.kline ?? null)
         setDisconnected(false)
         setBook(frame.book)
-        setTrades(frame.trades)
+        setLastPrice(frame.last_price)
         setSource(frame.source)
         // 刚打开页面时上游还在握手：盘口面板自己会显示"暂无盘口数据"，
         // 这时弹红色告警只会让每次打开页面都像出了故障。
@@ -137,7 +138,7 @@ export function useMarketFeed(symbol: string, enabled: boolean, interval?: strin
 
   const cooldownMs = cooldownUntil > 0 ? Math.max(0, cooldownUntil - Date.now()) : 0
 
-  return { book, trades, error, updatedAt, cooldownMs, source, kline, disconnected }
+  return { book, lastPrice, error, updatedAt, cooldownMs, source, kline, disconnected }
 }
 
 /**

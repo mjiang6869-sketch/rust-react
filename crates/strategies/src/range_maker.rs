@@ -101,37 +101,13 @@ impl RangeMakerParams {
     pub fn bp_to_ratio(bp: Decimal) -> Decimal {
         bp / Decimal::from(10_000)
     }
-}
 
-/// 区间做市策略。
-pub struct RangeMaker {
-    pub params: RangeMakerParams,
-}
-
-impl RangeMaker {
-    pub fn new(params: RangeMakerParams) -> Self {
-        Self { params }
-    }
-
-    pub fn with_defaults() -> Self {
-        Self::new(RangeMakerParams::default())
-    }
-}
-
-impl Strategy for RangeMaker {
-    fn id(&self) -> &'static str {
-        "range_maker"
-    }
-
-    fn name(&self) -> &'static str {
-        "区间做市"
-    }
-
-    fn warmup_candles(&self) -> usize {
-        self.params.lookback
-    }
-
-    fn parameters(&self) -> Vec<ParameterSpec> {
+    /// 参数规格：这是本策略参数合法性的**唯一规则来源**。
+    ///
+    /// engine 与 api 校验参数时都应调用 [`RangeMakerParams::validate`]（它遍历
+    /// 这里的规格逐项检查），而不是各自重新写一份范围判断——避免出现"前端
+    /// 允许而引擎拒绝"或反过来的分裂。
+    pub fn specs() -> Vec<ParameterSpec> {
         vec![
             ParameterSpec {
                 key: "lookback".into(),
@@ -207,6 +183,101 @@ impl Strategy for RangeMaker {
                 max: Decimal::from(100),
             },
         ]
+    }
+
+    /// 按规格的 key 取出对应字段的数值（整数字段转换为 `Decimal`）。
+    ///
+    /// 只服务于 [`RangeMakerParams::validate`]；不在 [`RangeMakerParams::specs`]
+    /// 里的字段（例如 `side_mode`、`break_even` 等非数值/未受限参数）不需要
+    /// 出现在这里。
+    fn numeric_value(&self, key: &str) -> Option<Decimal> {
+        match key {
+            "lookback" => Some(Decimal::from(self.lookback)),
+            "take_profit_bp" => Some(self.take_profit_bp),
+            "stop_buffer_bp" => Some(self.stop_buffer_bp),
+            "equity_pct" => Some(self.equity_pct),
+            "leverage" => Some(self.leverage),
+            "valid_minutes" => Some(Decimal::from(self.valid_minutes)),
+            "trailing_bp" => Some(self.trailing_bp),
+            _ => None,
+        }
+    }
+
+    /// 校验参数是否落在 [`RangeMakerParams::specs`] 声明的合法范围内。
+    ///
+    /// 这是参数合法性检查的唯一入口——engine 与 api 都应调用它，而不是自己
+    /// 重新判断某个参数的上下限。
+    pub fn validate(&self) -> Result<(), String> {
+        fn fmt_dec(d: Decimal) -> String {
+            d.normalize().to_string()
+        }
+
+        for spec in Self::specs() {
+            let value = self.numeric_value(&spec.key).ok_or_else(|| {
+                format!("内部错误：参数「{}」缺少数值读取实现，无法校验", spec.label)
+            })?;
+            if value < spec.min || value > spec.max {
+                let is_percent = spec.unit.as_deref() == Some("%");
+                let (range_desc, value_desc) = if is_percent {
+                    let hundred = Decimal::from(100);
+                    (
+                        format!(
+                            "{}%–{}%",
+                            fmt_dec(spec.min * hundred),
+                            fmt_dec(spec.max * hundred)
+                        ),
+                        format!("{}%", fmt_dec(value * hundred)),
+                    )
+                } else {
+                    let unit_suffix = match spec.unit.as_deref() {
+                        Some(unit) if !unit.is_empty() => format!(" {unit}"),
+                        _ => String::new(),
+                    };
+                    (
+                        format!("{}–{}{}", fmt_dec(spec.min), fmt_dec(spec.max), unit_suffix),
+                        fmt_dec(value),
+                    )
+                };
+                return Err(format!(
+                    "参数「{}」须在 {}之间，收到 {}",
+                    spec.label, range_desc, value_desc
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 区间做市策略。
+pub struct RangeMaker {
+    pub params: RangeMakerParams,
+}
+
+impl RangeMaker {
+    pub fn new(params: RangeMakerParams) -> Self {
+        Self { params }
+    }
+
+    pub fn with_defaults() -> Self {
+        Self::new(RangeMakerParams::default())
+    }
+}
+
+impl Strategy for RangeMaker {
+    fn id(&self) -> &'static str {
+        "range_maker"
+    }
+
+    fn name(&self) -> &'static str {
+        "区间做市"
+    }
+
+    fn warmup_candles(&self) -> usize {
+        self.params.lookback
+    }
+
+    fn parameters(&self) -> Vec<ParameterSpec> {
+        RangeMakerParams::specs()
     }
 
     fn evaluate(&self, view: &MarketView<'_>) -> Option<StrategyIntent> {
@@ -720,5 +791,133 @@ mod tests {
                 p.key
             );
         }
+    }
+
+    /// 把某个规格 key 对应的字段设为给定的 `Decimal` 值。整数字段做类型转换。
+    fn set_numeric(p: &mut RangeMakerParams, key: &str, v: Decimal) {
+        use rust_decimal::prelude::ToPrimitive;
+        match key {
+            "lookback" => {
+                p.lookback = v
+                    .to_usize()
+                    .unwrap_or_else(|| panic!("lookback 测试值 {v} 无法转换为 usize"))
+            }
+            "take_profit_bp" => p.take_profit_bp = v,
+            "stop_buffer_bp" => p.stop_buffer_bp = v,
+            "equity_pct" => p.equity_pct = v,
+            "leverage" => p.leverage = v,
+            "valid_minutes" => {
+                p.valid_minutes = v
+                    .to_i64()
+                    .unwrap_or_else(|| panic!("valid_minutes 测试值 {v} 无法转换为 i64"))
+            }
+            "trailing_bp" => p.trailing_bp = v,
+            other => panic!("测试辅助函数 set_numeric 不认识参数 key: {other}"),
+        }
+    }
+
+    /// 越界扰动步长：整数型字段用 1，其余用一个足以跨越边界的小数步长。
+    fn perturb_step(key: &str) -> Decimal {
+        match key {
+            "lookback" | "valid_minutes" => Decimal::ONE,
+            "equity_pct" => dec!(0.0001),
+            _ => dec!(0.1),
+        }
+    }
+
+    /// 默认参数必须通过校验——否则新用户一上来就会被拒。
+    #[test]
+    fn default_params_pass_validation() {
+        assert!(RangeMakerParams::default().validate().is_ok());
+    }
+
+    /// 表驱动：每个规格字段在 min/max 边界上应通过，越界一点点应失败，
+    /// 且错误文案要点名是哪个参数（用 label）。
+    #[test]
+    fn boundary_values_validate_per_spec() {
+        for spec in RangeMakerParams::specs() {
+            let step = perturb_step(&spec.key);
+
+            let mut at_min = RangeMakerParams::default();
+            set_numeric(&mut at_min, &spec.key, spec.min);
+            assert!(
+                at_min.validate().is_ok(),
+                "参数 {} 取最小值 {} 应通过校验",
+                spec.key,
+                spec.min
+            );
+
+            let mut at_max = RangeMakerParams::default();
+            set_numeric(&mut at_max, &spec.key, spec.max);
+            assert!(
+                at_max.validate().is_ok(),
+                "参数 {} 取最大值 {} 应通过校验",
+                spec.key,
+                spec.max
+            );
+
+            let mut below_min = RangeMakerParams::default();
+            set_numeric(&mut below_min, &spec.key, spec.min - step);
+            let err = below_min
+                .validate()
+                .expect_err(&format!("参数 {} 低于最小值应校验失败", spec.key));
+            assert!(
+                err.contains(&spec.label),
+                "错误文案应包含标签「{}」：{err}",
+                spec.label
+            );
+
+            let mut above_max = RangeMakerParams::default();
+            set_numeric(&mut above_max, &spec.key, spec.max + step);
+            let err = above_max
+                .validate()
+                .expect_err(&format!("参数 {} 高于最大值应校验失败", spec.key));
+            assert!(
+                err.contains(&spec.label),
+                "错误文案应包含标签「{}」：{err}",
+                spec.label
+            );
+        }
+    }
+
+    /// 百分比参数越界时，错误文案应带 % 号，用比例本身（0.15）会让用户看不懂。
+    #[test]
+    fn percent_parameter_out_of_range_message_contains_percent_sign() {
+        let p = RangeMakerParams {
+            equity_pct: dec!(1.5), // 150%，超出上限 100%
+            ..Default::default()
+        };
+        let err = p.validate().expect_err("超出范围应返回错误");
+        assert!(err.contains('%'), "百分比参数越界的错误文案应包含 %：{err}");
+    }
+
+    /// specs() 里声明的每个 key 都必须能通过 numeric_value 取到值，否则
+    /// validate() 会把内部实现缺口误报成参数越界。
+    #[test]
+    fn numeric_value_resolves_every_spec_key() {
+        let p = RangeMakerParams::default();
+        for spec in RangeMakerParams::specs() {
+            assert!(
+                p.numeric_value(&spec.key).is_some(),
+                "参数 {} 应能通过 numeric_value 取到数值",
+                spec.key
+            );
+        }
+    }
+
+    /// `RangeMaker::parameters()` 与 `RangeMakerParams::specs()` 必须是同一份
+    /// key 列表——前者只是后者的委托，不能各自维护一套。
+    #[test]
+    fn range_maker_parameters_match_specs_keys() {
+        let strategy_keys: Vec<String> = RangeMaker::with_defaults()
+            .parameters()
+            .into_iter()
+            .map(|p| p.key)
+            .collect();
+        let spec_keys: Vec<String> = RangeMakerParams::specs()
+            .into_iter()
+            .map(|p| p.key)
+            .collect();
+        assert_eq!(strategy_keys, spec_keys);
     }
 }

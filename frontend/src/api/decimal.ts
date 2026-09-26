@@ -168,6 +168,16 @@ export function mulStr(a: string, b: string): string {
   return format(mul(parse(a), parse(b)))
 }
 
+/**
+ * 百分数字符串 → 比例字符串。`toPercent` 的逆运算：`'10'` → `'0.1'`。
+ *
+ * 用于把用户在界面上输入的百分数（例如仓位比例 10%）换算回后端存储的
+ * 比例形式，仍走整数除法，不经过浮点。
+ */
+export function fromPercent(s: string, scale = 8): string {
+  return format(div(parse(s), parse('100'), scale))
+}
+
 /** 字符串比较。 */
 export function cmpStr(a: string, b: string): -1 | 0 | 1 {
   return cmp(parse(a), parse(b))
