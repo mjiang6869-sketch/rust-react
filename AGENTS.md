@@ -128,6 +128,25 @@ cargo tree -p domain | grep -E 'tokio|reqwest|duckdb|axum'   # 必须无输出
 两条通路的覆盖区间不同，所以行情接口的响应必须带 `source` 字段，界面必须
 把它显示出来——不显示的话用户会以为图表覆盖的区间就是回测覆盖的区间。
 
+### 币安接入：能用 WS 就不用 REST
+
+REST 按 IP 计权重（USDⓈ-M 上限约 2400/分钟），超限返回 429，继续请求会升级
+成 418 封禁——所以**新增或改造币安接入时默认选 WebSocket**，REST 只留给 WS
+做不到的事：
+
+- **公开行情**：实时 K 线、盘口、成交流一律走推送（`exchange::stream`）；REST
+  仅用于历史 K 线初始化、缺口补齐、`exchangeInfo` 这类一次性或历史查询。
+  **禁止用 REST 轮询代替推送。**
+- **账户与订单**：用户数据流走 WS（listenKey）；下单、撤单、查询先评估币安的
+  请求-响应式 WebSocket API（USDⓈ-M 有 `ws-fapi` 通道，端点、方法与频率限制
+  以官方文档为准）；仍走 REST 的调用必须复用冷却闸门（`exchange::cooldown`）
+  与共享缓存，不得在循环里无间隔请求。
+- 每个新 REST 调用点先问一句「币安有没有推送或 WS API 的等价能力？」，有就用；
+  确实只能用 REST 的，在代码附近写明为什么。
+- 推送连接保持按交易对/周期复用（现有实现），不要每页面/每任务各起一条。
+
+例外：回测与覆盖查询读本地归档（见上一节），与币安无关。
+
 ### 前端不计算交易价格
 
 **前端永远不做价格算术。** 它发 `ManualPlan` 意图，后端用 `ProtectionPlanner`
@@ -158,9 +177,18 @@ cargo tree -p domain | grep -E 'tokio|reqwest|duckdb|axum'   # 必须无输出
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test -p <改动的 crate> [测试名关键字]   # 日常：定向测试
 cargo tree -p domain | grep -E 'tokio|reqwest|duckdb|axum'   # 必须无输出
 ```
+
+**完成任务跑定向测试即可，不必跑全量 `cargo test`。** 按改动范围选
+`cargo test -p <crate>`（可多个 `-p`，如 `cargo test -p engine -p sim`），
+需要时再加测试名关键字过滤。全量只在改动跨多个 crate、触及共享不变量
+（量化、保护单数学、订单状态机）、发版前或用户明确要求时跑。交付时如实
+报告跑过的命令，没覆盖到的面要说明。
+
+GUI/IDE 启动的 shell 可能没有 `cargo`（报 `command not found`）：先执行
+`export PATH="$HOME/.cargo/bin:$PATH"`，或直接用 `./scripts/run.sh`。
 
 改动以下内容时必须补测试：
 

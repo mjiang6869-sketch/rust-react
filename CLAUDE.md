@@ -1,3 +1,6 @@
+@AGENTS.md
+<!-- 这行导入是必须的：仓库里同时存在 CLAUDE.md 时，Claude Code 默认只读 CLAUDE.md、不读 AGENTS.md，导入才能让工程契约始终生效 -->
+
 ## Subagent 使用规则
 
 目标：**规划用 Opus 5.5（`architect`），写码用 Sonnet（`coder`），二者配合；不要重复创建 subagent。**
