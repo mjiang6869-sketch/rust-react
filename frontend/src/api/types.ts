@@ -333,6 +333,80 @@ export interface DownloadRequest {
   to: string
 }
 
+/** 下载任务状态机的状态标签。 */
+export type DownloadJobState = 'idle' | 'running' | 'finished' | 'cancelled' | 'failed'
+
+/** 下载请求的回显（供快照展示，不做二次校验）。 */
+export interface DownloadJobRequest {
+  symbols: string[]
+  kinds: string[]
+  from: string
+  to: string
+}
+
+/** 裁剪后的下载计划摘要。 */
+export interface DownloadJobPlan {
+  total: number
+  /** 因归档范围裁剪掉的说明（小字展示）。 */
+  clipped: string[]
+  /** 是否成功取得归档范围。false 时计划是按“到上个月”兜底算出的。 */
+  index_available: boolean
+}
+
+/** 正在处理的分区。 */
+export interface DownloadJobCurrent {
+  symbol: string
+  kind: string
+  month: string
+  stage: string
+  stage_label: string
+  stage_done: number
+  /** `null` 表示这个阶段没有已知总量（例如下载中，只能看已处理字节）。 */
+  stage_total: number | null
+  stage_started_at: string
+}
+
+/** 一个分区的失败记录。 */
+export interface DownloadJobFailure {
+  partition: string
+  error: string
+}
+
+/** 下载任务的完整状态快照。WebSocket 推送与 REST 查询共用同一形状。 */
+export interface DownloadJob {
+  state: DownloadJobState
+  started_at: string | null
+  finished_at: string | null
+  request: DownloadJobRequest | null
+  plan: DownloadJobPlan | null
+  done: number
+  completed: number
+  not_in_archive: number
+  failed: number
+  current: DownloadJobCurrent | null
+  failures: DownloadJobFailure[]
+  last_error: string | null
+}
+
+/** 某数据集在币安归档（S3）里的覆盖范围。 */
+export interface ArchiveDataset {
+  kind: string
+  label: string
+  earliest: string | null
+  latest: string | null
+  months: number
+  error: string | null
+}
+
+/** `GET /api/v1/data/archive-range` 的响应。 */
+export interface ArchiveRange {
+  symbol: string
+  source: string
+  fetched_at: string
+  hint: string
+  datasets: ArchiveDataset[]
+}
+
 /** 一笔成交。 */
 export interface FillRecord {
   trade_id: string
@@ -354,15 +428,7 @@ export type ServerMessage =
   | { type: 'pong' }
 
 export type ProgressMessage =
-  | {
-      type: 'download'
-      symbol: string
-      kind: string
-      month: string
-      done: number
-      total: number
-    }
-  | { type: 'download_done'; completed: number; failed: number }
+  | { type: 'download_status'; job: DownloadJob }
   | { type: 'backtest'; symbol: string; model: string; done: number; total: number }
 
 /** K 线。时间用秒级时间戳，与 lightweight-charts 的要求一致。 */

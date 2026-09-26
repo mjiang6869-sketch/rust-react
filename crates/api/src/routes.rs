@@ -58,7 +58,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/market/stream", get(crate::market_stream::handler))
         // ---- 数据管理 ----
         .route("/api/v1/data/coverage", get(data_coverage))
-        .route("/api/v1/data/download", post(start_download))
+        .route(
+            "/api/v1/data/download",
+            get(download_status).post(start_download),
+        )
+        .route("/api/v1/data/download/cancel", post(cancel_download))
+        .route("/api/v1/data/archive-range", get(archive_range))
         // ---- 实盘安全 ----
         .route("/api/v1/live/arm", post(arm))
         .route("/api/v1/live/disarm", post(disarm))
@@ -603,7 +608,7 @@ async fn data_coverage(State(s): State<Arc<AppState>>) -> Result<impl IntoRespon
                 expected,
                 ..
             } => (format!("待查（{row_count} 行，期望 {expected}）"), 0),
-            data::PartitionStatus::NotInArchive => ("归档无此分区".to_string(), 0),
+            data::PartitionStatus::NotInArchive => ("归档无此分区（终态，不重试）".to_string(), 0),
             data::PartitionStatus::Failed { error, .. } => (format!("失败：{error}"), 0),
             data::PartitionStatus::Absent => ("未处理".to_string(), 0),
         };
@@ -655,6 +660,11 @@ async fn data_coverage(State(s): State<Arc<AppState>>) -> Result<impl IntoRespon
     })))
 }
 
+/// 查询当前下载任务状态。没有任务时是 `state == "idle"` 的默认快照。
+async fn download_status(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(ApiResponse::ok(s.downloads().snapshot()))
+}
+
 async fn start_download(
     State(s): State<Arc<AppState>>,
     crate::dto::Json2(req): crate::dto::Json2<DownloadRequestDto>,
@@ -664,31 +674,134 @@ async fn start_download(
     if from > to {
         return Err(ApiError::BadRequest("起始月份不能晚于结束月份".into()));
     }
+
+    // 全部校验必须在 `try_start`（进而在后台任务、任何网络请求）之前完成——
+    // 非法输入不应该占用唯一的下载任务名额。
     if req.symbols.is_empty() {
         return Err(ApiError::BadRequest("必须指定至少一个交易对".into()));
     }
+    let symbols: Vec<String> = req
+        .symbols
+        .iter()
+        .map(|sym| validate_symbol(sym))
+        .collect::<Result<_, _>>()?;
 
-    // 下载是长任务，放到后台执行并立即返回。进度通过 WebSocket 推进界面。
-    let data_root = s.data_root.clone();
-    let symbols = req.symbols.clone();
-    let kinds = req.kinds.clone();
-    let progress = s.progress_tx.clone();
+    if req.kinds.is_empty() {
+        return Err(ApiError::BadRequest("必须指定至少一个数据集".into()));
+    }
+    let kinds: Vec<data::DatasetKind> = req
+        .kinds
+        .iter()
+        .map(|k| data::DatasetKind::from_api_name(k).map_err(ApiError::BadRequest))
+        .collect::<Result<_, _>>()?;
 
+    let request_snapshot = crate::state::DownloadJobRequestSnapshot {
+        symbols: symbols.clone(),
+        kinds: req.kinds.clone(),
+        from: req.from.clone(),
+        to: req.to.clone(),
+    };
+    let guard = s
+        .downloads()
+        .try_start(request_snapshot)
+        .map_err(ApiError::Conflict)?;
+    let snapshot = guard.snapshot();
+
+    // 下载是长任务，放到后台执行并立即返回。进度通过 WebSocket 推给界面。
+    let state = s.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            crate::download_task::run(data_root, symbols, kinds, from, to, progress).await
-        {
-            tracing::error!("下载任务失败：{e:#}");
-        }
+        crate::download_task::run(state, guard, symbols, kinds, from, to).await;
     });
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(serde_json::json!({
-            "started": true,
-            "message": "下载任务已在后台开始，进度会通过 WebSocket 推送",
-        }))),
-    ))
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(snapshot))))
+}
+
+/// 取消当前下载任务。没有任务在跑时返回 409——不能假装取消成功。
+async fn cancel_download(State(s): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    if s.downloads().cancel() {
+        Ok(Json(ApiResponse::ok(
+            serde_json::json!({ "cancelled": true }),
+        )))
+    } else {
+        Err(ApiError::Conflict("没有正在进行的下载任务".into()))
+    }
+}
+
+/// 数据集的中文标签，供归档范围接口展示。与 `data::archive_index` 内部
+/// 用于拼接裁剪说明的映射同源，但那份是私有的——这里在 API 层单独维护
+/// 一份，避免为了复用两行 match 而导出一个仅供展示用的内部细节。
+fn dataset_label(kind: data::DatasetKind) -> &'static str {
+    match kind {
+        data::DatasetKind::Klines1m => "K 线",
+        data::DatasetKind::AggTrades => "逐笔成交",
+        data::DatasetKind::MarkPriceKlines1m => "标记价 K 线",
+        data::DatasetKind::FundingRate => "资金费率",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveRangeQuery {
+    symbol: String,
+    /// 逗号分隔的数据集列表。省略时查询全部数据集。
+    kinds: Option<String>,
+}
+
+/// 查询某交易对在币安归档（S3）里各数据集的真实覆盖范围。
+///
+/// 与下载任务规划共用同一份 [`AppState::archive_months`] 缓存——界面在
+/// 提交下载前先看一眼范围，跟下载任务实际用来裁剪计划的数据是同一份，
+/// 不会出现"界面说有、下载却裁掉了"的不一致。
+async fn archive_range(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ArchiveRangeQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let symbol = validate_symbol(&q.symbol)?;
+
+    let kinds: Vec<data::DatasetKind> = match &q.kinds {
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|k| data::DatasetKind::from_api_name(k).map_err(ApiError::BadRequest))
+            .collect::<Result<_, _>>()?,
+        None => data::DatasetKind::ALL.to_vec(),
+    };
+    if kinds.is_empty() {
+        return Err(ApiError::BadRequest("kinds 不能为空".into()));
+    }
+
+    // 校验全部通过之后才发起网络请求——单个数据集查询失败只影响它自己的
+    // `error` 字段，不应该让整个请求失败（例如某个数据集当时刚好抖动）。
+    let mut datasets = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let entry = match s.archive_months(kind, &symbol).await {
+            Ok(months) => serde_json::json!({
+                "kind": kind.api_name(),
+                "label": dataset_label(kind),
+                "earliest": months.earliest().map(|(y, m)| format!("{y:04}-{m:02}")),
+                "latest": months.latest().map(|(y, m)| format!("{y:04}-{m:02}")),
+                "months": months.months.len(),
+                "error": null,
+            }),
+            Err(e) => serde_json::json!({
+                "kind": kind.api_name(),
+                "label": dataset_label(kind),
+                "earliest": null,
+                "latest": null,
+                "months": 0,
+                "error": e,
+            }),
+        };
+        datasets.push(entry);
+    }
+
+    Ok(Json(ApiResponse::ok(serde_json::json!({
+        "symbol": symbol,
+        "source": "data.binance.vision 归档列表（S3）",
+        "fetched_at": chrono::Utc::now(),
+        "hint": "当月的月度包要到下月初才生成",
+        "datasets": datasets,
+    }))))
 }
 
 // ---------------------------------------------------------------------------
@@ -794,12 +907,14 @@ mod tests {
             "/api/v1/market/stream",
             "/api/v1/data/coverage",
             "/api/v1/data/download",
+            "/api/v1/data/download/cancel",
+            "/api/v1/data/archive-range",
             "/api/v1/live/arm",
             "/api/v1/live/disarm",
             "/api/v1/mode",
             "/api/v1/ws",
         ];
-        assert_eq!(paths.len(), 24);
+        assert_eq!(paths.len(), 26);
         // 路径必须是版本化的——未来breaking change要走 v2。
         for p in paths {
             assert!(p.starts_with("/api/v1/"), "路由必须版本化：{p}");

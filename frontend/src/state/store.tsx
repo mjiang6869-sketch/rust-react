@@ -25,7 +25,10 @@ import type { ReactNode } from 'react'
 
 import { ApiError, api } from '../api/client'
 import { EngineSocket } from '../api/ws'
-import type { EngineState, ProgressMessage } from '../api/types'
+import type { DownloadJob, EngineState, ProgressMessage } from '../api/types'
+
+/** 回测进度消息（`ProgressMessage` 里 `backtest` 变体）。 */
+export type BacktestProgress = Extract<ProgressMessage, { type: 'backtest' }>
 
 export interface AppState {
   /** 引擎状态。`null` 表示尚未收到首次快照。 */
@@ -34,8 +37,19 @@ export interface AppState {
   connected: boolean
   /** 最近一次错误（面向用户的中文说明）。 */
   error: string | null
-  /** 后台任务进度。 */
-  progress: ProgressMessage | null
+  /** 回测后台任务进度。与下载任务分开保存——否则两者会互相覆盖。 */
+  backtestProgress: BacktestProgress | null
+  /**
+   * 下载任务快照。收到 WS `download_status` 消息时直接整份替换（后端推
+   * 的就是完整快照，不是增量）。`null` 表示还没收到过（挂载时应先用
+   * REST 查一次初始化）。
+   */
+  downloadJob: DownloadJob | null
+  /**
+   * 用一次 REST 查询结果初始化/纠正下载任务快照。仅供 `DataPanel` 挂载时
+   * 调用——之后的更新都应来自 WS `download_status`。
+   */
+  setDownloadJob: (job: DownloadJob) => void
   /** 手动清除错误。 */
   clearError: () => void
   /** 重新加载引擎状态（WebSocket 尚未连上时用）。 */
@@ -48,7 +62,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [engine, setEngine] = useState<EngineState | null>(null)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [progress, setProgress] = useState<ProgressMessage | null>(null)
+  const [backtestProgress, setBacktestProgress] = useState<BacktestProgress | null>(null)
+  const [downloadJob, setDownloadJob] = useState<DownloadJob | null>(null)
   const socketRef = useRef<EngineSocket | null>(null)
 
   // WebSocket 状态更新。
@@ -64,10 +79,19 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     })
   }, [])
 
+  // 后台任务进度：下载与回测分开保存，否则两者会互相覆盖对方的最新状态。
+  const handleProgress = useCallback((p: ProgressMessage) => {
+    if (p.type === 'download_status') {
+      setDownloadJob(p.job)
+    } else {
+      setBacktestProgress(p)
+    }
+  }, [])
+
   useEffect(() => {
     const socket = new EngineSocket({
       onState: handleState,
-      onProgress: (p) => setProgress(p),
+      onProgress: handleProgress,
       onConnectionChange: (c) => setConnected(c),
       onError: (_code, message) => setError(message),
     })
@@ -78,7 +102,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       socket.close()
       socketRef.current = null
     }
-  }, [handleState])
+  }, [handleState, handleProgress])
 
   // 首次加载用 REST 拉一次，让界面立刻有数据而不必等 WebSocket 握手。
   useEffect(() => {
@@ -113,8 +137,17 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const clearError = useCallback(() => setError(null), [])
 
   const value = useMemo<AppState>(
-    () => ({ engine, connected, error, progress, clearError, refresh }),
-    [engine, connected, error, progress, clearError, refresh],
+    () => ({
+      engine,
+      connected,
+      error,
+      backtestProgress,
+      downloadJob,
+      setDownloadJob,
+      clearError,
+      refresh,
+    }),
+    [engine, connected, error, backtestProgress, downloadJob, setDownloadJob, clearError, refresh],
   )
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>

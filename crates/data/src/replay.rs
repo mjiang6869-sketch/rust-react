@@ -21,7 +21,19 @@ use anyhow::{Context, Result, bail};
 use chrono::{TimeZone, Utc};
 use domain::{AggTrade, Candle, MarketEvent, Price, Qty};
 
+use crate::download::Layout;
+use crate::manifest::{DatasetKind, PartitionKey};
+
 /// 一个分区的 Parquet 路径（Hive 分区布局）。
+///
+/// **必须与下载器共用同一个路径函数**（[`Layout::parquet`]）——这里只是
+/// 套一层更方便调用的签名，不能自己重新拼字符串。此前 K 线与逐笔成交各
+/// 自维护一份路径拼接逻辑，逐笔成交那份用了 `agg_trades`（下划线），而
+/// 下载器写盘用的是 `aggTrades`（`DatasetKind::archive_dir()`），导致回放
+/// 读不到任何已下载的逐笔数据。
+///
+/// 当前只支持 `interval="1m"`（`Klines1m` 数据集本身就是这个粒度），传入
+/// 其它值在调试构建下会触发 assert，提醒调用方这个参数目前只是摆设。
 pub fn klines_parquet_path(
     root: &Path,
     symbol: &str,
@@ -29,13 +41,14 @@ pub fn klines_parquet_path(
     year: i32,
     month: u32,
 ) -> PathBuf {
-    root.join("lake")
-        .join("klines")
-        .join(format!("symbol={symbol}"))
-        .join(format!("interval={interval}"))
-        .join(format!("year={year}"))
-        .join(format!("month={month:02}"))
-        .join("data.parquet")
+    debug_assert_eq!(interval, "1m", "K 线数据集目前只支持 1m 粒度");
+    let key = PartitionKey {
+        kind: DatasetKind::Klines1m,
+        symbol: symbol.to_string(),
+        year,
+        month,
+    };
+    Layout::new(root).parquet(&key)
 }
 
 /// 逐笔成交的 Parquet 路径。
@@ -44,13 +57,17 @@ pub fn klines_parquet_path(
 /// 按天切分文件会让同一份数据被复制 31 次，浪费磁盘。
 /// 读取时用时间戳过滤行——Parquet 的列统计能让它只解码命中的行组，
 /// 不需要把整月数据都读进内存。
+///
+/// 路径拼接委托给 [`Layout::parquet`]，与下载器共用同一份逻辑（原因见
+/// [`klines_parquet_path`] 的文档）。
 pub fn agg_trades_parquet_path(root: &Path, symbol: &str, year: i32, month: u32) -> PathBuf {
-    root.join("lake")
-        .join("agg_trades")
-        .join(format!("symbol={symbol}"))
-        .join(format!("year={year}"))
-        .join(format!("month={month:02}"))
-        .join("data.parquet")
+    let key = PartitionKey {
+        kind: DatasetKind::AggTrades,
+        symbol: symbol.to_string(),
+        year,
+        month,
+    };
+    Layout::new(root).parquet(&key)
 }
 
 /// 定点价格缩放因子（与 `parquet_writer` 写入时一致）。
@@ -409,8 +426,42 @@ mod tests {
 
         let t = agg_trades_parquet_path(root, "ETHUSDC", 2026, 8);
         assert!(
-            t.ends_with("lake/agg_trades/symbol=ETHUSDC/year=2026/month=08/data.parquet"),
-            "{t:?}"
+            t.ends_with("lake/aggTrades/symbol=ETHUSDC/year=2026/month=08/data.parquet"),
+            "回放读取路径必须与下载器写入路径一致（aggTrades，不是 agg_trades）：{t:?}"
+        );
+    }
+
+    /// 回放与下载器必须共用同一个路径函数——这是本次修复的核心诉求。
+    /// 之前逐笔成交的路径各写各的，`agg_trades` vs `aggTrades` 的差异
+    /// 让回放永远读不到已下载的数据。
+    #[test]
+    fn replay_paths_match_layout_parquet_for_agg_trades_and_klines() {
+        use crate::download::Layout;
+        use crate::manifest::{DatasetKind, PartitionKey};
+
+        let root = Path::new("/data");
+        let layout = Layout::new(root);
+
+        let agg_key = PartitionKey {
+            kind: DatasetKind::AggTrades,
+            symbol: "ETHUSDC".into(),
+            year: 2026,
+            month: 8,
+        };
+        assert_eq!(
+            agg_trades_parquet_path(root, "ETHUSDC", 2026, 8),
+            layout.parquet(&agg_key)
+        );
+
+        let kline_key = PartitionKey {
+            kind: DatasetKind::Klines1m,
+            symbol: "ETHUSDC".into(),
+            year: 2026,
+            month: 8,
+        };
+        assert_eq!(
+            klines_parquet_path(root, "ETHUSDC", "1m", 2026, 8),
+            layout.parquet(&kline_key)
         );
     }
 

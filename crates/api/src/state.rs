@@ -8,11 +8,21 @@
 //!
 //! 代价是需要留意两者的一致性：引擎状态变更后要显式落库。这个责任落在
 //! `engine` 层，而不是在这里自动做——自动同步会让"什么时候写了库"变得隐式。
+//!
+//! # 下载任务状态为什么用 `std::sync::Mutex`
+//!
+//! [`DownloadJobs`] 内部的临界区都很短（读/写一份快照结构体），不涉及任何
+//! `.await`。用 `std::sync::Mutex` 而不是 `tokio::sync::Mutex`：前者没有异步
+//! 开销，且能在 `Drop` 里同步使用（`tokio::sync::Mutex` 的 `lock()` 是异步的，
+//! `Drop` 里没有 executor 可以 `.await`）。**规则：锁绝不跨 `.await` 持有**——
+//! 每个持锁的方法体都只做字段读写，拿到需要的值后立刻释放。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
+use chrono::{DateTime, Utc};
+use data::DatasetKind;
 use domain::ServiceMode;
 use engine::{EngineConfig, PaperEngine};
 use exchange::{BinanceClient, MarketStreams, PRODUCTION_URL};
@@ -23,16 +33,13 @@ use tokio::sync::Mutex;
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProgressMessage {
-    /// 下载进度。
-    Download {
-        symbol: String,
-        kind: String,
-        month: String,
-        done: usize,
-        total: usize,
-    },
-    /// 下载完成。
-    DownloadDone { completed: usize, failed: usize },
+    /// 下载任务的完整状态快照。取代旧的 `Download` / `DownloadDone` 两个
+    /// 变体——界面靠一份完整快照就能重建整个进度面板，不需要拼接增量。
+    ///
+    /// `Box`：`DownloadJobSnapshot` 比 `Backtest` 变体大出好几倍（失败列表、
+    /// 当前分区等字段），不装箱会让整个枚举按最大变体分配，即便绝大多数
+    /// 消息其实是体积小得多的回测进度。
+    DownloadStatus { job: Box<DownloadJobSnapshot> },
     /// 回测进度。
     Backtest {
         symbol: String,
@@ -40,6 +47,309 @@ pub enum ProgressMessage {
         done: usize,
         total: usize,
     },
+}
+
+// ---------------------------------------------------------------------------
+// 下载任务状态
+// ---------------------------------------------------------------------------
+
+/// 下载请求的回显（供快照展示，不做二次校验）。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DownloadJobRequestSnapshot {
+    pub symbols: Vec<String>,
+    pub kinds: Vec<String>,
+    pub from: String,
+    pub to: String,
+}
+
+/// 裁剪后的下载计划摘要。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DownloadJobPlanSnapshot {
+    pub total: usize,
+    pub clipped: Vec<String>,
+    pub index_available: bool,
+}
+
+/// 正在处理的分区。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DownloadJobCurrentSnapshot {
+    pub symbol: String,
+    pub kind: String,
+    pub month: String,
+    pub stage: String,
+    pub stage_label: String,
+    pub stage_done: u64,
+    pub stage_total: Option<u64>,
+    pub stage_started_at: DateTime<Utc>,
+}
+
+/// 一个分区的失败记录。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DownloadJobFailureSnapshot {
+    pub partition: String,
+    pub error: String,
+}
+
+/// `failures` 列表的上限。任务可能有几百个失败分区（例如整段区间归档都
+/// 缺失），无限增长的列表既没有排查价值又浪费带宽。
+const MAX_FAILURES: usize = 50;
+
+/// 下载任务的完整状态快照。这是 WebSocket 推送与 REST 查询共用的唯一形状。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DownloadJobSnapshot {
+    /// `"idle"` | `"running"` | `"finished"` | `"cancelled"` | `"failed"`。
+    pub state: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub request: Option<DownloadJobRequestSnapshot>,
+    pub plan: Option<DownloadJobPlanSnapshot>,
+    pub done: usize,
+    pub completed: usize,
+    pub not_in_archive: usize,
+    pub failed: usize,
+    pub current: Option<DownloadJobCurrentSnapshot>,
+    pub failures: Vec<DownloadJobFailureSnapshot>,
+    pub last_error: Option<String>,
+}
+
+impl Default for DownloadJobSnapshot {
+    fn default() -> Self {
+        Self {
+            state: "idle".to_string(),
+            started_at: None,
+            finished_at: None,
+            request: None,
+            plan: None,
+            done: 0,
+            completed: 0,
+            not_in_archive: 0,
+            failed: 0,
+            current: None,
+            failures: Vec::new(),
+            last_error: None,
+        }
+    }
+}
+
+struct DownloadJobsInner {
+    snapshot: DownloadJobSnapshot,
+    cancel: Option<data::CancelToken>,
+}
+
+/// 从中毒的锁里也能拿到内容——下载任务的临界区从不做可能 panic 的复杂计算，
+/// 但持锁方（例如 `Drop`）绝不能因为别处的 panic 而跟着 panic 或死锁。
+fn lock_inner(inner: &StdMutex<DownloadJobsInner>) -> MutexGuard<'_, DownloadJobsInner> {
+    inner.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 单任务下载状态机：同一时间只允许一个下载任务在跑。
+///
+/// 内部只有一把 `std::sync::Mutex`，且所有持锁方法都只做字段读写——从不
+/// `.await`。这样才能在 [`DownloadJobGuard::drop`] 里同步上锁。
+pub struct DownloadJobs {
+    inner: Arc<StdMutex<DownloadJobsInner>>,
+}
+
+impl Default for DownloadJobs {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(DownloadJobsInner {
+                snapshot: DownloadJobSnapshot::default(),
+                cancel: None,
+            })),
+        }
+    }
+}
+
+impl DownloadJobs {
+    /// 尝试开始一个新任务。已有任务在跑时返回 `Err`，且**不会**修改任何状态
+    /// ——调用方应据此返回 409，且不能因为这次失败的尝试而误清掉真正在跑的
+    /// 那个任务的进度。
+    pub fn try_start(
+        &self,
+        request: DownloadJobRequestSnapshot,
+    ) -> Result<DownloadJobGuard, String> {
+        let mut guard = lock_inner(&self.inner);
+        if guard.snapshot.state == "running" {
+            return Err("已有下载任务在进行".to_string());
+        }
+        let cancel = data::CancelToken::default();
+        guard.snapshot = DownloadJobSnapshot {
+            state: "running".to_string(),
+            started_at: Some(Utc::now()),
+            request: Some(request),
+            ..DownloadJobSnapshot::default()
+        };
+        guard.cancel = Some(cancel.clone());
+        drop(guard);
+        Ok(DownloadJobGuard {
+            inner: self.inner.clone(),
+            cancel,
+            finished: false,
+        })
+    }
+
+    /// 当前快照。没有任务时是 `state == "idle"` 的默认值。
+    pub fn snapshot(&self) -> DownloadJobSnapshot {
+        lock_inner(&self.inner).snapshot.clone()
+    }
+
+    /// 取消当前任务。没有任务在跑时返回 `false`，不做任何事。
+    pub fn cancel(&self) -> bool {
+        let guard = lock_inner(&self.inner);
+        if guard.snapshot.state != "running" {
+            return false;
+        }
+        match &guard.cancel {
+            Some(c) => {
+                c.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// 一次下载任务的 RAII 句柄。
+///
+/// # 为什么需要 `Drop` 兜底
+///
+/// 下载任务跑在一个独立的 `tokio::spawn` 里。如果任务因为未预料的 panic
+/// 提前结束（例如某个 `unwrap` 炸了），**必须**有人把状态从 `running` 改回
+/// 终态，否则 [`DownloadJobs::try_start`] 会永久拒绝所有后续请求，界面上
+/// 也会一直显示"进行中"的假象。`Drop` 检查"这个 guard 是否已经显式
+/// `finish()` 过"，没有就强制标记为 `failed`。
+pub struct DownloadJobGuard {
+    inner: Arc<StdMutex<DownloadJobsInner>>,
+    cancel: data::CancelToken,
+    finished: bool,
+}
+
+impl DownloadJobGuard {
+    /// 与当前任务共享状态的取消令牌。克隆出的副本与原件共享底层标记。
+    pub fn cancel_token(&self) -> data::CancelToken {
+        self.cancel.clone()
+    }
+
+    fn with_snapshot<F: FnOnce(&mut DownloadJobSnapshot)>(&self, f: F) {
+        let mut guard = lock_inner(&self.inner);
+        f(&mut guard.snapshot);
+    }
+
+    pub fn set_plan(&self, plan: DownloadJobPlanSnapshot) {
+        self.with_snapshot(|s| s.plan = Some(plan));
+    }
+
+    pub fn set_current(&self, current: Option<DownloadJobCurrentSnapshot>) {
+        self.with_snapshot(|s| s.current = current);
+    }
+
+    /// 记一个不算成功/失败/归档缺失的完成（目前只有 `Skipped` 会走这里）。
+    pub fn record_done(&self) {
+        self.with_snapshot(|s| s.done += 1);
+    }
+
+    pub fn record_completed(&self) {
+        self.with_snapshot(|s| {
+            s.completed += 1;
+            s.done += 1;
+        });
+    }
+
+    pub fn record_not_in_archive(&self) {
+        self.with_snapshot(|s| {
+            s.not_in_archive += 1;
+            s.done += 1;
+        });
+    }
+
+    pub fn record_failure(&self, partition: String, error: String) {
+        self.with_snapshot(|s| {
+            s.failed += 1;
+            s.done += 1;
+            if s.failures.len() >= MAX_FAILURES {
+                s.failures.remove(0);
+            }
+            s.failures
+                .push(DownloadJobFailureSnapshot { partition, error });
+        });
+    }
+
+    pub fn set_last_error(&self, err: String) {
+        self.with_snapshot(|s| s.last_error = Some(err));
+    }
+
+    /// 当前快照（不消耗 guard，任务运行中随时可查）。
+    pub fn snapshot(&self) -> DownloadJobSnapshot {
+        lock_inner(&self.inner).snapshot.clone()
+    }
+
+    /// 显式收尾。消耗 guard——收尾之后不应该再更新任何进度。
+    ///
+    /// 返回收尾后的快照，方便调用方立即广播一次"任务结束"消息，而不必
+    /// 再单独查一次。
+    pub fn finish(mut self, state: &str) -> DownloadJobSnapshot {
+        self.finished = true;
+        self.with_snapshot(|s| {
+            s.state = state.to_string();
+            s.finished_at = Some(Utc::now());
+            s.current = None;
+        });
+        self.snapshot()
+    }
+}
+
+/// 手写 `Debug`：`CancelToken`（`data` crate）没有派生 `Debug`，没法直接
+/// `#[derive]`。只打印对排查有用的字段——`finished` 决定 `Drop` 会不会
+/// 兜底改状态，这也是测试里 `unwrap_err()` 需要 `Debug` 的唯一原因。
+impl std::fmt::Debug for DownloadJobGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadJobGuard")
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+
+impl Drop for DownloadJobGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut guard = lock_inner(&self.inner);
+        if guard.snapshot.state == "running" {
+            guard.snapshot.state = "failed".to_string();
+            guard.snapshot.finished_at = Some(Utc::now());
+            guard.snapshot.current = None;
+            guard.snapshot.last_error = Some("任务意外结束".to_string());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 归档列举缓存
+// ---------------------------------------------------------------------------
+
+/// 成功结果的缓存有效期。归档月份范围几乎不变，6 小时内不必重新列举。
+const ARCHIVE_CACHE_SUCCESS_TTL: chrono::Duration = chrono::Duration::hours(6);
+/// 失败结果的缓存有效期。网络抖动等短暂问题很快会恢复，但也不能让一次
+/// 失败在几秒内被同一个请求打好几次——30 秒内复用同一个错误。
+const ARCHIVE_CACHE_FAILURE_TTL: chrono::Duration = chrono::Duration::seconds(30);
+
+#[derive(Clone)]
+struct ArchiveCacheEntry {
+    at: DateTime<Utc>,
+    result: Result<data::ArchiveMonths, String>,
+}
+
+/// 判断一条缓存记录是否已过期。纯函数，不做任何 IO——方便直接单测两条
+/// TTL（成功 6 小时 / 失败 30 秒）的边界。
+fn is_cache_entry_stale(stored_at: DateTime<Utc>, now: DateTime<Utc>, success: bool) -> bool {
+    let ttl = if success {
+        ARCHIVE_CACHE_SUCCESS_TTL
+    } else {
+        ARCHIVE_CACHE_FAILURE_TTL
+    };
+    now - stored_at >= ttl
 }
 
 /// 应用共享状态。
@@ -90,6 +400,16 @@ pub struct AppState {
     /// `None` 表示行情 REST 被指到了非生产地址。推送只接生产网——测试网的
     /// 推送入口与生产不同，混用会让盘口与 K 线来自两个不同的市场。
     market_streams: Option<MarketStreams>,
+    /// 下载任务状态机。单任务，见 [`DownloadJobs`]。
+    downloads: DownloadJobs,
+    /// 币安归档列举（S3）的结果缓存。key 是 `(数据集, 交易对)`。
+    ///
+    /// 用 `std::sync::Mutex`：临界区只是查表/写表，从不跨 `.await`。
+    archive_cache: StdMutex<HashMap<(DatasetKind, String), ArchiveCacheEntry>>,
+    /// 归档列举专用的 HTTP 客户端。与下载任务用的下载客户端分开：前者
+    /// 只做小请求（列目录 XML），15 秒超时足够；下载客户端要扛几百 MB
+    /// 的传输，用的是分钟级超时。两者共用同一个 `user_agent`。
+    archive_client: reqwest::Client,
 }
 
 impl AppState {
@@ -100,6 +420,11 @@ impl AppState {
         let market_streams = market_rest_base()
             .eq(PRODUCTION_URL)
             .then(|| MarketStreams::production(market_cooldown.clone()));
+        let archive_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("rust-crypto-research/0.1")
+            .build()
+            .expect("构造归档列举 HTTP 客户端失败");
         Arc::new(Self {
             engine: Arc::new(Mutex::new(engine)),
             db: Arc::new(Mutex::new(db)),
@@ -111,6 +436,9 @@ impl AppState {
             market: std::sync::OnceLock::new(),
             market_cooldown,
             market_streams,
+            downloads: DownloadJobs::default(),
+            archive_cache: StdMutex::new(HashMap::new()),
+            archive_client,
         })
     }
 
@@ -161,6 +489,53 @@ impl AppState {
     /// 行情推送。`None` 的含义见字段文档。
     pub fn market_streams(&self) -> Option<&MarketStreams> {
         self.market_streams.as_ref()
+    }
+
+    /// 下载任务状态机。
+    pub fn downloads(&self) -> &DownloadJobs {
+        &self.downloads
+    }
+
+    /// 某数据集某标的的归档月份范围，带缓存。
+    ///
+    /// # 锁的用法
+    ///
+    /// 先在锁内查表，锁外做网络请求，最后再短暂上锁写回——**不会**跨
+    /// `.await` 持锁。
+    pub async fn archive_months(
+        &self,
+        kind: DatasetKind,
+        symbol: &str,
+    ) -> Result<data::ArchiveMonths, String> {
+        let key = (kind, symbol.to_string());
+        let now = Utc::now();
+
+        {
+            let cache = self.archive_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = cache.get(&key) {
+                let success = entry.result.is_ok();
+                if !is_cache_entry_stale(entry.at, now, success) {
+                    return entry.result.clone();
+                }
+            }
+        }
+
+        let result = data::fetch_archive_months(&self.archive_client, kind, symbol)
+            .await
+            .map_err(|e| format!("{e:#}"));
+
+        {
+            let mut cache = self.archive_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(
+                key,
+                ArchiveCacheEntry {
+                    at: Utc::now(),
+                    result: result.clone(),
+                },
+            );
+        }
+
+        result
     }
 
     pub async fn mode(&self) -> ServiceMode {
@@ -269,6 +644,15 @@ mod tests {
         )
     }
 
+    fn sample_request() -> DownloadJobRequestSnapshot {
+        DownloadJobRequestSnapshot {
+            symbols: vec!["ETHUSDC".into()],
+            kinds: vec!["klines".into()],
+            from: "2026-01".into(),
+            to: "2026-02".into(),
+        }
+    }
+
     #[tokio::test]
     async fn default_mode_is_paper() {
         let s = state();
@@ -338,9 +722,8 @@ mod tests {
     #[tokio::test]
     async fn broadcast_without_subscribers_does_not_panic() {
         let s = state();
-        s.broadcast(ProgressMessage::DownloadDone {
-            completed: 1,
-            failed: 0,
+        s.broadcast(ProgressMessage::DownloadStatus {
+            job: Box::new(DownloadJobSnapshot::default()),
         });
     }
 
@@ -359,15 +742,94 @@ mod tests {
 
     #[tokio::test]
     async fn progress_messages_are_serializable() {
-        let msg = ProgressMessage::Download {
-            symbol: "ETHUSDC".into(),
-            kind: "klines".into(),
-            month: "2026-08".into(),
-            done: 3,
-            total: 10,
+        let msg = ProgressMessage::DownloadStatus {
+            job: Box::new(DownloadJobSnapshot::default()),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"download\""), "{json}");
-        assert!(json.contains("ETHUSDC"));
+        assert!(json.contains("\"type\":\"download_status\""), "{json}");
+    }
+
+    // ---- DownloadJobs / DownloadJobGuard ----
+
+    /// 已有任务在跑时，第二次 `try_start` 必须失败，且不能影响第一个任务。
+    #[test]
+    fn try_start_blocks_concurrent_second_task() {
+        let jobs = DownloadJobs::default();
+        let guard = jobs.try_start(sample_request()).expect("第一次应成功");
+        let err = jobs.try_start(sample_request()).unwrap_err();
+        assert!(err.contains("已有下载任务在进行"), "{err}");
+        assert_eq!(jobs.snapshot().state, "running", "第一个任务不应被影响");
+        drop(guard);
+    }
+
+    /// guard 被 drop 而没有显式 `finish()`（模拟 panic 或提前返回）时，
+    /// 状态必须变成 `failed`，不能停在 `running`——否则界面会永远显示
+    /// "进行中"，且新任务永远无法开始。
+    #[test]
+    fn guard_drop_without_finish_marks_failed() {
+        let jobs = DownloadJobs::default();
+        {
+            let _guard = jobs.try_start(sample_request()).unwrap();
+        }
+        let snap = jobs.snapshot();
+        assert_eq!(snap.state, "failed");
+        assert_ne!(snap.state, "running");
+        assert_eq!(snap.last_error.as_deref(), Some("任务意外结束"));
+    }
+
+    /// 显式 `finish()` 之后 drop，不应再被 `Drop` 兜底逻辑覆盖。
+    #[test]
+    fn explicit_finish_is_not_overridden_by_drop() {
+        let jobs = DownloadJobs::default();
+        let guard = jobs.try_start(sample_request()).unwrap();
+        let snap = guard.finish("finished");
+        assert_eq!(snap.state, "finished");
+        assert_eq!(jobs.snapshot().state, "finished");
+    }
+
+    /// `cancel()`：没有任务时返回 `false`；有任务时返回 `true`，且必须
+    /// 真的触发取消令牌，不能只是回报"有任务"却不做事。
+    #[test]
+    fn cancel_reflects_task_presence_and_triggers_token() {
+        let jobs = DownloadJobs::default();
+        assert!(!jobs.cancel(), "没有任务时应返回 false");
+
+        let guard = jobs.try_start(sample_request()).unwrap();
+        let token = guard.cancel_token();
+        assert!(!token.is_cancelled());
+        assert!(jobs.cancel(), "有任务时应返回 true");
+        assert!(token.is_cancelled(), "cancel() 必须真的触发令牌");
+    }
+
+    // ---- 归档缓存 TTL ----
+
+    #[test]
+    fn cache_entry_uses_six_hour_ttl_on_success() {
+        let stored = Utc::now();
+        assert!(!is_cache_entry_stale(
+            stored,
+            stored + chrono::Duration::hours(5),
+            true
+        ));
+        assert!(is_cache_entry_stale(
+            stored,
+            stored + chrono::Duration::hours(6),
+            true
+        ));
+    }
+
+    #[test]
+    fn cache_entry_uses_thirty_second_ttl_on_failure() {
+        let stored = Utc::now();
+        assert!(!is_cache_entry_stale(
+            stored,
+            stored + chrono::Duration::seconds(29),
+            false
+        ));
+        assert!(is_cache_entry_stale(
+            stored,
+            stored + chrono::Duration::seconds(30),
+            false
+        ));
     }
 }

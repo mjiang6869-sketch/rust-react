@@ -25,8 +25,12 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-/// 台账格式版本。变更结构时递增，并在 `migrate` 里补上迁移分支。
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// 台账格式版本。变更结构或语义时递增，并在 `migrate` 里补上迁移分支。
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+/// `migrate` 能理解的最旧版本。低于此版本或高于 `CURRENT_SCHEMA_VERSION`
+/// 一律拒绝加载。
+const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// 数据集种类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -81,6 +85,51 @@ impl DatasetKind {
     /// 支持列表移除（见 crates/data/README.md）。
     pub fn monthly_only(self) -> bool {
         false
+    }
+
+    /// 币安归档里 K 线类数据集在 `{symbol}/` 之后多出的周期目录段
+    /// （例如 `1m`）。非 K 线类数据集（`aggTrades`、`fundingRate`）没有
+    /// 这一层，返回 `None`。
+    ///
+    /// 这是本模块此前遗漏的一层路径：`archive_url_and_name` 曾经生成的
+    /// K 线 URL 少了这一段，导致对应请求全部 404。
+    pub fn interval_segment(self) -> Option<&'static str> {
+        match self {
+            DatasetKind::Klines1m | DatasetKind::MarkPriceKlines1m => Some("1m"),
+            DatasetKind::AggTrades | DatasetKind::FundingRate => None,
+        }
+    }
+
+    /// 全部数据集种类，用于遍历（构造帮助信息、往返测试等）。
+    pub const ALL: [DatasetKind; 4] = [
+        DatasetKind::Klines1m,
+        DatasetKind::AggTrades,
+        DatasetKind::MarkPriceKlines1m,
+        DatasetKind::FundingRate,
+    ];
+
+    /// CLI / API 对外接受的名字。这是唯一定义处——CLI 与 API 的解析都应
+    /// 调用 [`DatasetKind::from_api_name`]，不要各自维护一份映射。
+    pub fn api_name(self) -> &'static str {
+        match self {
+            DatasetKind::Klines1m => "klines",
+            DatasetKind::AggTrades => "agg_trades",
+            DatasetKind::MarkPriceKlines1m => "mark_price",
+            DatasetKind::FundingRate => "funding",
+        }
+    }
+
+    /// 由 [`DatasetKind::api_name`] 反解析。未知名字返回错误，错误信息里
+    /// 列出全部可用选项，方便用户直接看到怎么改。
+    pub fn from_api_name(s: &str) -> Result<DatasetKind, String> {
+        DatasetKind::ALL
+            .iter()
+            .copied()
+            .find(|k| k.api_name() == s)
+            .ok_or_else(|| {
+                let options: Vec<&str> = DatasetKind::ALL.iter().map(|k| k.api_name()).collect();
+                format!("未知数据集：{s}。可用：{}", options.join(" / "))
+            })
     }
 }
 
@@ -289,9 +338,10 @@ impl Manifest {
                 )
             })? as u32;
 
-        if version != CURRENT_SCHEMA_VERSION {
+        if !(MIN_SUPPORTED_SCHEMA_VERSION..=CURRENT_SCHEMA_VERSION).contains(&version) {
             bail!(
-                "台账版本 {version} 不受当前程序支持（期望 {CURRENT_SCHEMA_VERSION}），\
+                "台账版本 {version} 不受当前程序支持（支持 \
+                 {MIN_SUPPORTED_SCHEMA_VERSION}..={CURRENT_SCHEMA_VERSION}），\
                  拒绝启动。请勿手工修改 schema_version；如需降级，请从归档重新下载。"
             );
         }
@@ -318,15 +368,46 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// 迁移梯子。当前只有 v1，暂无迁移分支。
-    ///
-    /// 这里刻意保持"没有分支就报错"的形状：新增版本时必须在 `match` 里
-    /// 显式处理，而不是靠 serde default 静默填补。
+    /// 迁移梯子。新增版本时必须在 `match` 里显式处理，而不是靠 serde
+    /// default 静默填补。
     fn migrate(&mut self) -> Result<()> {
-        match self.schema_version {
-            CURRENT_SCHEMA_VERSION => Ok(()),
-            other => bail!("没有从版本 {other} 到 {CURRENT_SCHEMA_VERSION} 的迁移路径"),
+        while self.schema_version != CURRENT_SCHEMA_VERSION {
+            match self.schema_version {
+                1 => self.migrate_v1_to_v2(),
+                other => bail!("没有从版本 {other} 到 {CURRENT_SCHEMA_VERSION} 的迁移路径"),
+            }
         }
+        Ok(())
+    }
+
+    /// v1 → v2：纯语义迁移，磁盘结构不变。
+    ///
+    /// v1 程序生成的 K 线归档 URL 缺少周期目录段（`1m/`），导致所有 K 线 /
+    /// 标记价 K 线请求都收到 404，被误标为 `NotInArchive`（这是终态，
+    /// `pending()` 会永远跳过它们）。这里把这些误标的分区重新删回
+    /// "未处理"，下次运行会用修正后的 URL 重新探测。
+    ///
+    /// **注意**：这条迁移依赖"v1 与 v2 磁盘结构完全相同"这一事实，所以
+    /// 才能直接用当前的 `ManifestRecord`/`PartitionEntry` 反序列化 v1
+    /// 文件。将来 v2→v3 如果改动了字段结构，必须为旧版本拆出独立的
+    /// 反序列化结构体，不能再依赖这个巧合。
+    fn migrate_v1_to_v2(&mut self) {
+        let before = self.partitions.len();
+        self.partitions.retain(|key, entry| {
+            !(matches!(
+                key.kind,
+                DatasetKind::Klines1m | DatasetKind::MarkPriceKlines1m
+            ) && matches!(entry.status, PartitionStatus::NotInArchive))
+        });
+        let removed = before - self.partitions.len();
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "迁移 v1→v2：清除因错误的 K 线归档 URL 被误标为 NotInArchive 的分区，\
+                 它们会在下次运行时重新探测"
+            );
+        }
+        self.schema_version = 2;
     }
 
     /// 原子保存：写临时文件 → fsync → rename → fsync 目录。
@@ -380,6 +461,30 @@ impl Manifest {
     /// 记录一个分区结果。
     pub fn record(&mut self, key: PartitionKey, entry: PartitionEntry) {
         self.partitions.insert(key, entry);
+    }
+
+    /// 记录一个分区并立即落盘，且不会覆盖其他任务并发写入的分区。
+    ///
+    /// # 为什么不能直接 `self.save(path)`
+    ///
+    /// 多个下载任务各自持有一份内存中的 `Manifest`。如果各自用自己那份
+    /// 内存状态整体覆盖磁盘文件，后完成的任务会把先完成的任务刚写入的
+    /// 分区抹掉——两边都以为自己在"追加"，实际上互相覆盖。
+    ///
+    /// 这里改成"从磁盘重新加载最新台账 → 只合并这一个分区 → 原子写回"，
+    /// 把覆盖范围收窄到单个分区；同时用重新加载并合并后的结果替换
+    /// `self`，让内存副本与磁盘保持一致（包括其他任务这期间写入的分区）。
+    pub fn record_and_save(
+        &mut self,
+        path: &Path,
+        key: PartitionKey,
+        entry: PartitionEntry,
+    ) -> Result<()> {
+        let mut latest = Manifest::load(path)?;
+        latest.record(key, entry);
+        latest.save(path)?;
+        *self = latest;
+        Ok(())
     }
 
     /// 所有需要处理的月份：给定标的目标区间内，尚未完成的分区。
@@ -455,13 +560,29 @@ pub fn months_between(from: (i32, u32), to: (i32, u32)) -> Vec<(i32, u32)> {
     out
 }
 
+/// 币安归档里某数据集、某标的的路径前缀（`{base}/` 之后的部分）。
+///
+/// 这是**唯一**拼接归档路径前缀的地方——除了 [`archive_url_and_name`]，
+/// 将来做 S3 列举（比对本地台账与归档实际内容）时也应该复用它，不要在
+/// 别处重新拼一遍字符串。
+///
+/// K 线类数据集（`klines`、`markPriceKlines`）在 `{symbol}/` 之后还有一层
+/// 周期目录（`1m/`），此前遗漏这一层导致对应请求全部 404。
+pub fn archive_prefix(kind: DatasetKind, symbol: &str) -> String {
+    let dir = kind.archive_dir();
+    match kind.interval_segment() {
+        Some(seg) => format!("{dir}/{symbol}/{seg}/"),
+        None => format!("{dir}/{symbol}/"),
+    }
+}
+
 /// 分区对应的归档 URL 与文件名。
 pub fn archive_url_and_name(base: &str, key: &PartitionKey) -> (String, String) {
     let tag = key.kind.file_tag();
-    let dir = key.kind.archive_dir();
     let symbol = &key.symbol;
     let name = format!("{symbol}-{tag}-{}-{:02}.zip", key.year, key.month);
-    let url = format!("{base}/{dir}/{symbol}/{name}");
+    let prefix = archive_prefix(key.kind, symbol);
+    let url = format!("{base}/{prefix}{name}");
     (url, name)
 }
 
@@ -498,38 +619,73 @@ mod tests {
         assert!(months_between((2026, 8), (2024, 1)).is_empty());
     }
 
+    /// 实测确认的币安归档 URL 形状——K 线类数据集在 `{symbol}/` 之后还有
+    /// 一层周期目录（`1m/`），此前遗漏导致这类请求全部 404。逐字比较完整
+    /// URL，避免"看起来对但少一层"的回归。
     #[test]
-    fn archive_url_matches_binance_layout() {
-        let key = PartitionKey {
-            kind: DatasetKind::AggTrades,
-            symbol: "ETHUSDC".into(),
-            year: 2026,
-            month: 8,
-        };
-        let (url, name) =
-            archive_url_and_name("https://data.binance.vision/data/futures/um/monthly", &key);
-        assert_eq!(name, "ETHUSDC-aggTrades-2026-08.zip");
-        assert_eq!(
-            url,
-            "https://data.binance.vision/data/futures/um/monthly/aggTrades/ETHUSDC/ETHUSDC-aggTrades-2026-08.zip"
-        );
+    fn archive_urls_match_binance_layout_exactly() {
+        const BASE: &str = "https://data.binance.vision/data/futures/um/monthly";
+        let cases: [(DatasetKind, &str, i32, u32, &str); 4] = [
+            (
+                DatasetKind::Klines1m,
+                "ETHUSDC",
+                2024,
+                1,
+                "https://data.binance.vision/data/futures/um/monthly/klines/ETHUSDC/1m/ETHUSDC-1m-2024-01.zip",
+            ),
+            (
+                DatasetKind::MarkPriceKlines1m,
+                "ETHUSDC",
+                2024,
+                1,
+                "https://data.binance.vision/data/futures/um/monthly/markPriceKlines/ETHUSDC/1m/ETHUSDC-1m-2024-01.zip",
+            ),
+            (
+                DatasetKind::AggTrades,
+                "ETHUSDC",
+                2026,
+                8,
+                "https://data.binance.vision/data/futures/um/monthly/aggTrades/ETHUSDC/ETHUSDC-aggTrades-2026-08.zip",
+            ),
+            (
+                DatasetKind::FundingRate,
+                "ETHUSDC",
+                2026,
+                8,
+                "https://data.binance.vision/data/futures/um/monthly/fundingRate/ETHUSDC/ETHUSDC-fundingRate-2026-08.zip",
+            ),
+        ];
+        for (kind, symbol, year, month, expected_url) in cases {
+            let key = PartitionKey {
+                kind,
+                symbol: symbol.into(),
+                year,
+                month,
+            };
+            let (url, _name) = archive_url_and_name(BASE, &key);
+            assert_eq!(url, expected_url, "{kind:?}");
+        }
     }
 
     #[test]
-    fn klines_archive_url_uses_interval_segment() {
-        let key = PartitionKey {
-            kind: DatasetKind::Klines1m,
-            symbol: "BTCUSDC".into(),
-            year: 2024,
-            month: 1,
-        };
-        let (url, name) =
-            archive_url_and_name("https://data.binance.vision/data/futures/um/monthly", &key);
-        assert_eq!(name, "BTCUSDC-1m-2024-01.zip");
-        assert!(
-            url.contains("/klines/BTCUSDC/BTCUSDC-1m-2024-01.zip"),
-            "{url}"
-        );
+    fn api_name_round_trips_for_all_kinds() {
+        for k in DatasetKind::ALL {
+            let name = k.api_name();
+            assert_eq!(DatasetKind::from_api_name(name), Ok(k), "{name}");
+        }
+    }
+
+    #[test]
+    fn from_api_name_rejects_unknown_and_lists_options() {
+        let err = DatasetKind::from_api_name("klienes").unwrap_err();
+        assert!(err.contains("klienes"), "{err}");
+        for k in DatasetKind::ALL {
+            assert!(
+                err.contains(k.api_name()),
+                "错误信息应列出可用选项 {}：{err}",
+                k.api_name()
+            );
+        }
     }
 
     /// 行数期望是判断"数据是否完整"的依据，必须准确。
@@ -557,6 +713,22 @@ mod tests {
 
         let err = Manifest::load(&path).unwrap_err().to_string();
         assert!(err.contains("99"), "错误信息应包含实际版本号：{err}");
+        assert!(err.contains("拒绝"), "必须拒绝而非静默重置：{err}");
+    }
+
+    /// 0 不是合法的历史版本（迁移梯子最早只到 v1），同样必须拒绝。
+    #[test]
+    fn schema_version_zero_is_rejected_not_reset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(
+            &path,
+            br#"{"schema_version":0,"partitions":[],"gaps":[],"updated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let err = Manifest::load(&path).unwrap_err().to_string();
+        assert!(err.contains('0'), "错误信息应包含实际版本号：{err}");
         assert!(err.contains("拒绝"), "必须拒绝而非静默重置：{err}");
     }
 
@@ -763,5 +935,189 @@ mod tests {
             m.coverage(DatasetKind::Klines1m, "ETHUSDC"),
             vec![(2024, 1)]
         );
+    }
+
+    /// 构造一份 v1 台账样例：klines/markPriceKlines 因 v1 程序的错误 URL
+    /// 被误标为 `NotInArchive`，agg_trades 的 `NotInArchive` 是真实的
+    /// （没有周期目录，URL 一直是对的），还有一条已经 `Finalized` 的
+    /// klines 分区（同一分区曾在其他月份成功过）。
+    fn v1_sample_bytes() -> Vec<u8> {
+        let file = ManifestFile {
+            schema_version: 1,
+            partitions: vec![
+                ManifestRecord {
+                    kind: DatasetKind::Klines1m,
+                    symbol: "ETHUSDC".into(),
+                    year: 2024,
+                    month: 1,
+                    entry: PartitionEntry {
+                        status: PartitionStatus::NotInArchive,
+                        ..PartitionEntry::absent()
+                    },
+                },
+                ManifestRecord {
+                    kind: DatasetKind::AggTrades,
+                    symbol: "ETHUSDC".into(),
+                    year: 2024,
+                    month: 1,
+                    entry: PartitionEntry {
+                        status: PartitionStatus::NotInArchive,
+                        ..PartitionEntry::absent()
+                    },
+                },
+                ManifestRecord {
+                    kind: DatasetKind::Klines1m,
+                    symbol: "ETHUSDC".into(),
+                    year: 2024,
+                    month: 2,
+                    entry: PartitionEntry {
+                        status: PartitionStatus::Finalized {
+                            row_count: 1440 * 29,
+                            min_ts: Utc::now(),
+                            max_ts: Utc::now(),
+                        },
+                        ..PartitionEntry::absent()
+                    },
+                },
+            ],
+            gaps: vec![],
+            updated_at: Utc::now(),
+        };
+        serde_json::to_vec_pretty(&file).unwrap()
+    }
+
+    /// v1 → v2 迁移的核心诉求：被误标的 klines NotInArchive 重新变成待办，
+    /// 而没受影响的 agg_trades NotInArchive 与 Finalized klines 都保留。
+    #[test]
+    fn v1_klines_not_in_archive_becomes_pending_after_migration() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, v1_sample_bytes()).unwrap();
+
+        let m = Manifest::load(&path).unwrap();
+        assert_eq!(m.schema_version, CURRENT_SCHEMA_VERSION);
+
+        let pending = m.pending(DatasetKind::Klines1m, "ETHUSDC", (2024, 1), (2024, 2));
+        assert_eq!(
+            pending,
+            vec![PartitionKey {
+                kind: DatasetKind::Klines1m,
+                symbol: "ETHUSDC".into(),
+                year: 2024,
+                month: 1,
+            }],
+            "被误标 NotInArchive 的 2024-01 应重新出现在待办里，2024-02 已 Finalized 不应出现"
+        );
+
+        assert!(
+            m.entry(&PartitionKey {
+                kind: DatasetKind::AggTrades,
+                symbol: "ETHUSDC".into(),
+                year: 2024,
+                month: 1,
+            })
+            .is_some(),
+            "agg_trades 的 NotInArchive 不受 klines 迁移影响，应保留"
+        );
+
+        let finalized = m
+            .entry(&PartitionKey {
+                kind: DatasetKind::Klines1m,
+                symbol: "ETHUSDC".into(),
+                year: 2024,
+                month: 2,
+            })
+            .unwrap();
+        assert!(finalized.status.is_usable(), "Finalized 分区不能被误删");
+    }
+
+    /// 重启测试：v1 加载 → 保存 → 再加载，版本落盘为 2；且已经是 v2 的
+    /// klines NotInArchive 不会被再次清除（迁移只对 schema_version==1 生效）。
+    #[test]
+    fn v1_to_v2_migration_persists_and_is_not_reapplied() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, v1_sample_bytes()).unwrap();
+
+        let mut m = Manifest::load(&path).unwrap();
+        m.save(&path).unwrap();
+
+        let reloaded = Manifest::load(&path).unwrap();
+        assert_eq!(reloaded.schema_version, CURRENT_SCHEMA_VERSION);
+
+        // 现在台账已经是 v2。往里面记一条新的 klines NotInArchive——代表
+        // 这次是归档确实没有该分区（不是 URL 错误造成的误判）。
+        let mut m2 = Manifest::load(&path).unwrap();
+        let fresh_key = PartitionKey {
+            kind: DatasetKind::Klines1m,
+            symbol: "ETHUSDC".into(),
+            year: 2023,
+            month: 12,
+        };
+        m2.record(
+            fresh_key.clone(),
+            PartitionEntry {
+                status: PartitionStatus::NotInArchive,
+                ..PartitionEntry::absent()
+            },
+        );
+        m2.save(&path).unwrap();
+
+        let reloaded_again = Manifest::load(&path).unwrap();
+        assert_eq!(reloaded_again.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(
+            reloaded_again.entry(&fresh_key).is_some(),
+            "v2 台账里的 NotInArchive 不应被 v1→v2 迁移逻辑再次清除"
+        );
+    }
+
+    /// `record_and_save` 必须只合并单个分区，不能让两个内存副本的整份
+    /// 保存互相覆盖对方刚写的分区。
+    #[test]
+    fn record_and_save_merges_across_two_manifest_instances() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+
+        let mut m1 = Manifest::default();
+        let mut m2 = Manifest::default();
+
+        let key1 = PartitionKey {
+            kind: DatasetKind::Klines1m,
+            symbol: "ETHUSDC".into(),
+            year: 2024,
+            month: 1,
+        };
+        let key2 = PartitionKey {
+            kind: DatasetKind::AggTrades,
+            symbol: "ETHUSDC".into(),
+            year: 2024,
+            month: 1,
+        };
+
+        m1.record_and_save(
+            &path,
+            key1.clone(),
+            PartitionEntry {
+                status: PartitionStatus::NotInArchive,
+                ..PartitionEntry::absent()
+            },
+        )
+        .unwrap();
+        m2.record_and_save(
+            &path,
+            key2.clone(),
+            PartitionEntry {
+                status: PartitionStatus::NotInArchive,
+                ..PartitionEntry::absent()
+            },
+        )
+        .unwrap();
+
+        let on_disk = Manifest::load(&path).unwrap();
+        assert!(
+            on_disk.entry(&key1).is_some(),
+            "m1 写的分区不能被 m2 的保存覆盖"
+        );
+        assert!(on_disk.entry(&key2).is_some(), "m2 写的分区必须在磁盘上");
     }
 }

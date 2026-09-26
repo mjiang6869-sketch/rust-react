@@ -30,6 +30,43 @@ use crate::manifest::DatasetKind;
 /// 每个 row group 的行数。10 万行在压缩率与内存之间比较平衡。
 pub const BATCH_ROWS: usize = 100_000;
 
+/// 转换过程中使用的临时文件路径：同目录下加 `.tmp` 后缀。
+///
+/// 同目录很重要——`rename` 跨文件系统不是原子操作，同目录能保证是。
+fn tmp_path_for(out_path: &Path) -> std::path::PathBuf {
+    let name = out_path
+        .file_name()
+        .map(|n| format!("{}.tmp", n.to_string_lossy()))
+        .unwrap_or_else(|| "data.parquet.tmp".to_string());
+    out_path.with_file_name(name)
+}
+
+/// 进程中途被杀时，`.tmp` 文件必须不被当成有效产物。这个 guard 在成功路径
+/// 上显式 `disarm()`，其它任何退出路径（`?`、`bail!`、panic 展开）都会在
+/// `Drop` 里删除残留的 `.tmp`。
+struct TmpFileGuard<'a> {
+    path: &'a Path,
+    active: bool,
+}
+
+impl<'a> TmpFileGuard<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self { path, active: true }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TmpFileGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
 /// 转换结果的统计。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversionStats {
@@ -175,13 +212,40 @@ pub fn convert_csv_to_parquet(
     csv_path: &Path,
     out_path: &Path,
 ) -> Result<ConversionStats> {
+    convert_csv_to_parquet_with_progress(kind, csv_path, out_path, &mut |_, _| true)
+}
+
+/// 带进度回调的版本。
+///
+/// `on_progress(done_bytes, total_bytes)` 在每个批次写完后调用一次（批次
+/// 大小见 [`BATCH_ROWS`]）；返回 `false` 表示应取消——函数会立即返回一个
+/// 文案包含"取消"的错误，且保证不留下最终文件与 `.tmp` 残留
+/// （[`TmpFileGuard`] 在任何提前返回路径上都会清理 `.tmp`，而最终文件只在
+/// 转换全部完成后才通过 rename 产生）。
+pub fn convert_csv_to_parquet_with_progress(
+    kind: DatasetKind,
+    csv_path: &Path,
+    out_path: &Path,
+    on_progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<ConversionStats> {
     let file =
         File::open(csv_path).with_context(|| format!("打开 CSV 失败: {}", csv_path.display()))?;
+    let total_bytes = file
+        .metadata()
+        .with_context(|| format!("读取 CSV 元数据失败: {}", csv_path.display()))?
+        .len();
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
 
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
+    // 原子写：先写到同目录的 `.tmp`，成功后才 fsync + rename 到最终路径。
+    // 任何错误退出路径都靠 `TmpFileGuard` 清理 `.tmp`，避免进程中途被杀
+    // 时在 `out_path` 或残留的 `.tmp` 留下半成品。
+    let tmp_path = tmp_path_for(out_path);
+    let _ = std::fs::remove_file(&tmp_path); // 清理上次中途被杀留下的残留
+    let tmp_guard = TmpFileGuard::new(&tmp_path);
 
     let schema = schema_for(kind);
     let props = WriterProperties::builder()
@@ -189,14 +253,14 @@ pub fn convert_csv_to_parquet(
         .set_compression(Compression::ZSTD(Default::default()))
         .set_max_row_group_size(BATCH_ROWS)
         .build();
-    let out = File::create(out_path)
-        .with_context(|| format!("创建 Parquet 失败: {}", out_path.display()))?;
+    let out = File::create(&tmp_path)
+        .with_context(|| format!("创建 Parquet 失败: {}", tmp_path.display()))?;
     let mut writer = ArrowWriter::try_new(out, schema.clone(), Some(props))
         .context("初始化 Parquet writer 失败")?;
 
     // 表头
     let mut header = String::new();
-    reader.read_line(&mut header).context("读取 CSV 表头失败")?;
+    let mut bytes_read = reader.read_line(&mut header).context("读取 CSV 表头失败")? as u64;
     let expected_cols = schema.fields().len();
     let header_cols = header.trim_end().split(',').count();
     if header_cols != expected_cols {
@@ -225,6 +289,7 @@ pub fn convert_csv_to_parquet(
         if n == 0 {
             break;
         }
+        bytes_read += n as u64;
         line_no += 1;
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
@@ -259,6 +324,9 @@ pub fn convert_csv_to_parquet(
         if rows.is_full() {
             let batch = rows.take_batch(kind, &schema)?;
             writer.write(&batch).context("写入 Parquet 失败")?;
+            if !on_progress(bytes_read, total_bytes) {
+                bail!("转换已取消: {}", csv_path.display());
+            }
         }
     }
 
@@ -266,12 +334,33 @@ pub fn convert_csv_to_parquet(
         let batch = rows.take_batch(kind, &schema)?;
         writer.write(&batch).context("写入 Parquet 失败")?;
     }
+    if !on_progress(bytes_read, total_bytes) {
+        bail!("转换已取消: {}", csv_path.display());
+    }
 
     if stats.row_count == 0 {
         bail!("CSV 没有任何数据行: {}", csv_path.display());
     }
 
     writer.close().context("收尾 Parquet 失败")?;
+
+    // fsync tmp 文件内容，再原子 rename 到最终路径，最后 fsync 父目录确保
+    // rename 本身落盘——沿用 `manifest::save` 里验证过的模式。
+    {
+        let f = File::open(&tmp_path)
+            .with_context(|| format!("重新打开 Parquet 用于 fsync 失败: {}", tmp_path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync Parquet 失败: {}", tmp_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, out_path)
+        .with_context(|| format!("替换 Parquet 失败: {}", out_path.display()))?;
+    if let Some(parent) = out_path.parent() {
+        let dir = File::open(parent)
+            .with_context(|| format!("打开 Parquet 目录失败: {}", parent.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("fsync Parquet 目录失败: {}", parent.display()))?;
+    }
+    tmp_guard.disarm();
 
     Ok(stats)
 }
@@ -389,6 +478,24 @@ mod tests {
         assert!(stats.internal_gaps.is_empty(), "两行相隔 60 秒，不是缺口");
     }
 
+    /// 成功转换后：最终 Parquet 文件必须存在，且不能留下 `.tmp` 残留。
+    #[test]
+    fn successful_conversion_leaves_final_file_and_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = write_csv(
+            dir.path(),
+            "k.csv",
+            "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n\
+             1785542400000,1860.24,1861.29,1860.01,1861.15,700.611,1785542459999,1303525.72961,987,414.070,770424.15195,0\n",
+        );
+        let out = dir.path().join("k.parquet");
+        let tmp = dir.path().join("k.parquet.tmp");
+        convert_csv_to_parquet(DatasetKind::Klines1m, &csv, &out).unwrap();
+
+        assert!(out.exists(), "最终文件应存在");
+        assert!(!tmp.exists(), "成功后不应留下 .tmp 残留");
+    }
+
     #[test]
     fn agg_trades_convert_preserves_direction_flag() {
         let dir = tempfile::tempdir().unwrap();
@@ -465,6 +572,27 @@ mod tests {
         assert!(convert_csv_to_parquet(DatasetKind::Klines1m, &csv, &out).is_err());
     }
 
+    /// 坏行导致转换失败后：最终路径不能存在，`.tmp` 也不能留下残留
+    /// ——否则进程被杀在写入中途会让 `lake/…/data.parquet.tmp` 一直躺在
+    /// 磁盘上，且下次重跑前如果误读到它会当成半成品数据。
+    #[test]
+    fn failed_conversion_leaves_neither_final_nor_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = write_csv(
+            dir.path(),
+            "bad_row.csv",
+            "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n\
+             1785542400000,1860.24,1861.29,1860.01,1861.15,700.611,1785542459999,1303525.72961,987,414.070,770424.15195,0\n\
+             not_a_number,1861.15,1861.50,1860.90,1861.40,500.000,1785542519999,930000.00000,500,200.000,372000.00000,0\n",
+        );
+        let out = dir.path().join("bad_row.parquet");
+        let tmp = dir.path().join("bad_row.parquet.tmp");
+
+        assert!(convert_csv_to_parquet(DatasetKind::Klines1m, &csv, &out).is_err());
+        assert!(!out.exists(), "转换失败后最终文件不应存在");
+        assert!(!tmp.exists(), "转换失败后 .tmp 也不应留下残留");
+    }
+
     /// 超过 8 位小数的价格必须报错而非静默截断。
     #[test]
     fn excessive_precision_is_rejected_not_truncated() {
@@ -513,5 +641,75 @@ mod tests {
         let out = dir.path().join("big.parquet");
         let stats = convert_csv_to_parquet(DatasetKind::Klines1m, &csv, &out).unwrap();
         assert_eq!(stats.row_count, total as u64, "跨批次不能丢行");
+    }
+
+    fn multi_batch_csv(dir: &Path, name: &str, batches: usize) -> (std::path::PathBuf, u64) {
+        let mut content = String::from(
+            "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n",
+        );
+        let total = BATCH_ROWS * batches + 137; // 刻意跨批次边界
+        for i in 0..total {
+            content.push_str(&format!(
+                "{},100.00,101.00,99.00,100.50,1.000,{},1.0,1,0.5,0.5,0\n",
+                1785542400000i64 + (i as i64) * 60_000,
+                1785542459999i64 + (i as i64) * 60_000
+            ));
+        }
+        let csv = write_csv(dir, name, &content);
+        let size = std::fs::metadata(&csv).unwrap().len();
+        (csv, size)
+    }
+
+    /// 跨多批的 CSV：进度回调的 `done` 单调不减，最后一次等于文件大小。
+    #[test]
+    fn progress_callback_is_monotonic_and_ends_at_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let (csv, size) = multi_batch_csv(dir.path(), "multi.csv", 3);
+        let out = dir.path().join("multi.parquet");
+
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let stats = convert_csv_to_parquet_with_progress(
+            DatasetKind::Klines1m,
+            &csv,
+            &out,
+            &mut |done, total| {
+                seen.push((done, total));
+                true
+            },
+        )
+        .unwrap();
+
+        assert!(stats.row_count > 0);
+        assert!(seen.len() >= 3, "至少应跨越多个批次汇报进度：{seen:?}");
+        for i in 1..seen.len() {
+            assert!(seen[i].0 >= seen[i - 1].0, "done 不能倒退：{seen:?}");
+        }
+        let (last_done, last_total) = *seen.last().unwrap();
+        assert_eq!(last_done, size, "最后一次 done 应等于文件大小");
+        assert_eq!(last_total, size);
+    }
+
+    /// 回调返回 `false` 必须取消转换：错误文案含"取消"，最终文件与 `.tmp`
+    /// 都不能留下——否则半成品会被下次误当成有效缓存。
+    #[test]
+    fn progress_callback_returning_false_cancels_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (csv, _size) = multi_batch_csv(dir.path(), "cancel.csv", 2);
+        let out = dir.path().join("cancel.parquet");
+        let tmp = dir.path().join("cancel.parquet.tmp");
+
+        let mut calls = 0u32;
+        let err =
+            convert_csv_to_parquet_with_progress(DatasetKind::Klines1m, &csv, &out, &mut |_, _| {
+                calls += 1;
+                false
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("取消"), "{err}");
+        assert!(!out.exists(), "取消后最终文件不应存在");
+        assert!(!tmp.exists(), "取消后 .tmp 不应留下残留");
+        assert!(calls >= 1);
     }
 }

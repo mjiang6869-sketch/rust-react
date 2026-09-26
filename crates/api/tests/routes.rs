@@ -820,6 +820,122 @@ async fn download_validates_input() {
     assert!(body["message"].as_str().unwrap().contains("晚于"));
 }
 
+/// 未知数据集必须在生成任何任务前就被拒绝，且错误信息列出可用选项。
+#[tokio::test]
+async fn download_rejects_unknown_kind() {
+    let s = test_state();
+    let (status, body) = post_json(
+        &s,
+        "/api/v1/data/download",
+        serde_json::json!({ "symbols": ["ETHUSDC"], "kinds": ["bogus"], "from": "2026-01", "to": "2026-02" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("klines"),
+        "错误信息应列出可用数据集：{body}"
+    );
+}
+
+/// 交易对里的路径穿越字符必须在发出任何请求（乃至启动后台任务）之前被拒绝。
+#[tokio::test]
+async fn download_rejects_symbol_injection() {
+    let s = test_state();
+    let (status, body) = post_json(
+        &s,
+        "/api/v1/data/download",
+        serde_json::json!({ "symbols": ["../x"], "kinds": ["klines"], "from": "2026-01", "to": "2026-02" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// 没有任务时 GET 必须报 idle。
+#[tokio::test]
+async fn download_get_reports_idle_without_task() {
+    let s = test_state();
+    let (status, body) = get(&s, "/api/v1/data/download").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["state"], "idle");
+}
+
+/// 已有下载任务在跑时，再次 POST 必须返回 409，且不能扰乱正在进行的任务。
+#[tokio::test]
+async fn download_post_conflicts_when_already_running() {
+    let s = test_state();
+    let _guard = s
+        .downloads()
+        .try_start(api::state::DownloadJobRequestSnapshot {
+            symbols: vec!["ETHUSDC".into()],
+            kinds: vec!["klines".into()],
+            from: "2026-01".into(),
+            to: "2026-02".into(),
+        })
+        .expect("应能开始第一个任务");
+
+    let (status, body) = post_json(
+        &s,
+        "/api/v1/data/download",
+        serde_json::json!({ "symbols": ["ETHUSDC"], "kinds": ["klines"], "from": "2026-01", "to": "2026-02" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        s.downloads().snapshot().state,
+        "running",
+        "第一个任务不应受影响"
+    );
+}
+
+/// 没有任务时取消必须 409，不能假装成功。
+#[tokio::test]
+async fn download_cancel_conflicts_without_task() {
+    let s = test_state();
+    let (status, body) = post_json(&s, "/api/v1/data/download/cancel", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+/// 有任务时取消必须成功，且必须真的触发取消令牌，不能只是回报"有任务"。
+#[tokio::test]
+async fn download_cancel_succeeds_with_running_task() {
+    let s = test_state();
+    let guard = s
+        .downloads()
+        .try_start(api::state::DownloadJobRequestSnapshot {
+            symbols: vec!["ETHUSDC".into()],
+            kinds: vec!["klines".into()],
+            from: "2026-01".into(),
+            to: "2026-02".into(),
+        })
+        .expect("应能开始任务");
+    let token = guard.cancel_token();
+
+    let (status, body) = post_json(&s, "/api/v1/data/download/cancel", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["cancelled"], true);
+    assert!(token.is_cancelled(), "cancel 接口必须真的触发取消令牌");
+}
+
+// ---------------------------------------------------------------------------
+// 归档范围
+// ---------------------------------------------------------------------------
+
+/// 交易对校验必须在发出任何网络请求前拒绝非法输入。
+#[tokio::test]
+async fn archive_range_rejects_invalid_symbol() {
+    let s = test_state();
+    let (status, body) = get(&s, "/api/v1/data/archive-range?symbol=%21%21").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// 非法数据集名称必须 400，且不能触发任何网络请求。
+#[tokio::test]
+async fn archive_range_rejects_unknown_kind() {
+    let s = test_state();
+    let (status, body) = get(&s, "/api/v1/data/archive-range?symbol=ETHUSDC&kinds=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
 /// 未知路由返回 404 而非 500。
 #[tokio::test]
 async fn unknown_route_is_not_found() {

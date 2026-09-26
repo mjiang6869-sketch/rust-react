@@ -229,6 +229,9 @@ pnpm build
 ```sh
 cargo run -p cli -- download --symbol ETHUSDC --kind klines,agg_trades \
     --from 2026-01 --to 2026-08
+# 从归档里最早的月份同步到最新的月份（范围由归档列表自动发现）
+cargo run --release -p cli -- download --symbol ETHUSDC \
+    --kind klines,agg_trades,mark_price,funding --from earliest --to latest
 cargo run -p cli -- coverage --symbol ETHUSDC
 cargo run -p cli -- backtest --symbol ETHUSDC \
     --from 2026-08-01 --to 2026-08-07 --fill-models m0,m1
@@ -251,6 +254,27 @@ cargo run -p cli -- models
 
 数据落盘为 Parquet（Hive 分区），DuckDB 直接 SQL 查询。下载台账记录每个
 分区的状态与校验和，重跑会跳过已完成的分区。
+
+**起止月份**：每个交易对、每个数据集在归档里的最早/最晚月份由 data.binance.vision
+背后的 S3 列表接口自动发现（不是币安交易接口，不计 IP 权重），下载区间会按各
+数据集自己的范围裁剪，上市前的月份不会产生 404 噪音。界面「数据管理」页的
+「从最早开始」按钮、CLI 的 `--from earliest --to latest` 都走这条路；对应接口
+`GET /api/v1/data/archive-range?symbol=ETHUSDC`。当月的月度包要到下月初才生成，
+最近一个月的 404 记为可重试的失败，而不是「归档无此分区」的终态。
+
+**下载任务**：同一时间只允许一个下载任务（第二次启动返回 409）。任务状态在
+`GET /api/v1/data/download`，进度按阶段（下载 / 校验 / 解压 / 转换）推送，刷新
+页面可立即看到；`POST /api/v1/data/download/cancel` 取消。任何时候中断（取消、
+重启、断网）都可以续跑：已下载的 ZIP 保留并断点续传，Parquet 先写临时文件再
+改名，不会留下半成品。
+
+**转换速度**：大批量下载建议用 release 构建运行（`RC_RELEASE=1 ./scripts/run.sh
+restart` 或 `cargo run --release -p cli -- download …`），debug 构建下解压与
+Parquet 转换会慢数倍。
+
+**台账 v2**：v1 程序拼错了 K 线归档路径（少了 `1m/` 这一层），把所有 K 线与
+标记价 K 线都记成了「归档无此分区」。升级到 v2 时会自动清掉这些误标，让它们
+重新下载；旧版本程序读到 v2 台账会拒绝启动。
 
 ## 安全
 

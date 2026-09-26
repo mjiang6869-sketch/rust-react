@@ -75,8 +75,8 @@ download 选项：
   --symbol <SYM>          交易对（可重复，或用逗号分隔）
   --kind <KIND>           数据集：klines / agg_trades / mark_price / funding
                           （可重复，或用逗号分隔）
-  --from <YYYY-MM>        起始月份
-  --to <YYYY-MM>          结束月份
+  --from <YYYY-MM|earliest>  起始月份，或 earliest（归档实际最早月份）
+  --to <YYYY-MM|latest>      结束月份，或 latest（归档实际最晚月份）
   --data-root <PATH>      数据根目录（默认 {DEFAULT_DATA_ROOT}）
   --concurrency <N>       并发下载数（默认 4）
 
@@ -95,6 +95,7 @@ coverage 选项：
 
 示例：
   rc download --symbol ETHUSDC --kind klines,agg_trades --from 2026-01 --to 2026-08
+  rc download --symbol ETHUSDC --kind klines,agg_trades --from earliest --to latest
   rc backtest --symbol ETHUSDC --from 2026-08-01 --to 2026-08-31 --fill-models m0,m1
 "#
     );

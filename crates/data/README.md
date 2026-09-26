@@ -67,6 +67,25 @@ curl -s -r 0-0 -o /dev/null -D - "$URL" | grep -i content-range
 # -> content-range: bytes 0-0/348352540
 ```
 
+### 3. K 线类路径多一层周期目录
+
+K 线与标记价 K 线的归档路径是 `klines/ETHUSDC/1m/ETHUSDC-1m-2024-01.zip`，比
+`aggTrades/ETHUSDC/ETHUSDC-aggTrades-2024-01.zip` 多一层 `1m/`。少这一层会 404，
+而 404 又被当成「归档无此分区」的终态——v1 台账就是这样把全部 K 线误标的。
+路径只在 `manifest::archive_prefix` 一处拼接，下载与列举共用。
+
+### 4. 续传遇到 416
+
+本地 ZIP 已完整时再发 `Range: bytes=N-`，服务端返回 **416**。它的意思是「本地已
+完整」，不是错误：直接进入 sha256 校验，校验不符再删掉重下。
+
+### 5. 列举必须用 S3 主机
+
+`https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?prefix=…&delimiter=/`
+返回按 key 升序的 XML；同样的查询打到 `data.binance.vision` 只返回 HTML 页面。
+列举用来发现每个数据集的最早/最晚月份（`archive_index`）。这个主机不带任何凭据，
+**绝不能**加入 `exchange` 的签名白名单。
+
 ## 落盘格式
 
 ### 定点整数，不用字符串或浮点
@@ -108,6 +127,11 @@ curl -s -r 0-0 -o /dev/null -D - "$URL" | grep -i content-range
   恰好 1440/天；资金费 3/天；逐笔成交**没有**期望值（不假装有）。
 - **缺口必须阻断回测**：跨越缺口会凭空发明不可能的成交。
 - **未知 `schema_version` 报错而非重置**：静默重置会丢失"已下载"的记忆。
+- **v1 → v2 迁移**：两版磁盘结构相同，迁移只删除 K 线与标记价 K 线的
+  `NotInArchive` 条目（v1 的 URL 错误导致的误标）。将来结构变化时须为 v1 单独
+  保留反序列化结构。
+- **写入用 `record_and_save`**：每次从磁盘重新加载、只合并一个分区再原子保存，
+  避免多个任务各自整份保存互相覆盖。
 - 解析时**先单独读版本号再解析结构**，这样格式变更时用户看到的是"版本不受
   支持"而不是误导性的"文件损坏"。
 

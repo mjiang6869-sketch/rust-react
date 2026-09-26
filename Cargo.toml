@@ -45,3 +45,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 arrow = "54"
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd", "snap"] }
 duckdb = { version = "1", features = ["bundled"] }
+
+# debug 构建下依赖库也做优化：解压、sha256、Parquet/zstd 编码在未优化时慢数倍，
+# 大批量下载会显得"卡住"。只影响第三方依赖，本仓库代码仍是 debug，调试不受影响；
+# 代价是首次编译变慢。
+[profile.dev.package."*"]
+opt-level = 3

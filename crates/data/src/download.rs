@@ -13,17 +13,19 @@
 //! 5. **校验 sha256**：归档自带 `.CHECKSUM` 文件。校验失败的分区拒绝入库，
 //!    否则会在后续所有回测里静默使用损坏数据。
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{Datelike, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::manifest::{
     DatasetKind, PartitionEntry, PartitionKey, PartitionStatus, archive_url_and_name,
 };
-use crate::parquet_writer::convert_csv_to_parquet;
+use crate::parquet_writer::convert_csv_to_parquet_with_progress;
 
 /// 归档基地址。
 pub const DEFAULT_ARCHIVE_BASE: &str = "https://data.binance.vision/data/futures/um/monthly";
@@ -110,6 +112,60 @@ pub enum DownloadOutcome {
     Skipped,
 }
 
+/// `fetch_partition` 内部的阶段，用于细粒度进度上报。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// 下载 ZIP。
+    Downloading,
+    /// 校验 sha256。
+    Verifying,
+    /// 解压 CSV。
+    Extracting,
+    /// 转换为 Parquet。
+    Converting,
+}
+
+impl Stage {
+    /// 中文展示名，供终端/前端直接显示。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Stage::Downloading => "下载",
+            Stage::Verifying => "校验",
+            Stage::Extracting => "解压",
+            Stage::Converting => "转换",
+        }
+    }
+
+    /// 小写英文标签，供日志/机器可读场景使用。
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Stage::Downloading => "downloading",
+            Stage::Verifying => "verifying",
+            Stage::Extracting => "extracting",
+            Stage::Converting => "converting",
+        }
+    }
+}
+
+/// 协作式取消令牌。
+///
+/// `clone()` 出的每个副本共享同一个底层标记：任一副本调用 `cancel()`，
+/// 所有副本的 `is_cancelled()` 都会立即观察到。
+#[derive(Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// 请求取消。
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// 是否已被请求取消。
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// 下载器的进度回调。
 pub trait DownloadProgress: Send {
     fn on_start(&mut self, key: &PartitionKey, url: &str);
@@ -118,6 +174,10 @@ pub trait DownloadProgress: Send {
     fn on_skip(&mut self, key: &PartitionKey);
     fn on_absent(&mut self, key: &PartitionKey);
     fn on_error(&mut self, key: &PartitionKey, err: &str);
+    /// 阶段内细粒度进度（字节数）。`total` 未知时为 `None`。
+    ///
+    /// 默认空实现——现有的 `DownloadProgress` 实现不需要跟着改。
+    fn on_stage(&mut self, _key: &PartitionKey, _stage: Stage, _done: u64, _total: Option<u64>) {}
 }
 
 /// 无操作回调。
@@ -131,6 +191,131 @@ impl DownloadProgress for QuietProgress {
     fn on_error(&mut self, _: &PartitionKey, _: &str) {}
 }
 
+/// HTTP 响应分类的结果。
+///
+/// 把"服务器返回了什么状态码"翻译成"下载器该做什么"，与网络请求本身
+/// 解耦，方便对每种组合单独测试（尤其是容易被忽略的 416/404 边界）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RespAction {
+    /// 全新下载（覆盖写）。
+    Fresh,
+    /// 断点续传：服务器接受了 Range 请求，追加写。
+    Append,
+    /// 本地文件已经完整——服务器对"从已有长度开始"的 Range 请求回了
+    /// 416（Range Not Satisfiable）。跳过下载，直接进入校验。
+    AlreadyComplete,
+    /// 归档里确实没有这个分区（标的当时尚未上线等）。终态。
+    NotInArchive,
+    /// 分区所在月份还没到归档发布的时间（monthly 包要到下月初才生成）。
+    /// 不是终态——应记为可重试的失败，而不是 `NotInArchive`。
+    NotYetPublished,
+    /// 其它任何状态码，视为错误。
+    Error(String),
+}
+
+/// 归档月度包发布的时间规律：当月与上月的包可能还没生成。
+///
+/// 用来把"这个月份的 404 是不是因为包还没发布"与"归档里真的没有这个
+/// 分区"区分开——前者应该重试，后者是终态。
+fn previous_month(today: NaiveDate) -> (i32, u32) {
+    let y = today.year();
+    let m = today.month();
+    if m == 1 { (y - 1, 12) } else { (y, m - 1) }
+}
+
+/// 把 HTTP 响应状态翻译成下载器该采取的动作。
+///
+/// 纯函数，不做任何 IO——方便穷举所有状态码组合做表驱动测试。
+pub fn classify_response(
+    status: reqwest::StatusCode,
+    existing_len: u64,
+    key: &PartitionKey,
+    today: NaiveDate,
+) -> RespAction {
+    match status {
+        reqwest::StatusCode::OK => RespAction::Fresh,
+        reqwest::StatusCode::PARTIAL_CONTENT if existing_len > 0 => RespAction::Append,
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE if existing_len > 0 => {
+            RespAction::AlreadyComplete
+        }
+        reqwest::StatusCode::NOT_FOUND => {
+            let (py, pm) = previous_month(today);
+            if (key.year, key.month) >= (py, pm) {
+                RespAction::NotYetPublished
+            } else {
+                RespAction::NotInArchive
+            }
+        }
+        other => RespAction::Error(format!("HTTP {other}")),
+    }
+}
+
+/// 从 `Content-Range: bytes a-b/TOTAL` 里取总长度。
+///
+/// `TOTAL` 为 `*` 时代表服务器不知道总长，返回 `None`。
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    let total = value.rsplit('/').next()?;
+    if total == "*" {
+        None
+    } else {
+        total.parse().ok()
+    }
+}
+
+/// 在 blocking 线程池里跑一段同步代码，把进度转发给 `progress.on_stage`。
+///
+/// `f` 收到的 `report` 回调：调用一次就把 `(done, total)` 发给异步侧触发
+/// `on_stage`，返回值是"是否应继续"——`cancel` 一旦被置位就恒为 `false`，
+/// `f` 应据此尽快返回一个文案含"取消"的错误。
+///
+/// 用 `mpsc` + `select!` 转发，而不是 `block_in_place`：本项目部分场景跑在
+/// `current_thread` runtime 上，`block_in_place` 在其下会直接 panic。
+async fn run_blocking_with_progress<T, F>(
+    key: &PartitionKey,
+    stage: Stage,
+    progress: &mut dyn DownloadProgress,
+    cancel: &CancelToken,
+    f: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut dyn FnMut(u64, Option<u64>) -> bool) -> Result<T> + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
+    let cancel = cancel.clone();
+
+    let mut handle = tokio::task::spawn_blocking(move || {
+        let mut report = move |done: u64, total: Option<u64>| -> bool {
+            let _ = tx.send((done, total));
+            !cancel.is_cancelled()
+        };
+        f(&mut report)
+    });
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Some((done, total)) => progress.on_stage(key, stage, done, total),
+                    None => break,
+                }
+            }
+            res = &mut handle => {
+                while let Ok((done, total)) = rx.try_recv() {
+                    progress.on_stage(key, stage, done, total);
+                }
+                return res.context("blocking 任务 panic")?;
+            }
+        }
+    }
+
+    // channel 已关闭（blocking 闭包已跑完 report），handle 应该马上就能拿到。
+    while let Ok((done, total)) = rx.try_recv() {
+        progress.on_stage(key, stage, done, total);
+    }
+    handle.await.context("blocking 任务 panic")?
+}
+
 /// 下载并转换一个分区。
 ///
 /// 步骤：下载 ZIP → 校验 sha256 → 解压 CSV 到独立的按数据集目录 → 转 Parquet
@@ -141,7 +326,12 @@ pub async fn fetch_partition(
     key: &PartitionKey,
     base_url: &str,
     progress: &mut dyn DownloadProgress,
+    cancel: &CancelToken,
 ) -> Result<(DownloadOutcome, PartitionEntry)> {
+    if cancel.is_cancelled() {
+        bail!("已取消：{key}");
+    }
+
     let (url, _name) = archive_url_and_name(base_url, key);
     progress.on_start(key, &url);
 
@@ -167,38 +357,70 @@ pub async fn fetch_partition(
         .with_context(|| format!("请求失败: {url}"))?;
 
     let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        // 归档里没有这个分区。这是终态，不是错误——标的可能当时还没上线。
-        progress.on_absent(key);
-        return Ok((
-            DownloadOutcome::NotInArchive,
-            PartitionEntry {
-                status: PartitionStatus::NotInArchive,
-                ..PartitionEntry::absent()
-            },
-        ));
-    }
-    if !status.is_success() {
-        bail!("HTTP {} 下载 {}", status, url);
-    }
+    let action = classify_response(status, existing, key, Utc::now().date_naive());
 
-    {
-        let append = existing > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
-        let mut file = if append {
-            tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(&zip_path)
-                .await?
-        } else {
-            tokio::fs::File::create(&zip_path).await?
-        };
-        let mut stream = resp.bytes_stream();
-        use futures_util::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("下载流中断")?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+    match action {
+        RespAction::NotInArchive => {
+            // 归档里没有这个分区。这是终态，不是错误——标的可能当时还没上线。
+            // 记下请求的 URL：万一将来这个判断本身出错（例如又漏拼了一层
+            // 路径），台账里留着的 URL 能让人一眼看出问题，而不必凭空猜测。
+            progress.on_absent(key);
+            return Ok((
+                DownloadOutcome::NotInArchive,
+                PartitionEntry {
+                    status: PartitionStatus::NotInArchive,
+                    source_url: Some(url),
+                    ..PartitionEntry::absent()
+                },
+            ));
         }
-        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        RespAction::NotYetPublished => {
+            // 不是终态：不能标记 NotInArchive，否则会永久跳过这个分区。
+            // 让它冒泡成 Err，调用方会记为 Failed（可重试）。
+            bail!("归档尚未发布：{key}，月度包要到下月初才生成");
+        }
+        RespAction::Error(msg) => {
+            bail!("{msg} 下载 {url}");
+        }
+        RespAction::AlreadyComplete => {
+            // 本地文件已经完整（对已有字节的 Range 请求收到 416）。跳过
+            // 下载，直接进入下面的 sha256 校验；校验不符时会删除文件并
+            // 报错，下次重跑就是全新下载。
+            progress.on_stage(key, Stage::Downloading, existing, Some(existing));
+        }
+        RespAction::Fresh | RespAction::Append => {
+            let append = matches!(action, RespAction::Append);
+            let total = if append {
+                resp.headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_content_range_total)
+            } else {
+                resp.content_length()
+            };
+            let mut file = if append {
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&zip_path)
+                    .await?
+            } else {
+                tokio::fs::File::create(&zip_path).await?
+            };
+            let mut stream = resp.bytes_stream();
+            use futures_util::StreamExt;
+            let mut done = if append { existing } else { 0 };
+            while let Some(chunk) = stream.next().await {
+                if cancel.is_cancelled() {
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
+                    bail!("已取消：{key}");
+                }
+                let chunk = chunk.context("下载流中断")?;
+                tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+                done += chunk.len() as u64;
+                progress.on_stage(key, Stage::Downloading, done, total);
+            }
+            tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        }
     }
 
     let zip_bytes = tokio::fs::metadata(&zip_path).await?.len();
@@ -206,7 +428,14 @@ pub async fn fetch_partition(
     progress.on_downloaded(key, zip_bytes, dl_secs);
 
     // ---- 2. 校验 sha256 ----
-    let sha = sha256_file(&zip_path)?;
+    let sha = {
+        let zip_path_for_task = zip_path.clone();
+        run_blocking_with_progress(key, Stage::Verifying, progress, cancel, move |report| {
+            let mut adapt = |done: u64, total: u64| report(done, Some(total));
+            sha256_file_with_progress(&zip_path_for_task, &mut adapt)
+        })
+        .await?
+    };
     if let Some(expected) = fetch_expected_checksum(client, &url).await {
         if !checksum_matches(&expected, &sha) {
             // 校验失败必须删除文件并报错——留在磁盘上会在下次重跑时
@@ -220,14 +449,56 @@ pub async fn fetch_partition(
     let conv_started = std::time::Instant::now();
     let csv_dir = layout.csv_dir(key);
     tokio::fs::create_dir_all(&csv_dir).await?;
-    let csv_path = extract_single_csv(&zip_path, &csv_dir)?;
+    let csv_path = {
+        let zip_path_for_task = zip_path.clone();
+        let csv_dir_for_task = csv_dir.clone();
+        let result =
+            run_blocking_with_progress(key, Stage::Extracting, progress, cancel, move |report| {
+                let mut adapt = |done: u64, total: u64| report(done, Some(total));
+                extract_single_csv_with_progress(&zip_path_for_task, &csv_dir_for_task, &mut adapt)
+            })
+            .await;
+        match result {
+            Ok(p) => p,
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    let _ = tokio::fs::remove_dir_all(&csv_dir).await;
+                }
+                return Err(e);
+            }
+        }
+    };
 
     // ---- 4. 转 Parquet ----
     let parquet_path = layout.parquet(key);
     if let Some(parent) = parquet_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let stats = convert_csv_to_parquet(key.kind, &csv_path, &parquet_path)?;
+    let stats = {
+        let csv_path_for_task = csv_path.clone();
+        let parquet_path_for_task = parquet_path.clone();
+        let kind = key.kind;
+        let result =
+            run_blocking_with_progress(key, Stage::Converting, progress, cancel, move |report| {
+                let mut adapt = |done: u64, total: u64| report(done, Some(total));
+                convert_csv_to_parquet_with_progress(
+                    kind,
+                    &csv_path_for_task,
+                    &parquet_path_for_task,
+                    &mut adapt,
+                )
+            })
+            .await;
+        match result {
+            Ok(s) => s,
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    let _ = tokio::fs::remove_dir_all(&csv_dir).await;
+                }
+                return Err(e);
+            }
+        }
+    };
     let parquet_bytes = std::fs::metadata(&parquet_path)?.len();
     progress.on_converted(key, stats.row_count, conv_started.elapsed().as_secs());
 
@@ -307,17 +578,48 @@ fn tolerance_for(expected: u64) -> u64 {
 }
 
 /// 计算文件 sha256。
+#[cfg(test)]
 fn sha256_file(path: &Path) -> Result<String> {
+    sha256_file_with_progress(path, &mut |_, _| true)
+}
+
+/// 计算文件 sha256，每读约 8MB 汇报一次 `(done, total)`。
+///
+/// 回调返回 `false` 表示取消：立即返回文案含"取消"的错误，不删除
+/// `path`（保留已下载的 ZIP 以便续传）。
+fn sha256_file_with_progress(
+    path: &Path,
+    on_progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<String> {
+    const REPORT_EVERY: u64 = 8 * 1024 * 1024;
+
     let mut file =
         std::fs::File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
+    let total = file
+        .metadata()
+        .with_context(|| format!("读取文件元数据失败: {}", path.display()))?
+        .len();
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
+    let mut done = 0u64;
+    let mut since_last = 0u64;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        done += n as u64;
+        since_last += n as u64;
+        if since_last >= REPORT_EVERY {
+            since_last = 0;
+            if !on_progress(done, total) {
+                bail!("已取消：sha256 校验 {}", path.display());
+            }
+        }
+    }
+    if !on_progress(done, total) {
+        bail!("已取消：sha256 校验 {}", path.display());
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -347,7 +649,19 @@ fn checksum_matches(expected: &str, actual: &str) -> bool {
 /// 币安归档每个包只含一个 CSV，但文件名不含数据集标识（`ETHUSDC-1m-2026-08.csv`
 /// 在 klines 与 markPriceKlines 里完全同名）。所以解压目标目录必须由调用方
 /// 按数据集分开——这里只负责提取，不负责防止覆盖。
-fn extract_single_csv(zip_path: &Path, out_dir: &Path) -> Result<PathBuf> {
+///
+/// 带进度回调的解压：每写约 1MB 汇报一次 `(done, total)`，`total` 取自 ZIP
+/// 条目的（未压缩）大小。
+///
+/// 回调返回 `false` 表示取消：删除已写出的部分 CSV 并返回文案含"取消"的
+/// 错误。
+fn extract_single_csv_with_progress(
+    zip_path: &Path,
+    out_dir: &Path,
+    on_progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<PathBuf> {
+    const REPORT_EVERY: u64 = 1024 * 1024;
+
     let file = std::fs::File::open(zip_path)
         .with_context(|| format!("打开 ZIP 失败: {}", zip_path.display()))?;
     let mut archive = zip::ZipArchive::new(file).context("解析 ZIP 失败")?;
@@ -372,10 +686,35 @@ fn extract_single_csv(zip_path: &Path, out_dir: &Path) -> Result<PathBuf> {
     let out_path = out_dir.join(Path::new(&name).file_name().context("非法文件名")?);
     {
         let mut entry = archive.by_name(&name)?;
+        let total = entry.size();
         let mut out = std::fs::File::create(&out_path)
             .with_context(|| format!("创建 CSV 失败: {}", out_path.display()))?;
-        std::io::copy(&mut entry, &mut out)?;
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut done = 0u64;
+        let mut since_last = 0u64;
+        loop {
+            let n = entry.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])?;
+            done += n as u64;
+            since_last += n as u64;
+            if since_last >= REPORT_EVERY {
+                since_last = 0;
+                if !on_progress(done, total) {
+                    drop(out);
+                    let _ = std::fs::remove_file(&out_path);
+                    bail!("已取消：解压 {}", zip_path.display());
+                }
+            }
+        }
         out.sync_all()?;
+        if !on_progress(done, total) {
+            drop(out);
+            let _ = std::fs::remove_file(&out_path);
+            bail!("已取消：解压 {}", zip_path.display());
+        }
     }
     Ok(out_path)
 }
@@ -460,6 +799,103 @@ mod tests {
         assert_eq!(tolerance_for(100), 5);
     }
 
+    /// `today` 固定为 2026-09-26，便于表驱动测试月份边界。
+    fn today() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()
+    }
+
+    /// `classify_response` 覆盖每个真正影响下载器行为的状态码组合：
+    /// 200/206/416（各分有无本地文件）、404（老月份/上月/当月）、其它状态码。
+    #[test]
+    fn classify_response_table() {
+        let k = |month: u32| key(DatasetKind::AggTrades, month);
+
+        // 200：总是全新下载，不管本地是否已有文件。
+        assert_eq!(
+            classify_response(reqwest::StatusCode::OK, 0, &k(1), today()),
+            RespAction::Fresh
+        );
+        assert_eq!(
+            classify_response(reqwest::StatusCode::OK, 100, &k(1), today()),
+            RespAction::Fresh
+        );
+
+        // 206：只有本地已有部分内容时才是续传，否则视为异常状态。
+        assert_eq!(
+            classify_response(reqwest::StatusCode::PARTIAL_CONTENT, 100, &k(1), today()),
+            RespAction::Append
+        );
+        assert!(matches!(
+            classify_response(reqwest::StatusCode::PARTIAL_CONTENT, 0, &k(1), today()),
+            RespAction::Error(_)
+        ));
+
+        // 416：本地已有文件时代表"已经完整"，没有文件时是异常状态。
+        assert_eq!(
+            classify_response(
+                reqwest::StatusCode::RANGE_NOT_SATISFIABLE,
+                100,
+                &k(1),
+                today()
+            ),
+            RespAction::AlreadyComplete
+        );
+        assert!(matches!(
+            classify_response(
+                reqwest::StatusCode::RANGE_NOT_SATISFIABLE,
+                0,
+                &k(1),
+                today()
+            ),
+            RespAction::Error(_)
+        ));
+
+        // 404 老月份：归档确实没有这个分区，终态。
+        assert_eq!(
+            classify_response(reqwest::StatusCode::NOT_FOUND, 0, &k(1), today()),
+            RespAction::NotInArchive
+        );
+
+        // 404 上个月（今天是 2026-09-26，上月是 2026-08）：可能只是还没发布。
+        assert_eq!(
+            classify_response(reqwest::StatusCode::NOT_FOUND, 0, &k(8), today()),
+            RespAction::NotYetPublished
+        );
+
+        // 404 当月：肯定还没发布。
+        assert_eq!(
+            classify_response(reqwest::StatusCode::NOT_FOUND, 0, &k(9), today()),
+            RespAction::NotYetPublished
+        );
+
+        // 500：其它任何状态码都视为错误。
+        assert!(matches!(
+            classify_response(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                0,
+                &k(1),
+                today()
+            ),
+            RespAction::Error(_)
+        ));
+    }
+
+    /// 跨年边界：今天是 1 月，上个月应该是去年 12 月，而不是月份 0。
+    #[test]
+    fn classify_response_handles_year_boundary_for_previous_month() {
+        let jan = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let dec_key = PartitionKey {
+            kind: DatasetKind::AggTrades,
+            symbol: "ETHUSDC".into(),
+            year: 2025,
+            month: 12,
+        };
+        assert_eq!(
+            classify_response(reqwest::StatusCode::NOT_FOUND, 0, &dec_key, jan),
+            RespAction::NotYetPublished
+        );
+    }
+
     #[test]
     fn sha256_of_known_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -469,6 +905,67 @@ mod tests {
         assert_eq!(
             sha256_file(&p).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// `clone()` 出的副本与原件共享同一个取消标记。
+    #[test]
+    fn cancel_token_clone_shares_state() {
+        let original = CancelToken::default();
+        let clone = original.clone();
+        assert!(!original.is_cancelled());
+
+        clone.cancel();
+
+        assert!(
+            original.is_cancelled(),
+            "clone 上取消后，原件也应观察到已取消"
+        );
+    }
+
+    #[test]
+    fn content_range_total_parses_or_is_none_for_star() {
+        assert_eq!(parse_content_range_total("bytes 0-99/1234"), Some(1234));
+        assert_eq!(parse_content_range_total("bytes 100-199/*"), None);
+        assert_eq!(parse_content_range_total("garbage"), None);
+    }
+
+    /// 用于测试的进度收集器：只记录 `on_stage`，其它回调空实现。
+    struct StageCollector(Vec<(u64, Option<u64>)>);
+
+    impl DownloadProgress for StageCollector {
+        fn on_start(&mut self, _: &PartitionKey, _: &str) {}
+        fn on_downloaded(&mut self, _: &PartitionKey, _: u64, _: u64) {}
+        fn on_converted(&mut self, _: &PartitionKey, _: u64, _: u64) {}
+        fn on_skip(&mut self, _: &PartitionKey) {}
+        fn on_absent(&mut self, _: &PartitionKey) {}
+        fn on_error(&mut self, _: &PartitionKey, _: &str) {}
+        fn on_stage(&mut self, _: &PartitionKey, _: Stage, done: u64, total: Option<u64>) {
+            self.0.push((done, total));
+        }
+    }
+
+    /// 阻塞闭包发 3 条进度，异步侧应按序收到 3 条，并拿到闭包的返回值。
+    #[tokio::test]
+    async fn run_blocking_with_progress_forwards_messages_in_order() {
+        let k = key(DatasetKind::AggTrades, 1);
+        let mut collector = StageCollector(Vec::new());
+        let cancel = CancelToken::default();
+
+        let result: Result<i32> =
+            run_blocking_with_progress(&k, Stage::Converting, &mut collector, &cancel, |report| {
+                assert!(report(1, Some(10)));
+                assert!(report(2, Some(10)));
+                assert!(report(3, Some(10)));
+                Ok(42)
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            collector.0,
+            vec![(1, Some(10)), (2, Some(10)), (3, Some(10))],
+            "进度必须按发出顺序到达"
         );
     }
 }

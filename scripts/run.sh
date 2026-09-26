@@ -412,12 +412,15 @@ cmd_start() {
     ( cd "$ROOT_DIR/frontend" && pnpm install )
   fi
 
-  # 二进制不存在时才编译——每次启动都编译会让人以为卡住了
+  # 每次启动都交给 cargo 判断是否需要重编：代码没变时一秒内结束。只在二进制
+  # 不存在时才编译会让 restart 一直跑旧二进制——改了代码重启后新接口 404。
   if [[ ! -x "$(binary_path)" ]]; then
     step "构建 Rust 服务（首次较慢）"
-    do_cargo_build
-    ok "构建完成"
+  else
+    step "构建 Rust 服务（代码没变时很快）"
   fi
+  do_cargo_build || exit 1
+  ok "构建完成"
 
   step "启动服务"
   start_rust || exit 1

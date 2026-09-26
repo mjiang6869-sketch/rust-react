@@ -20,11 +20,13 @@ import {
 } from './cooldown'
 import type {
   ApiResponse,
+  ArchiveRange,
   AutoMakerConfig,
   AutoMakerParams,
   BacktestResult,
   BacktestRunSummary,
   Coverage,
+  DownloadJob,
   DownloadRequest,
   BookSnapshotResponse,
   EngineState,
@@ -261,11 +263,33 @@ export const api = {
 
   coverage: () => request<Coverage>('/data/coverage'),
 
+  /** 当前下载任务快照。没有任务时是 `state === 'idle'` 的默认值。 */
+  downloadStatus: () => request<DownloadJob>('/data/download'),
+
+  /**
+   * 开始下载任务。已有任务在跑时后端返回 409（中文消息），调用方应据此
+   * 提示用户，而不是静默失败。
+   */
   startDownload: (req: DownloadRequest) =>
-    request<{ started: boolean; message: string }>('/data/download', {
+    request<DownloadJob>('/data/download', {
       method: 'POST',
       body: JSON.stringify(req),
     }),
+
+  /** 取消当前下载任务。没有任务在跑时后端返回 409。 */
+  cancelDownload: () =>
+    request<{ cancelled: boolean }>('/data/download/cancel', { method: 'POST' }),
+
+  /**
+   * 某交易对在币安归档（S3）里的真实覆盖范围。
+   *
+   * `kinds` 省略时查询全部数据集。
+   */
+  archiveRange: (symbol: string, kinds?: string[]) => {
+    const q = new URLSearchParams({ symbol })
+    if (kinds !== undefined && kinds.length > 0) q.set('kinds', kinds.join(','))
+    return request<ArchiveRange>(`/data/archive-range?${q.toString()}`)
+  },
 
   arm: () =>
     request<{ armed: boolean; blocking_reasons: string[] }>('/live/arm', {

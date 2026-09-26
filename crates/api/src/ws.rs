@@ -53,7 +53,10 @@ enum ServerMessage {
         data: serde_json::Value,
     },
     /// 后台任务进度。
-    Progress { data: ProgressMessage },
+    ///
+    /// `Box`：`ProgressMessage::DownloadStatus` 携带完整任务快照，比其它
+    /// `ServerMessage` 变体大得多，不装箱会让整个枚举按最大变体分配。
+    Progress { data: Box<ProgressMessage> },
     /// 错误。
     Error { code: String, message: String },
     /// 心跳响应。
@@ -77,6 +80,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if let Err(e) = send_snapshot(&mut sender, &state).await {
         tracing::warn!("发送初始快照失败：{e}");
         return;
+    }
+
+    // 若有下载任务且非 idle，补发一条完整快照——不然新连接（或断线重连）
+    // 的界面只能等到下一次进度节流广播才看到"进行中"的任务，期间会
+    // 误以为没有任务在跑。
+    let downloads = state.downloads().snapshot();
+    if downloads.state != "idle" {
+        let msg = ServerMessage::Progress {
+            data: Box::new(ProgressMessage::DownloadStatus {
+                job: Box::new(downloads),
+            }),
+        };
+        match serde_json::to_string(&msg) {
+            Ok(text) => {
+                if sender.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => tracing::warn!("序列化下载任务快照失败：{e}"),
+        }
     }
 
     // 定期推送状态快照。
@@ -148,7 +171,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             progress = engine_rx.recv() => {
                 match progress {
                     Ok(msg) => {
-                        let out = ServerMessage::Progress { data: msg };
+                        let out = ServerMessage::Progress { data: Box::new(msg) };
                         if sender
                             .send(Message::Text(
                                 serde_json::to_string(&out).unwrap_or_default().into(),
@@ -314,12 +337,12 @@ mod tests {
     #[test]
     fn progress_messages_serialize() {
         let m = ServerMessage::Progress {
-            data: ProgressMessage::Backtest {
+            data: Box::new(ProgressMessage::Backtest {
                 symbol: "ETHUSDC".into(),
                 model: "M1".into(),
                 done: 1,
                 total: 2,
-            },
+            }),
         };
         let j = serde_json::to_string(&m).unwrap();
         assert!(j.contains("\"type\":\"progress\""), "{j}");

@@ -29,21 +29,29 @@
 //! 2. **缺口必须阻断回测。** 跨越缺口会凭空发明不可能的成交。缺口记录在台账里，
 //!    回测必须在存在缺口时拒绝运行。
 
+pub mod archive_index;
 pub mod download;
 pub mod fixed;
 pub mod manifest;
 pub mod parquet_writer;
 pub mod replay;
 
+pub use archive_index::{
+    ARCHIVE_LIST_BASE, ARCHIVE_PREFIX_ROOT, ArchiveMonths, ListPage, WorkPlan,
+    fetch_archive_months, list_url, months_from_keys, parse_list_bucket, plan_work,
+};
 pub use download::{
-    DEFAULT_ARCHIVE_BASE, DownloadOutcome, DownloadProgress, Layout, QuietProgress, fetch_partition,
+    CancelToken, DEFAULT_ARCHIVE_BASE, DownloadOutcome, DownloadProgress, Layout, QuietProgress,
+    Stage, fetch_partition,
 };
 pub use fixed::{decode_price, decode_rate, encode_price, encode_rate, parse_decimal};
 pub use manifest::{
     CURRENT_SCHEMA_VERSION, DatasetKind, Gap, Manifest, PartitionEntry, PartitionKey,
-    PartitionStatus, archive_url_and_name, months_between,
+    PartitionStatus, archive_prefix, archive_url_and_name, months_between,
 };
-pub use parquet_writer::{BATCH_ROWS, ConversionStats, convert_csv_to_parquet};
+pub use parquet_writer::{
+    BATCH_ROWS, ConversionStats, convert_csv_to_parquet, convert_csv_to_parquet_with_progress,
+};
 pub use replay::{
     DaySlice, MissingDataPolicy, NoProgress, ReplayOutput, ReplayProgress, ReplaySpec,
     agg_trades_parquet_path, days_in_month, ensure_parquet, klines_parquet_path, load_day,
