@@ -19,12 +19,14 @@
 //! 数百万行）走 `data` crate 的 Parquet + DuckDB——那边需要列剪枝与谓词
 //! 下推，不是事务。两者混在一个引擎里会让任一边都做不好。
 
+pub mod equity;
 pub mod history;
 pub mod orders;
 pub mod schema;
 
 use thiserror::Error;
 
+pub use equity::{EquitySample, insert_equity_sample, recent_equity_samples};
 pub use history::{
     AiSessionRow, AnnotationRow, BacktestRunRow, IntegrityReport, PnlSummary, ai_session_context,
     delete_annotation, get_backtest_run, has_open_orders, insert_ai_session, insert_backtest_run,

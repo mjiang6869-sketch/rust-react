@@ -31,6 +31,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // ---- 健康与状态 ----
         .route("/api/v1/health", get(health))
         .route("/api/v1/state", get(get_state))
+        .route("/api/v1/overview", get(crate::overview::get))
         // ---- 合约与策略 ----
         .route("/api/v1/instrument", get(get_instrument))
         .route("/api/v1/strategies", get(list_strategies))
@@ -889,6 +890,7 @@ mod tests {
         let paths = [
             "/api/v1/health",
             "/api/v1/state",
+            "/api/v1/overview",
             "/api/v1/instrument",
             "/api/v1/strategies",
             "/api/v1/fill-models",
@@ -914,7 +916,7 @@ mod tests {
             "/api/v1/mode",
             "/api/v1/ws",
         ];
-        assert_eq!(paths.len(), 26);
+        assert_eq!(paths.len(), 27);
         // 路径必须是版本化的——未来breaking change要走 v2。
         for p in paths {
             assert!(p.starts_with("/api/v1/"), "路由必须版本化：{p}");

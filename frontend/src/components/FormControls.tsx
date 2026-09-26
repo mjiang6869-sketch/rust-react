@@ -55,12 +55,13 @@ export function SelectField({ label, hint, error, compact, id: suppliedId, onCha
 }
 
 /** 原生日期/月历保留系统键盘与移动端体验；值始终是 YYYY-MM[-DD]。 */
-export function DateField({ label, hint, error, value, onChange, min, max, mode = 'date', id: suppliedId }: FieldProps & {
+export function DateField({ label, hint, error, value, onChange, min, max, disabled, mode = 'date', id: suppliedId }: FieldProps & {
   id?: string
   value: string
   onChange: (value: string) => void
   min?: string
   max?: string
+  disabled?: boolean
   mode?: 'date' | 'month'
 }) {
   const generatedId = useId()
@@ -68,11 +69,11 @@ export function DateField({ label, hint, error, value, onChange, min, max, mode 
   const ref = useRef<HTMLInputElement>(null)
   return <FieldFrame {...{ id, label, hint, error }}>
     <div className="input-wrap date-wrap">
-      <Input ref={ref} id={id} type={mode} value={value} min={min} max={max}
+      <Input ref={ref} id={id} type={mode} value={value} min={min} max={max} disabled={disabled}
         placeholder={mode === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD'}
         aria-invalid={error ? true : undefined} aria-describedby={error || hint ? `${id}-help` : undefined}
         onChange={(e) => onChange(e.target.value)} />
-      <button type="button" className="date-trigger" aria-label={`选择${label}`} onClick={() => {
+      <button type="button" className="date-trigger" aria-label={`选择${label}`} disabled={disabled} onClick={() => {
         ref.current?.focus()
         try { ref.current?.showPicker?.() } catch { /* 不支持系统日历时保留键盘输入。 */ }
       }}><CalendarDays size={16} aria-hidden="true" /></button>

@@ -20,6 +20,7 @@ import { Input } from '../components/FormControls'
 import { ChartHost } from '../chart/ChartHost'
 import { useKlines } from '../chart/useKlines'
 import { num } from '../format'
+import { AccountSnapshot } from './AccountSnapshot'
 import { AutoMakerPanel } from './AutoMakerPanel'
 import { ManualPanel } from './ManualPanel'
 import { OrderBook } from './OrderBook'
@@ -39,29 +40,34 @@ export function MarketPage({ engine, hasPosition }: MarketPageProps) {
   const [symbolError, setSymbolError] = useState<string | null>(null)
   return (
     <>
-      <form className="market-selector" onSubmit={(event) => {
-        event.preventDefault()
-        const next = draftSymbol.trim().toUpperCase()
-        if (!/^[A-Z0-9]{2,30}$/.test(next)) {
-          setSymbolError('请输入有效的合约代码，例如 ETHUSDC')
-          return
-        }
-        setSymbolError(null)
-        setDraftSymbol(next)
-        setSymbol(next)
-      }}>
-        <label htmlFor="market-symbol">交易对</label>
-        <Input type="text" id="market-symbol" list="market-symbols" value={draftSymbol}
-          onChange={(event) => setDraftSymbol(event.target.value)} autoComplete="off"
-          spellCheck={false} aria-describedby={symbolError ? 'symbol-error' : undefined} />
-        <datalist id="market-symbols">
-          {[...new Set([engine.symbol, 'ETHUSDC', 'BTCUSDC', 'SOLUSDC', 'ETHUSDT', 'BTCUSDT'])].map((value) => <option key={value} value={value} />)}
-        </datalist>
-        <button type="submit" className="secondary">切换</button>
+      <div className="market-toolbar">
+        <form className="market-selector" onSubmit={(event) => {
+          event.preventDefault()
+          const next = draftSymbol.trim().toUpperCase()
+          if (!/^[A-Z0-9]{2,30}$/.test(next)) {
+            setSymbolError('请输入有效的合约代码，例如 ETHUSDC')
+            return
+          }
+          setSymbolError(null)
+          setDraftSymbol(next)
+          setSymbol(next)
+        }}>
+          <label htmlFor="market-symbol">交易对</label>
+          <Input type="text" id="market-symbol" list="market-symbols" value={draftSymbol}
+            onChange={(event) => setDraftSymbol(event.target.value)} autoComplete="off"
+            spellCheck={false} aria-describedby={symbolError ? 'symbol-error' : undefined} />
+          <datalist id="market-symbols">
+            {[...new Set([engine.symbol, 'ETHUSDC', 'BTCUSDC', 'SOLUSDC', 'ETHUSDT', 'BTCUSDT'])].map((value) => <option key={value} value={value} />)}
+          </datalist>
+          <button type="submit" className="secondary">切换</button>
+          {symbolError && <span id="symbol-error" role="alert">{symbolError}</span>}
+        </form>
+        <AutoMakerPanel engine={engine} symbol={symbol} />
+        <div className="market-toolbar-meta">
         <span className={`mode-badge ${engine.mode === 'LIVE' ? 'mode-live' : 'mode-paper'}`}>{engine.mode_label}</span>
         <span className="head-note">UTC+8</span>
-        {symbolError && <span id="symbol-error" role="alert">{symbolError}</span>}
-      </form>
+        </div>
+      </div>
       <MarketWorkspace key={symbol} engine={engine} hasPosition={hasPosition} symbol={symbol} />
     </>
   )
@@ -206,7 +212,7 @@ function MarketWorkspace({ engine, hasPosition, symbol }: MarketPageProps & { sy
           )
         )}
         <OrderBook book={feed.book} currentPrice={lastPrice} depth={9} />
-        <AutoMakerPanel engine={engine} symbol={symbol} />
+        <AccountSnapshot engine={engine} />
       </div>
       <TradingActivity engine={engine} />
     </div>

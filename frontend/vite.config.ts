@@ -10,6 +10,8 @@ const apiTarget = process.env.RUST_CRYPTO_API_URL ?? 'http://127.0.0.1:8080'
 
 export default defineConfig({
   plugins: [react()],
+  // /market 等直达地址在生产构建中仍从站点根目录加载资源。
+  base: '/',
   server: {
     host: '127.0.0.1',
     port: 5174,
@@ -25,9 +27,6 @@ export default defineConfig({
     },
   },
   build: {
-    // 相对路径：让构建产物可以从任意子路径提供服务，
-    // 也便于以后用 file:// 打开（Electron 打包场景）。
-    base: './',
     outDir: 'dist',
     sourcemap: true,
   },

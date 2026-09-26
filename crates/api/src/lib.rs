@@ -36,6 +36,7 @@ pub mod download_task;
 pub mod dto;
 pub mod engine_feed;
 pub mod market_stream;
+pub mod overview;
 pub mod routes;
 pub mod state;
 pub mod ws;

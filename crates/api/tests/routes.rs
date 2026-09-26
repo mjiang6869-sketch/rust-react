@@ -190,6 +190,25 @@ async fn state_exposes_engine_snapshot() {
 }
 
 #[tokio::test]
+async fn overview_uses_current_paper_snapshot_without_inventing_history() {
+    let s = test_state();
+    let (status, body) = get(&s, "/api/v1/overview").await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &body["data"];
+    assert_eq!(data["source"], "paper_account_snapshots");
+    assert_eq!(data["settlement_asset"], "USDC");
+    assert_eq!(data["equity"], "10000");
+    assert_eq!(data["cumulative_pnl"], "0");
+    assert_eq!(data["curve"].as_array().unwrap().len(), 1);
+    assert!(data["estimated_month_pnl"].is_null());
+    assert!(data["estimated_annualized_pct"].is_null());
+
+    s.set_mode(ServiceMode::Live).await;
+    let (status, _) = get(&s, "/api/v1/overview").await;
+    assert_eq!(status, StatusCode::CONFLICT, "实盘不能展示模拟盘收益图");
+}
+
+#[tokio::test]
 async fn strategies_list_includes_parameter_documentation() {
     let s = test_state();
     let (status, body) = get(&s, "/api/v1/strategies").await;

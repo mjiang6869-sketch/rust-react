@@ -183,6 +183,26 @@ export interface EngineState {
   position_source: OrderSource | null
 }
 
+/** 本次模拟盘运行的账户收益快照；金额由后端按 Decimal 计算。 */
+export interface OverviewData {
+  source: 'paper_account_snapshots'
+  symbol: string
+  settlement_asset: string
+  as_of: string
+  session_started_at: string
+  equity: string
+  cumulative_pnl: string
+  cumulative_return_pct: string | null
+  realized_pnl: string
+  unrealized_pnl: string
+  estimated_month_pnl: string | null
+  estimated_annualized_pct: string | null
+  fee_is_authoritative: boolean
+  sample_days: number
+  curve: Array<{ at: string; equity: string }>
+  daily: Array<{ date: string; realized_pnl: string; intensity: number }>
+}
+
 export interface ParameterInfo {
   key: string
   label: string

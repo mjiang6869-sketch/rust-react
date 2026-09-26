@@ -36,6 +36,7 @@ import type {
   Health,
   ManualPlanRequest,
   ManualPreview,
+  OverviewData,
   StrategyInfo,
 } from './types'
 
@@ -172,6 +173,8 @@ export const api = {
   health: () => request<Health>('/health'),
 
   state: () => request<EngineState>('/state'),
+
+  overview: () => request<OverviewData>('/overview'),
 
   strategies: () => request<StrategyInfo[]>('/strategies'),
 

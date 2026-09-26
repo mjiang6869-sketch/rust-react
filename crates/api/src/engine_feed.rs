@@ -67,6 +67,7 @@ const WARMUP_RETRY_BASE_SECS: u64 = 10;
 /// 引擎不会收到任何行情——模拟盘将永远不会成交。这种情况只记一条警告并
 /// 直接返回，不阻止服务启动。
 pub fn spawn(state: Arc<AppState>) {
+    crate::overview::spawn_sampling(state.clone());
     let Some(streams) = state.market_streams() else {
         tracing::warn!(
             "行情推送未启用（行情地址指向了非生产网）：模拟盘引擎收不到实时行情，不会产生任何成交"

@@ -23,7 +23,7 @@
 use rusqlite::Connection;
 
 /// 当前 schema 版本。新增迁移时递增。
-pub const CURRENT_VERSION: i32 = 1;
+pub const CURRENT_VERSION: i32 = 2;
 
 /// 逐版本迁移。索引 `i` 对应"从版本 i 升到 i+1"。
 ///
@@ -141,6 +141,20 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_annotations_symbol ON annotations (symbol, interval);
     "#,
+    // v1 -> v2：模拟盘账户权益的低频快照，只用于展示本次运行的资金曲线。
+    r#"
+    CREATE TABLE equity_samples (
+        session_id      TEXT NOT NULL,
+        sampled_at_ms   INTEGER NOT NULL,
+        settlement_asset TEXT NOT NULL,
+        equity          TEXT NOT NULL,
+        realized_pnl    TEXT NOT NULL,
+        unrealized_pnl  TEXT NOT NULL,
+        PRIMARY KEY (session_id, settlement_asset, sampled_at_ms)
+    );
+    CREATE INDEX idx_equity_samples_session_time
+        ON equity_samples (session_id, sampled_at_ms DESC);
+    "#,
 ];
 
 /// 当前数据库版本。
@@ -247,6 +261,7 @@ mod tests {
             "backtest_runs",
             "ai_sessions",
             "annotations",
+            "equity_samples",
         ] {
             let n: i64 = conn
                 .query_row(
@@ -298,6 +313,38 @@ mod tests {
                 "{name} 必须是 TEXT 以精确保存 Decimal"
             );
         }
+        for name in ["equity", "realized_pnl", "unrealized_pnl"] {
+            let ty: String = conn
+                .query_row(
+                    "SELECT type FROM pragma_table_info('equity_samples') WHERE name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ty, "TEXT", "{name} 必须是 TEXT");
+        }
+    }
+
+    #[test]
+    fn existing_v1_database_migrates_without_losing_rows() {
+        let conn = fresh();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        conn.execute(
+            "INSERT INTO realized_pnl (settlement_asset, amount) VALUES ('USDC', '12.34')",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(version(&conn).unwrap(), CURRENT_VERSION);
+        let amount: String = conn
+            .query_row(
+                "SELECT amount FROM realized_pnl WHERE settlement_asset='USDC'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(amount, "12.34");
     }
 
     /// 结算资产必须是显式列——USDT 与 USDC 不能混。

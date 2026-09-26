@@ -1,4 +1,4 @@
-// 自动化做市（区间做市策略）面板：开关 + 参数 + 运行状态。
+// 行情页顶部的自动化做市开关与参数弹层。
 //
 // # 两条独立的数据来源
 //
@@ -14,8 +14,8 @@
 // 用户经常是先调好参数再启用，而不是启用后再调——所以草稿编辑不依赖
 // `enabled`，只在提交网络请求时禁用输入框（`action.busy`）。
 
-import { useEffect, useMemo, useState } from 'react'
-import { Bot, RotateCcw } from 'lucide-react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Bot, RotateCcw, Settings2, X } from 'lucide-react'
 
 import { ApiError, api } from '../api/client'
 import { cmpStr, parse, toPercent } from '../api/decimal.ts'
@@ -71,6 +71,56 @@ export function AutoMakerPanel({ engine, symbol }: AutoMakerPanelProps) {
   const [touched, setTouched] = useState<Record<string, boolean>>({})
   const [externalNotice, setExternalNotice] = useState(false)
   const [reloadKey, setReloadKey] = useState(0)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsPlacement, setSettingsPlacement] = useState<{ top: number; left: number; width: number; maxHeight: number } | null>(null)
+  const controlRef = useRef<HTMLDivElement>(null)
+  const settingsButtonRef = useRef<HTMLButtonElement>(null)
+  const settingsPanelRef = useRef<HTMLElement>(null)
+  const recentSave = useRef<{ params: AutoMakerParams; at: number } | null>(null)
+
+  useLayoutEffect(() => {
+    if (!settingsOpen) return
+    const positionSettings = () => {
+      const trigger = settingsButtonRef.current?.getBoundingClientRect()
+      if (!trigger) return
+      const width = Math.min(420, window.innerWidth - 24)
+      const left = Math.max(8, Math.min(trigger.right - width, window.innerWidth - width - 8))
+      setSettingsPlacement({ top: trigger.bottom + 8, left, width, maxHeight: Math.max(0, Math.min(720, window.innerHeight - trigger.bottom - 16)) })
+    }
+    positionSettings()
+    const content = controlRef.current?.closest('.content')
+    const app = controlRef.current?.closest('.app')
+    window.addEventListener('resize', positionSettings)
+    content?.addEventListener('scroll', positionSettings)
+    app?.addEventListener('scroll', positionSettings)
+    return () => {
+      window.removeEventListener('resize', positionSettings)
+      content?.removeEventListener('scroll', positionSettings)
+      app?.removeEventListener('scroll', positionSettings)
+    }
+  }, [settingsOpen])
+
+  useEffect(() => {
+    if (settingsOpen) settingsPanelRef.current?.focus({ preventScroll: true })
+  }, [settingsOpen])
+
+  useEffect(() => {
+    if (!settingsOpen) return
+    const closeOnOutside = (event: PointerEvent) => {
+      if (!controlRef.current?.contains(event.target as Node)) setSettingsOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      setSettingsOpen(false)
+      settingsButtonRef.current?.focus({ preventScroll: true })
+    }
+    document.addEventListener('pointerdown', closeOnOutside)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutside)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [settingsOpen])
 
   // 初次加载（与手动重试）。
   useEffect(() => {
@@ -97,6 +147,12 @@ export function AutoMakerPanel({ engine, symbol }: AutoMakerPanelProps) {
   // 草稿未改动就跟着同步；已改动就保留草稿，只提示一句。
   useEffect(() => {
     if (fields === null || baseline === null || draft === null) return
+    // PUT 的成功响应可能早于下一帧 WebSocket 快照；别让旧快照撤销刚保存的参数。
+    if (recentSave.current !== null) {
+      if (sameParams(auto.params, recentSave.current.params)) recentSave.current = null
+      else if (Date.now() - recentSave.current.at < 5_000) return
+      else recentSave.current = null
+    }
     if (sameParams(auto.params, baseline)) return
     const dirty = isDraftDirty(draft, baseline, fields)
     setBaseline(auto.params)
@@ -112,6 +168,7 @@ export function AutoMakerPanel({ engine, symbol }: AutoMakerPanelProps) {
   const dirty = fields !== null && baseline !== null && draft !== null && isDraftDirty(draft, baseline, fields)
 
   function applyResponse(cfg: { fields: ParameterInfo[]; params: AutoMakerParams }) {
+    recentSave.current = { params: cfg.params, at: Date.now() }
     setFields(cfg.fields)
     setBaseline(cfg.params)
     setDraft(draftFromParams(cfg.params, cfg.fields))
@@ -119,19 +176,20 @@ export function AutoMakerPanel({ engine, symbol }: AutoMakerPanelProps) {
     setTouched({})
   }
 
-  async function enable() {
-    if (built.params === null) return
-    const response = await action.run(() => api.setAutoMaker({ enabled: true, params: built.params! }))
-    if (response) applyResponse(response)
-  }
-  async function disable() {
-    const response = await action.run(() => api.setAutoMaker({ enabled: false }))
-    if (response) applyResponse(response)
+  async function toggle() {
+    // 顶部开关只切换运行状态，不把弹层中尚未保存的草稿一并提交。
+    await action.run(() => api.setAutoMaker({ enabled: !auto.enabled }))
   }
   async function applyDraft() {
-    if (built.params === null) return
-    const response = await action.run(() => api.setAutoMaker({ enabled: true, params: built.params! }))
-    if (response) applyResponse(response)
+    const params = built.params
+    if (params === null) return
+    // 后端支持在关闭状态下保存参数；保存不能悄悄启用策略。
+    const response = await action.run(() => api.setAutoMaker({ enabled: auto.enabled, params }))
+    if (response) {
+      applyResponse(response)
+      setSettingsOpen(false)
+      settingsButtonRef.current?.focus({ preventScroll: true })
+    }
   }
   function restoreDefaults() {
     if (fields === null) return
@@ -149,126 +207,97 @@ export function AutoMakerPanel({ engine, symbol }: AutoMakerPanelProps) {
   const errorFor = (key: string) => (touched[key] ? built.errors[key] : undefined)
   const markTouched = (key: string) => () => setTouched((prev) => ({ ...prev, [key]: true }))
 
-  if (loadError !== null && fields === null) {
-    return (
-      <section className="panel auto-maker-panel" aria-labelledby="auto-maker-title">
-        <div className="panel-head">
-          <h2 id="auto-maker-title">
-            <Bot size={17} aria-hidden="true" />自动化做市
-          </h2>
-        </div>
-        <div className="notice notice-error" role="alert">
-          {loadError}
-          <button type="button" className="link-btn" onClick={() => setReloadKey((v) => v + 1)}>
-            重试
-          </button>
-        </div>
-      </section>
-    )
-  }
-
-  if (fields === null || draft === null) {
-    return (
-      <section className="panel auto-maker-panel" aria-labelledby="auto-maker-title">
-        <div className="panel-head">
-          <h2 id="auto-maker-title">
-            <Bot size={17} aria-hidden="true" />自动化做市
-          </h2>
-        </div>
-        <p className="panel-empty">正在加载配置…</p>
-      </section>
-    )
-  }
-
   const warmupPct =
     auto.status === 'WARMING_UP' ? Math.min(100, Math.round((auto.warmup_have / Math.max(1, auto.warmup_need)) * 100)) : 0
 
   return (
-    <section className="panel auto-maker-panel" aria-labelledby="auto-maker-title">
-      <div className="panel-head">
-        <h2 id="auto-maker-title">
-          <Bot size={17} aria-hidden="true" />自动化做市
-        </h2>
-        <span className={auto.enabled ? 'tag-ok' : 'tag'}>{auto.enabled ? '运行中' : '未启用'}</span>
-        <span className="head-note">{auto.strategy_name}</span>
-      </div>
-
-      <div className="auto-maker-status">
-        <p className="auto-maker-status-label">{auto.status_label}</p>
-        {auto.status === 'WARMING_UP' && (
-          <div className="auto-maker-warmup">
-            <div className="auto-maker-warmup-bar" role="img" aria-label={`预热进度 ${auto.warmup_have}/${auto.warmup_need}`}>
-              <span style={{ width: `${warmupPct}%` }} />
-            </div>
-            <span className="muted">
-              预热 {auto.warmup_have} / {auto.warmup_need} 根 K 线
-            </span>
-          </div>
-        )}
-        {!auto.enabled && engine.position_source === 'STRATEGY' && (
-          <p className="notice notice-info">策略持仓仍受止盈止损保护，可在持仓卡片手动平仓。</p>
-        )}
-        {symbol !== engine.symbol && <p className="auto-maker-elsewhere muted">运行在 {engine.symbol}</p>}
-      </div>
-
-      <fieldset className="auto-maker-body" disabled={action.busy}>
-        <legend className="sr-only">自动化做市参数</legend>
-        <div className="segmented auto-maker-side" role="group" aria-label="做市方向">
-          {(['LONG_ONLY', 'SHORT_ONLY'] as const).map((mode) => (
-            <button key={mode} type="button" aria-pressed={draft.side_mode === mode} onClick={() => setSideMode(mode)}>
-              {mode === 'LONG_ONLY' ? '只做多' : '只做空'}
-            </button>
-          ))}
-        </div>
-
-        {fields.map((field) => (
-          <InputField
-            key={field.key}
-            label={field.label}
-            unit={field.display_as_percent ? '%' : field.unit ?? ''}
-            value={draft[field.key as NumericKey]}
-            inputMode="decimal"
-            error={errorFor(field.key)}
-            onBlur={markTouched(field.key)}
-            onChange={(value) => setFieldValue(field.key as NumericKey, value)}
-            hint={rangeHint(field, auto.max_lookback)}
-          />
-        ))}
-
-        <p className="field-hint auto-maker-note">保本 / 移动止损：模拟盘引擎暂不执行，暂不开放。</p>
-      </fieldset>
-
-      {action.error !== null && (
-        <p className="field-error" role="alert">
-          {action.error}
-        </p>
-      )}
-      {externalNotice && <p className="notice notice-info">参数已在别处更新。</p>}
-
-      <div className="actions auto-maker-actions">
-        {auto.enabled ? (
-          <>
-            <button type="button" className="danger" disabled={action.busy} onClick={() => void disable()}>
-              {action.busy ? '处理中…' : '停用'}
-            </button>
-            <button
-              type="button"
-              className="secondary"
-              disabled={action.busy || !dirty || built.params === null}
-              onClick={() => void applyDraft()}
-            >
-              应用参数
-            </button>
-          </>
-        ) : (
-          <button type="button" className="primary" disabled={action.busy || built.params === null} onClick={() => void enable()}>
-            {action.busy ? '处理中…' : '启用自动化做市'}
-          </button>
-        )}
-        <button type="button" className="link-btn" disabled={action.busy} onClick={restoreDefaults}>
-          <RotateCcw size={14} aria-hidden="true" />恢复默认
+    <div className="auto-maker-control" ref={controlRef}>
+      <div className="auto-maker-control-main">
+        <span className="auto-maker-control-label"><Bot size={16} aria-hidden="true" />自动做市</span>
+        <span className={auto.enabled ? 'tag-ok' : 'tag'}>{auto.enabled ? '已开启' : '已关闭'}</span>
+        {auto.enabled && <span className="auto-maker-control-detail">{auto.status_label}</span>}
+        {symbol !== engine.symbol && <span className="auto-maker-control-detail">运行于 {engine.symbol}</span>}
+        {!auto.enabled && engine.position_source === 'STRATEGY' && <span className="auto-maker-control-detail warn">策略持仓仍在</span>}
+        {!auto.enabled && engine.mode === 'LIVE' && <span className="auto-maker-control-detail warn">仅模拟盘可开启</span>}
+        <button type="button" className={auto.enabled ? 'secondary' : 'primary'}
+          disabled={action.busy || (!auto.enabled && engine.mode === 'LIVE')}
+          title={!auto.enabled && engine.mode === 'LIVE' ? '仅模拟盘可开启自动化做市' : undefined}
+          onClick={() => void toggle()}>
+          {action.busy ? '处理中…' : auto.enabled ? '关闭做市' : '开启做市'}
+        </button>
+        <button ref={settingsButtonRef} type="button" className="secondary auto-maker-settings-button"
+          aria-expanded={settingsOpen} aria-controls="auto-maker-settings"
+          onClick={() => setSettingsOpen((open) => !open)}>
+          <Settings2 size={15} aria-hidden="true" />参数{dirty && <span className="auto-maker-dirty" aria-label="有未保存参数" />}
         </button>
       </div>
-    </section>
+      {action.error !== null && !settingsOpen && <p className="auto-maker-control-error" role="alert">{action.error}</p>}
+
+      {settingsOpen && <section ref={settingsPanelRef} id="auto-maker-settings" className="auto-maker-settings panel" role="dialog" aria-labelledby="auto-maker-title" tabIndex={-1}
+        style={settingsPlacement === null ? { visibility: 'hidden' } : settingsPlacement}>
+        <div className="panel-head">
+          <h2 id="auto-maker-title"><Bot size={17} aria-hidden="true" />自动化做市参数</h2>
+          <button type="button" className="icon-btn" aria-label="关闭参数设置" onClick={() => {
+            setSettingsOpen(false)
+            settingsButtonRef.current?.focus({ preventScroll: true })
+          }}>
+            <X size={17} aria-hidden="true" />
+          </button>
+        </div>
+        <div className="auto-maker-status">
+          <p className="auto-maker-status-label">{auto.status_label}</p>
+          {auto.status === 'WARMING_UP' && (
+            <div className="auto-maker-warmup">
+              <div className="auto-maker-warmup-bar" role="img" aria-label={`预热进度 ${auto.warmup_have}/${auto.warmup_need}`}>
+                <span style={{ width: `${warmupPct}%` }} />
+              </div>
+              <span className="muted">预热 {auto.warmup_have} / {auto.warmup_need} 根 K 线</span>
+            </div>
+          )}
+          {!auto.enabled && engine.position_source === 'STRATEGY' && (
+            <p className="notice notice-info">策略持仓仍受止盈止损保护，可在持仓卡片手动平仓。</p>
+          )}
+          {symbol !== engine.symbol && <p className="auto-maker-elsewhere muted">运行在 {engine.symbol}</p>}
+        </div>
+        {fields !== null && draft !== null ? <>
+          <fieldset className="auto-maker-body" disabled={action.busy}>
+            <legend className="sr-only">自动化做市参数</legend>
+            <div className="segmented auto-maker-side" role="group" aria-label="做市方向">
+              {(['LONG_ONLY', 'SHORT_ONLY'] as const).map((mode) => (
+                <button key={mode} type="button" aria-pressed={draft.side_mode === mode} onClick={() => setSideMode(mode)}>
+                  {mode === 'LONG_ONLY' ? '只做多' : '只做空'}
+                </button>
+              ))}
+            </div>
+            {fields.map((field) => (
+              <InputField key={field.key} label={field.label}
+                unit={field.display_as_percent ? '%' : field.unit ?? ''}
+                value={draft[field.key as NumericKey]} inputMode="decimal"
+                error={errorFor(field.key)} onBlur={markTouched(field.key)}
+                onChange={(value) => setFieldValue(field.key as NumericKey, value)}
+                hint={rangeHint(field, auto.max_lookback)} />
+            ))}
+            <p className="field-hint auto-maker-note">保本 / 移动止损：模拟盘引擎暂不执行，暂不开放。</p>
+          </fieldset>
+          {dirty && <p className="auto-maker-unsaved">参数尚未保存，顶部开关只切换已保存的配置。</p>}
+          {externalNotice && <p className="notice notice-info">参数已在别处更新。</p>}
+          <div className="actions auto-maker-actions">
+            <button type="button" className="primary" disabled={action.busy || !dirty || built.params === null}
+              onClick={() => void applyDraft()}>
+              {action.busy ? '保存中…' : '保存参数'}
+            </button>
+            <button type="button" className="link-btn" disabled={action.busy} onClick={restoreDefaults}>
+              <RotateCcw size={14} aria-hidden="true" />恢复默认
+            </button>
+          </div>
+        </> : loadError !== null ? (
+          <div className="auto-maker-load-error notice notice-error" role="alert">
+            {loadError}
+            <button type="button" className="link-btn" onClick={() => setReloadKey((v) => v + 1)}>重试</button>
+          </div>
+        ) : <p className="panel-empty">正在加载配置…</p>}
+        {action.error !== null && <p className="field-error auto-maker-action-error" role="alert">{action.error}</p>}
+      </section>}
+    </div>
   )
 }

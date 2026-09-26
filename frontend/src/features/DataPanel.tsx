@@ -12,7 +12,8 @@
 // 4. **下载任务进度** —— 任务是单例、跨页面存在的，界面必须能看到当前
 //    分区、阶段、已用时长与失败清单，而不只是一个笼统的百分比。
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { ArrowRight, Database, Download, HardDrive, RotateCw, TriangleAlert } from 'lucide-react'
 
 import { InputField, DateField } from '../components/FormControls'
 import { api } from '../api/client'
@@ -33,6 +34,17 @@ const KINDS = [
   { key: 'mark_price', label: '标记价（1m）', note: '强平距离估算' },
   { key: 'funding', label: '资金费率', note: '持仓成本，体积很小' },
 ] as const
+
+const KIND_LABELS: Record<string, string> = {
+  Klines1m: 'K 线（1m）',
+  AggTrades: '逐笔成交',
+  MarkPriceKlines1m: '标记价（1m）',
+  FundingRate: '资金费率',
+}
+
+function kindLabel(kind: string): string {
+  return KINDS.find((item) => item.key === kind)?.label ?? KIND_LABELS[kind] ?? kind
+}
 
 const STATE_LABELS: Record<DownloadJobState, string> = {
   idle: '空闲',
@@ -162,51 +174,79 @@ export function DataPanel() {
   }, [symbols, kinds, rangeAction])
 
   const running = job?.state === 'running'
+  const canStart = !running && !startAction.busy && symbols.trim() !== '' && kinds.length > 0 && from !== '' && to !== '' && from <= to
+  const datasets = coverage?.datasets ?? []
+  const partitions = datasets.reduce((count, dataset) => count + dataset.partitions, 0)
+  const finalized = datasets.reduce((count, dataset) => count + dataset.finalized, 0)
+  const problemCount = datasets.reduce((count, dataset) => count + dataset.problems.length, 0)
+  const storedBytes = datasets.reduce((count, dataset) => count + dataset.parquet_bytes, 0)
 
   return (
     <div className="data-layout">
-      <section className="panel" aria-labelledby="dl-title">
-        <h2 id="dl-title">下载历史数据</h2>
+      <div className="data-summary" aria-label="本地归档概览">
+        <SummaryStat icon={<Database size={17} aria-hidden="true" />} label="数据集" value={coverage === null ? '—' : String(datasets.length)} />
+        <SummaryStat icon={<Download size={17} aria-hidden="true" />} label="就绪分区" value={coverage === null ? '—' : `${finalized} / ${partitions}`} />
+        <SummaryStat icon={<TriangleAlert size={17} aria-hidden="true" />} label="异常记录" value={coverage === null ? '—' : String(problemCount + coverage.gaps.length)} attention={problemCount + (coverage?.gaps.length ?? 0) > 0} />
+        <SummaryStat icon={<HardDrive size={17} aria-hidden="true" />} label="归档占用" value={coverage === null ? '—' : bytes(storedBytes)} />
+      </div>
 
-        <div className="row">
-          <InputField id="dl-symbols" label="交易对" value={symbols} onChange={setSymbols}
+      <section className="panel data-job-panel" aria-labelledby="job-title">
+        <div className="panel-head">
+          <h2 id="job-title">下载任务</h2>
+          {running && <button type="button" className="danger" onClick={() => void cancel()} disabled={cancelAction.busy}>
+            {cancelAction.busy ? '取消中…' : '取消下载'}
+          </button>}
+        </div>
+        {initAction.error && job === null ? <p className="notice notice-error" role="alert">{initAction.error}</p>
+          : <DownloadJobCard job={job} tick={tick} />}
+        {cancelAction.error && <p className="notice notice-error" role="alert">{cancelAction.error}</p>}
+      </section>
+
+      <section className="panel data-download-panel" aria-labelledby="dl-title">
+        <div className="panel-head"><h2 id="dl-title">下载历史数据</h2></div>
+
+        <div className="data-download-body">
+
+        <div className="data-form-row">
+          <InputField id="dl-symbols" label="交易对" value={symbols} onChange={(value) => { setSymbols(value); setRanges(null) }}
             placeholder="ETHUSDC, BTCUSDC" hint="多个交易对用逗号分隔" disabled={running} />
         </div>
 
-        <fieldset className="fieldset">
-          <legend>数据集</legend>
+        <fieldset className="data-kind-grid">
+          <legend>选择数据集</legend>
           {KINDS.map((k) => (
             <label className="checkbox" key={k.key}>
               <input
                 type="checkbox"
                 checked={kinds.includes(k.key)}
                 disabled={running}
-                onChange={(e) =>
+                onChange={(e) => {
+                  setRanges(null)
                   setKinds((prev) =>
                     e.target.checked
                       ? [...prev, k.key]
                       : prev.filter((x) => x !== k.key),
                   )
-                }
+                }}
               />
               <span>
                 {k.label}
-                <small className="muted"> — {k.note}</small>
+                <small>{k.note}</small>
               </span>
             </label>
           ))}
         </fieldset>
 
-        <div className="row">
-          <DateField id="dl-from" label="起始月份" mode="month" value={from} onChange={setFrom} max={to} />
-          <DateField id="dl-to" label="结束月份" mode="month" value={to} onChange={setTo} min={from}
+        <div className="data-months">
+          <DateField id="dl-from" label="起始月份" mode="month" value={from} onChange={setFrom} max={to} disabled={running} />
+          <DateField id="dl-to" label="结束月份" mode="month" value={to} onChange={setTo} min={from} disabled={running}
             error={from > to ? '结束月份不能早于起始月份' : undefined} />
         </div>
 
-        <div className="actions">
+        <div className="data-range-action">
           <button
             type="button"
-            className="secondary"
+            className="link-btn"
             onClick={() => void useEarliest()}
             disabled={rangeAction.busy || running}
           >
@@ -222,6 +262,7 @@ export function DataPanel() {
 
         {ranges !== null && (
           <div className="archive-ranges">
+            <strong>公开归档范围</strong>
             {ranges.map((r) => (
               <div key={r.symbol} className="archive-range-block">
                 <div className="archive-range-head">
@@ -254,73 +295,44 @@ export function DataPanel() {
             {startAction.error}
           </p>
         )}
-        {cancelAction.error !== null && (
-          <p className="notice notice-error" role="alert">
-            {cancelAction.error}
-          </p>
-        )}
+        {kinds.length === 0 && <p className="field-error" role="alert">请至少选择一种数据集。</p>}
 
-        <div className="actions">
+        <div className="data-download-actions">
           <button
             type="button"
             className="primary"
             onClick={() => void start()}
-            disabled={startAction.busy || running || !from || !to || from > to}
+            disabled={!canStart}
           >
-            {startAction.busy ? '启动中…' : '开始下载'}
-          </button>
-          {running && (
-            <button
-              type="button"
-              className="danger"
-              onClick={() => void cancel()}
-              disabled={cancelAction.busy}
-            >
-              {cancelAction.busy ? '取消中…' : '取消下载'}
-            </button>
-          )}
-          <button
-            type="button"
-            className="secondary"
-            onClick={() => void load()}
-            disabled={loadAction.busy}
-          >
-            刷新覆盖情况
+            {startAction.busy ? '启动中…' : running ? '正在下载中' : '开始下载'} <ArrowRight size={16} aria-hidden="true" />
           </button>
         </div>
 
-        <p className="muted small">
-          下载在后台进行，可以随时关闭页面。已完成的分区会写入台账，重跑会跳过
-          已完成的分区，只重试失败的分区。
-        </p>
+        <p className="data-form-note">{running ? '当前有下载任务，结束或取消后可修改配置。' : '已完成的分区会跳过；异常分区可重跑。'}</p>
+        </div>
       </section>
 
-      <section className="panel" aria-labelledby="job-title">
-        <h2 id="job-title">下载任务</h2>
-        <DownloadJobCard job={job} tick={tick} />
-      </section>
-
-      <section className="panel" aria-labelledby="cov-title">
+      <section className="panel data-coverage-panel" aria-labelledby="cov-title">
         <div className="panel-head">
           <h2 id="cov-title">本地数据覆盖</h2>
-          {coverage !== null && (
-            <span className="muted mono">{coverage.data_root}</span>
-          )}
+          <button type="button" className="secondary" onClick={() => void load()} disabled={loadAction.busy}>
+            <RotateCw size={15} aria-hidden="true" />{loadAction.busy ? '刷新中…' : '刷新'}
+          </button>
         </div>
 
         {coverage === null ? (
-          <p className="muted">加载中…</p>
+          <p className="panel-empty">{loadAction.error ?? '正在读取本地归档…'}</p>
         ) : coverage.datasets.length === 0 ? (
-          <p className="muted">
-            台账为空——尚未下载任何数据。用左侧表单开始第一次下载。
-          </p>
+          <p className="panel-empty">台账为空。选择左侧交易对、数据集和月份，开始首次下载。</p>
         ) : (
           <div className="coverage-list">
-            {coverage.datasets.map((d) => (
+            {datasets.map((d) => (
               <DatasetBlock key={`${d.kind}-${d.symbol}`} data={d} />
             ))}
           </div>
         )}
+
+        {coverage !== null && <p className="data-root">存储位置 <span>{coverage.data_root}</span></p>}
 
         {coverage !== null && coverage.gaps.length > 0 && (
           <div className="gaps">
@@ -348,10 +360,19 @@ export function DataPanel() {
   )
 }
 
+function SummaryStat({ icon, label, value, attention = false }: {
+  icon: ReactNode; label: string; value: string; attention?: boolean
+}) {
+  return <div className={`data-summary-stat ${attention ? 'data-summary-attention' : ''}`}>
+    <span className="data-summary-icon">{icon}</span>
+    <div><span className="data-summary-label">{label}</span><strong>{value}</strong></div>
+  </div>
+}
+
 /** 下载任务的完整状态展示：整体进度、当前分区、耗时、结束汇总。 */
 function DownloadJobCard({ job, tick }: { job: DownloadJob | null; tick: number }) {
   if (job === null || job.state === 'idle') {
-    return <p className="muted">当前没有下载任务。</p>
+    return <p className="data-job-empty">当前没有下载任务。配置好交易对和月份后，即可从这里跟踪进度。</p>
   }
 
   const total = job.plan?.total ?? 0
@@ -373,7 +394,7 @@ function DownloadJobCard({ job, tick }: { job: DownloadJob | null; tick: number 
         <span className={STATE_TAG_CLASS[job.state]}>{STATE_LABELS[job.state]}</span>
         {job.request !== null && (
           <span className="muted mono">
-            {job.request.symbols.join(', ')} · {job.request.kinds.join(', ')} · {job.request.from} → {job.request.to}
+            {job.request.symbols.join(', ')} · {job.request.kinds.map(kindLabel).join('、')} · {job.request.from} → {job.request.to}
           </span>
         )}
         {elapsedSecs !== null && <span className="muted">已用时长 {duration(elapsedSecs)}</span>}
@@ -383,30 +404,23 @@ function DownloadJobCard({ job, tick }: { job: DownloadJob | null; tick: number 
         <p className="notice notice-warn">未能获取归档范围，已按上个月截止。</p>
       )}
 
+      <div className="data-job-progress">
       {job.plan !== null && (
-        <div className="progress">
-          <div className="progress-bar">
+        <div className="progress" aria-label="总体进度">
+          <div className="data-progress-label"><span>总体进度</span><strong>{job.done} / {total} 分区</strong></div>
+          <div className="progress-bar" role="progressbar" aria-label="总体进度" aria-valuemin={0} aria-valuemax={total} aria-valuenow={job.done}>
             <div className="progress-fill" style={{ width: `${overallPct}%` }} />
           </div>
-          <span className="muted">
-            总体进度 {job.done}/{total}
-          </span>
         </div>
-      )}
-
-      {job.plan !== null && job.plan.clipped.length > 0 && (
-        <p className="muted small">
-          已按归档范围裁剪：{job.plan.clipped.join('；')}
-        </p>
       )}
 
       {job.current !== null && (
         <div className="download-job-current">
-          <p className="muted">
-            当前：{job.current.symbol} {job.current.kind} {job.current.month} · {job.current.stage_label}
-          </p>
-          <div className="progress">
-            <div className="progress-bar">
+          <p className="data-progress-label"><span>当前分区</span><strong>{job.current.symbol} · {kindLabel(job.current.kind)} · {job.current.month}</strong></p>
+          <p className="data-job-stage">{job.current.stage_label}</p>
+          <div className="progress" aria-label="当前分区进度">
+            <div className="progress-bar" role="progressbar" aria-label="当前分区进度" aria-valuemin={0}
+              aria-valuemax={job.current.stage_total ?? undefined} aria-valuenow={job.current.stage_total !== null ? job.current.stage_done : undefined}>
               <div
                 className="progress-fill"
                 style={{
@@ -419,11 +433,16 @@ function DownloadJobCard({ job, tick }: { job: DownloadJob | null; tick: number 
             </div>
             <span className="muted">
               {job.current.stage_total !== null
-                ? `${job.current.stage_done}/${job.current.stage_total}`
+                ? `${job.current.stage_done.toLocaleString('zh-CN')} / ${job.current.stage_total.toLocaleString('zh-CN')}`
                 : bytes(job.current.stage_done)}
             </span>
           </div>
         </div>
+      )}
+      </div>
+
+      {job.plan !== null && job.plan.clipped.length > 0 && (
+        <p className="muted small">已按归档范围裁剪：{job.plan.clipped.join('；')}</p>
       )}
 
       {job.state !== 'running' && (
@@ -456,33 +475,30 @@ function DownloadJobCard({ job, tick }: { job: DownloadJob | null; tick: number 
 
 function DatasetBlock({ data }: { data: DatasetCoverage }) {
   const allOk = data.problems.length === 0 && data.finalized === data.partitions
+  const pct = data.partitions > 0 ? Math.min(100, (data.finalized / data.partitions) * 100) : 0
+  const label = kindLabel(data.kind)
   return (
-    <div className="coverage-item">
+    <article className="coverage-item">
       <div className="coverage-head">
-        <span className="coverage-symbol">{data.symbol}</span>
-        <span className="coverage-kind">{data.kind}</span>
+        <div><span className="coverage-symbol">{data.symbol}</span><span className="coverage-kind">{label}</span></div>
         <span className={allOk ? 'tag-ok' : 'tag-warn'}>
-          {allOk ? '完整' : '有问题'}
+          {allOk ? '完整' : data.problems.length > 0 ? '需检查' : '未完成'}
         </span>
       </div>
-      <dl className="kv kv-inline">
+      <dl className="data-coverage-stats">
         <div>
-          <dt>分区</dt>
-          <dd>
-            {data.finalized} / {data.partitions}
-          </dd>
+          <dt>已就绪</dt><dd>{data.finalized} / {data.partitions}</dd>
         </div>
         <div>
-          <dt>区间</dt>
-          <dd>
-            {data.first_month ?? '—'} → {data.last_month ?? '—'}
-          </dd>
+          <dt>覆盖月份</dt><dd>{data.first_month ?? '—'} → {data.last_month ?? '—'}</dd>
         </div>
         <div>
-          <dt>占用</dt>
-          <dd>{bytes(data.parquet_bytes)}</dd>
+          <dt>磁盘</dt><dd>{bytes(data.parquet_bytes)}</dd>
         </div>
       </dl>
+      <div className="data-coverage-track" role="progressbar" aria-label={`${data.symbol} ${label}已就绪分区`} aria-valuemin={0} aria-valuemax={data.partitions} aria-valuenow={data.finalized}>
+        <span style={{ width: `${pct}%` }} />
+      </div>
       {data.problems.length > 0 && (
         <details className="problems">
           <summary>{data.problems.length} 个异常分区</summary>
@@ -498,6 +514,6 @@ function DatasetBlock({ data }: { data: DatasetCoverage }) {
           </p>
         </details>
       )}
-    </div>
+    </article>
   )
 }

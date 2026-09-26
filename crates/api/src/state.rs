@@ -361,6 +361,8 @@ pub struct AppState {
     /// 用 `Mutex` 而非连接池：SQLite 的 WAL 模式已支持一写多读，而我们的
     /// 写入频率很低（每次订单状态变更），连接池带来的复杂度不值得。
     pub db: Arc<Mutex<Connection>>,
+    /// 本次模拟盘进程的权益曲线标识；重启后新建，避免把重置后的权益接到旧曲线上。
+    pub equity_session_id: String,
     /// 数据根目录（Parquet 与台账所在）。
     pub data_root: PathBuf,
     /// 后台任务进度广播通道。
@@ -428,6 +430,11 @@ impl AppState {
         Arc::new(Self {
             engine: Arc::new(Mutex::new(engine)),
             db: Arc::new(Mutex::new(db)),
+            equity_session_id: format!(
+                "{}-{}",
+                chrono::Utc::now().timestamp_micros(),
+                std::process::id()
+            ),
             data_root,
             symbol,
             progress_tx,
