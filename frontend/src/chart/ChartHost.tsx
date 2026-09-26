@@ -9,7 +9,7 @@
 // 全览——这是行情软件最让人恼火的体验之一。所以只在**首次加载**和**换周期**
 // 时显示最近 100 根，后续刷新保持用户当前的缩放。
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   CandlestickSeries,
   CrosshairMode,
@@ -23,6 +23,9 @@ import {
   type Time,
 } from 'lightweight-charts'
 
+import { Copy } from 'lucide-react'
+import { Input } from '../components/FormControls'
+import { ContextMenu } from '../components/ContextMenu'
 import type { CandleBar, RawCandle } from '../api/types'
 import { signedStr } from '../api/decimal'
 import { pnlClass } from '../format'
@@ -68,6 +71,32 @@ export function ChartHost({
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
   const orderLinesRef = useRef<OrderLines | null>(null)
+
+  const [menu, setMenu] = useState<{ x: number; y: number; price: string } | null>(null)
+  const [copyStatus, setCopyStatus] = useState('')
+  const [copyError, setCopyError] = useState(false)
+  const closeMenu = useCallback(() => setMenu(null), [])
+  useEffect(() => { closeMenu(); setCopyStatus('') }, [intervalKey, closeMenu])
+
+  function openPriceMenu(clientX: number, clientY: number) {
+    const container = containerRef.current
+    const chart = chartRef.current
+    const series = candleSeriesRef.current
+    if (!container || !chart || !series || rawCandles.length === 0) return
+    const bounds = container.getBoundingClientRect()
+    const x = clientX - bounds.left
+    const y = clientY - bounds.top
+    const pane = chart.paneSize()
+    if (x < 0 || y < 0 || x >= pane.width || y >= pane.height) return
+    // 这是光标在价格轴上的坐标，不用于下单或保护单计算。
+    const coordinatePrice = series.coordinateToPrice(y)
+    if (coordinatePrice === null || !Number.isFinite(coordinatePrice)) return
+    const price = series.priceFormatter().format(coordinatePrice)
+    container.focus({ preventScroll: true })
+    setCopyStatus('')
+    setCopyError(false)
+    setMenu({ x: clientX, y: clientY, price })
+  }
 
   // 保留上一次数据，判断推送可否增量更新。
   const previousBarsRef = useRef<CandleBar[]>([])
@@ -285,9 +314,37 @@ export function ChartHost({
       <div
         ref={containerRef}
         className="chart-plot"
+        tabIndex={0}
+        onContextMenu={(event) => {
+          event.preventDefault()
+          openPriceMenu(event.clientX, event.clientY)
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return
+          event.preventDefault()
+          const bounds = containerRef.current?.getBoundingClientRect()
+          const pane = chartRef.current?.paneSize()
+          if (bounds && pane) openPriceMenu(bounds.left + pane.width / 2, bounds.top + pane.height / 2)
+        }}
         role="img"
         aria-label="价格走势图，绿涨红跌，含 K 线、成交量与持仓价位线"
       />
+      {copyStatus && <div className="chart-copy-status" role="status">{copyStatus}</div>}
+      {menu && <ContextMenu x={menu.x} y={menu.y} label="图表价格操作" onClose={closeMenu}>
+        <div className="context-menu-caption">光标价格</div>
+        <button type="button" role="menuitem" className="context-menu-item" onClick={() => {
+          if (!navigator.clipboard) { setCopyError(true); return }
+          void navigator.clipboard.writeText(menu.price).then(() => {
+            setCopyStatus(`已复制价格 ${menu.price}`)
+            closeMenu()
+            containerRef.current?.focus({ preventScroll: true })
+          }).catch(() => setCopyError(true))
+        }}><Copy size={16} aria-hidden="true" /><span>复制价格</span><strong>{menu.price}</strong></button>
+        {copyError && <div className="context-copy-fallback">
+          <p role="alert">复制失败，请选中价格手动复制。</p>
+          <Input aria-label="待复制价格" readOnly value={menu.price} onFocus={(event) => event.target.select()} />
+        </div>}
+      </ContextMenu>}
     </div>
   )
 }

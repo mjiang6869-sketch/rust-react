@@ -16,6 +16,7 @@ import { CandlestickChart, Radio } from 'lucide-react'
 
 import { cooldownNotice, useMarketFeed } from '../api/marketFeed'
 import { INTERVALS, type EngineState } from '../api/types'
+import { Input } from '../components/FormControls'
 import { ChartHost } from '../chart/ChartHost'
 import { useKlines } from '../chart/useKlines'
 import { num } from '../format'
@@ -50,7 +51,7 @@ export function MarketPage({ engine, hasPosition }: MarketPageProps) {
         setSymbol(next)
       }}>
         <label htmlFor="market-symbol">交易对</label>
-        <input type="text" id="market-symbol" list="market-symbols" value={draftSymbol}
+        <Input type="text" id="market-symbol" list="market-symbols" value={draftSymbol}
           onChange={(event) => setDraftSymbol(event.target.value)} autoComplete="off"
           spellCheck={false} aria-describedby={symbolError ? 'symbol-error' : undefined} />
         <datalist id="market-symbols">

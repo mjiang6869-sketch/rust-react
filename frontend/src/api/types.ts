@@ -185,7 +185,8 @@ export interface ManualPlanRequest {
   quantity?: string
   size_pct?: string
   leverage: string
-  stop: string
+  stop?: string
+  stop_distance_bp?: string
   take_profit?: Array<{ pct: string; fraction: string }>
   take_profit_pct?: string
   break_even?: { trigger_r: string; offset: string }

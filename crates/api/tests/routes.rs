@@ -272,6 +272,32 @@ async fn preview_returns_quantized_prices() {
     assert_eq!(total, dec!(0.1), "各档合计应等于下总量");
 }
 
+/// 距离意图必须沿用保护单规划器的方向量化，旧止损价格请求仍然等价。
+#[tokio::test]
+async fn preview_stop_distance_matches_explicit_stop_for_both_sides() {
+    for (side, raw_stop, expected) in [
+        ("BUY", "3192.029925", "3192.02"),
+        ("SELL", "3208.030075", "3208.04"),
+    ] {
+        let s = test_state();
+        let mut explicit = valid_plan();
+        explicit["side"] = serde_json::json!(side);
+        explicit["entry"] = serde_json::json!("3200.03");
+        explicit["stop"] = serde_json::json!(raw_stop);
+        let mut distance = explicit.clone();
+        distance.as_object_mut().unwrap().remove("stop");
+        distance["stop_distance_bp"] = serde_json::json!("25");
+        let (old_status, old) = post_json(&s, "/api/v1/manual/preview", explicit).await;
+        let (status, body) = post_json(&s, "/api/v1/manual/preview", distance).await;
+        assert_eq!(old_status, StatusCode::OK, "{old}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, old);
+        assert_eq!(body["data"]["stop"], expected);
+        let (_, state) = get(&s, "/api/v1/state").await;
+        assert!(state["data"]["open_orders"].as_array().unwrap().is_empty());
+    }
+}
+
 /// 预览不能改变引擎状态。
 #[tokio::test]
 async fn preview_does_not_mutate_state() {

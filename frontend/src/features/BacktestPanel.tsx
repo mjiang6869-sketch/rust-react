@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 
+import { SelectField, DateField } from '../components/FormControls'
 import { api } from '../api/client'
 import type { BacktestResult, BacktestRunSummary, StrategyInfo } from '../api/types'
 import { duration, pct, pnlClass, signed } from '../format'
@@ -66,48 +67,13 @@ export function BacktestPanel({ symbol, initialEquity }: Props) {
         <h2 id="bt-title">运行回测</h2>
 
         <div className="row">
-          <div className="field">
-            <label htmlFor="bt-strategy">策略</label>
-            <div className="input-wrap">
-              <select
-                id="bt-strategy"
-                value={strategy}
-                onChange={(e) => setStrategy(e.target.value)}
-              >
-                {strategies.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
+          <SelectField id="bt-strategy" label="策略" value={strategy} onChange={setStrategy}
+            options={strategies.map((s) => ({ value: s.id, label: s.name }))} />
         </div>
-
         <div className="row">
-          <div className="field">
-            <label htmlFor="bt-from">起始日期</label>
-            <div className="input-wrap">
-              <input
-                id="bt-from"
-                type="text"
-                value={from}
-                onChange={(e) => setFrom(e.target.value)}
-              />
-            </div>
-            <small>格式 YYYY-MM-DD</small>
-          </div>
-          <div className="field">
-            <label htmlFor="bt-to">结束日期</label>
-            <div className="input-wrap">
-              <input
-                id="bt-to"
-                type="text"
-                value={to}
-                onChange={(e) => setTo(e.target.value)}
-              />
-            </div>
-          </div>
+          <DateField id="bt-from" label="起始日期" value={from} onChange={setFrom} max={to} />
+          <DateField id="bt-to" label="结束日期" value={to} onChange={setTo} min={from}
+            error={from > to ? '结束日期不能早于起始日期' : undefined} />
         </div>
 
         <fieldset className="fieldset">
@@ -158,7 +124,7 @@ export function BacktestPanel({ symbol, initialEquity }: Props) {
             type="button"
             className="primary"
             onClick={() => void run()}
-            disabled={action.busy || models.length === 0}
+            disabled={action.busy || models.length === 0 || !from || !to || from > to}
           >
             {action.busy ? '回测中…' : '运行回测'}
           </button>

@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 
+import { InputField, DateField } from '../components/FormControls'
 import { api } from '../api/client'
 import type { Coverage, DatasetCoverage } from '../api/types'
 import { bytes } from '../format'
@@ -69,19 +70,8 @@ export function DataPanel() {
         <h2 id="dl-title">下载历史数据</h2>
 
         <div className="row">
-          <div className="field">
-            <label htmlFor="dl-symbols">交易对</label>
-            <div className="input-wrap">
-              <input
-                id="dl-symbols"
-                type="text"
-                value={symbols}
-                onChange={(e) => setSymbols(e.target.value)}
-                placeholder="ETHUSDC, BTCUSDC"
-              />
-            </div>
-            <small>多个交易对用逗号分隔</small>
-          </div>
+          <InputField id="dl-symbols" label="交易对" value={symbols} onChange={setSymbols}
+            placeholder="ETHUSDC, BTCUSDC" hint="多个交易对用逗号分隔" />
         </div>
 
         <fieldset className="fieldset">
@@ -108,32 +98,9 @@ export function DataPanel() {
         </fieldset>
 
         <div className="row">
-          <div className="field">
-            <label htmlFor="dl-from">起始月份</label>
-            <div className="input-wrap">
-              <input
-                id="dl-from"
-                type="text"
-                value={from}
-                onChange={(e) => setFrom(e.target.value)}
-                placeholder="2026-01"
-              />
-            </div>
-            <small>格式 YYYY-MM</small>
-          </div>
-          <div className="field">
-            <label htmlFor="dl-to">结束月份</label>
-            <div className="input-wrap">
-              <input
-                id="dl-to"
-                type="text"
-                value={to}
-                onChange={(e) => setTo(e.target.value)}
-                placeholder="2026-08"
-              />
-            </div>
-            <small>格式 YYYY-MM</small>
-          </div>
+          <DateField id="dl-from" label="起始月份" mode="month" value={from} onChange={setFrom} max={to} />
+          <DateField id="dl-to" label="结束月份" mode="month" value={to} onChange={setTo} min={from}
+            error={from > to ? '结束月份不能早于起始月份' : undefined} />
         </div>
 
         {progress?.type === 'download' && (
@@ -172,7 +139,7 @@ export function DataPanel() {
             type="button"
             className="primary"
             onClick={() => void start()}
-            disabled={action.busy}
+            disabled={action.busy || !from || !to || from > to}
           >
             {action.busy ? '启动中…' : '开始下载'}
           </button>

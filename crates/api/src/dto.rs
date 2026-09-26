@@ -333,7 +333,10 @@ pub struct ManualPlanDto {
     /// 按权益比例下单。
     pub size_pct: Option<String>,
     pub leverage: String,
-    pub stop: String,
+    /// 明确止损价，与 stop_distance_bp 二选一；保留旧客户端兼容性。
+    pub stop: Option<String>,
+    /// 相对入场价的止损距离（基点），由服务端计算后交给保护单规划器量化。
+    pub stop_distance_bp: Option<String>,
     /// 分批止盈。`None` 表示不分批。
     pub take_profit: Option<Vec<TakeProfitRungDto>>,
     /// 单档止盈百分比（当 `take_profit` 为 `None` 时使用）。
@@ -928,7 +931,31 @@ pub fn parse_manual_plan(dto: &ManualPlanDto, now: DateTime<Utc>) -> Result<Manu
     };
 
     let entry = dec(&dto.entry, "entry")?;
-    let stop = dec(&dto.stop, "stop")?;
+    let stop = match (&dto.stop, &dto.stop_distance_bp) {
+        (Some(stop), None) => dec(stop, "stop")?,
+        (None, Some(bp)) => {
+            let bp = dec(bp, "stop_distance_bp")?;
+            let basis = Decimal::from(10_000);
+            if bp <= Decimal::ZERO || bp >= basis {
+                return Err(ApiError::BadRequest(
+                    "止损距离必须大于 0 且小于 10000 基点".into(),
+                ));
+            }
+            let delta = entry
+                .checked_mul(bp / basis)
+                .ok_or_else(|| ApiError::BadRequest("入场价或止损距离超出范围".into()))?;
+            match dto.side {
+                Side::Buy => entry.checked_sub(delta),
+                Side::Sell => entry.checked_add(delta),
+            }
+            .ok_or_else(|| ApiError::BadRequest("止损价超出范围".into()))?
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "必须且只能指定止损价或止损距离之一".into(),
+            ));
+        }
+    };
     let leverage = dec(&dto.leverage, "leverage")?;
     if leverage < Decimal::ONE {
         return Err(ApiError::BadRequest("杠杆必须不小于 1".into()));
@@ -1063,7 +1090,8 @@ mod tests {
             quantity: Some("0.1".into()),
             size_pct: None,
             leverage: "3".into(),
-            stop: "3192".into(),
+            stop: Some("3192".into()),
+            stop_distance_bp: None,
             take_profit: None,
             take_profit_pct: Some("0.0025".into()),
             break_even: None,
@@ -1071,6 +1099,36 @@ mod tests {
             cancel_unfilled_after_secs: Some(120),
             client_ref: Some("manual".into()),
         }
+    }
+
+    #[test]
+    fn manual_stop_distance_is_calculated_on_server() {
+        for (side, entry, bp, expected) in [
+            (Side::Buy, "3200", "25", dec!(3192)),
+            (Side::Sell, "3200", "25", dec!(3208)),
+            (Side::Buy, "0.00001234", "12.5", dec!(0.000012324575)),
+            (Side::Sell, "0.00001234", "12.5", dec!(0.000012355425)),
+        ] {
+            let mut dto = base_dto();
+            dto.side = side;
+            dto.entry = entry.into();
+            dto.stop = None;
+            dto.stop_distance_bp = Some(bp.into());
+            assert_eq!(parse_manual_plan(&dto, Utc::now()).unwrap().stop, expected);
+        }
+    }
+
+    #[test]
+    fn manual_stop_distance_rejects_ambiguous_or_invalid_values() {
+        for bp in [None, Some("0"), Some("-1"), Some("10000"), Some("NaN")] {
+            let mut dto = base_dto();
+            dto.stop = None;
+            dto.stop_distance_bp = bp.map(str::to_owned);
+            assert!(parse_manual_plan(&dto, Utc::now()).is_err());
+        }
+        let mut dto = base_dto();
+        dto.stop_distance_bp = Some("25".into());
+        assert!(parse_manual_plan(&dto, Utc::now()).is_err());
     }
 
     // ---- 限流语义必须原样穿过 API 层 ----

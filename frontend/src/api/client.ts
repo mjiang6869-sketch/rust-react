@@ -175,8 +175,9 @@ export const api = {
   fillModels: () => request<FillModelInfo[]>('/fill-models'),
 
   /** 预览手动计划。**不改变引擎状态**。 */
-  previewManual: (plan: ManualPlanRequest) =>
+  previewManual: (plan: ManualPlanRequest, signal?: AbortSignal) =>
     request<ManualPreview>('/manual/preview', {
+      ...(signal ? { signal } : {}),
       method: 'POST',
       body: JSON.stringify(plan),
     }),

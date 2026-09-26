@@ -1,84 +1,28 @@
-// 手动下单面板。
-//
-// # 这是产品的核心理由
-//
-// 币安没有 OCO、没有 bracket 单，一张条件单只能对应一个数量与触发价。所以
-// 「一个点位挂单 + 同时挂分批止盈与止损」必须由客户端实现。这个面板就是
-// 那个能力的入口。
-//
-// # 两条交互约定
-//
-// 1. **预览必须先于提交。** 用户改任何参数后都重新预览，看到的是后端量化后
-//    的真实价位——前端不做任何价格计算。这样「界面显示的价」与「将要挂出的
-//    价」必然一致。
-// 2. **提交带幂等键。** 双击不会下出两张单。键在用户第一次点击时生成，
-//    提交成功后丢弃。
-
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-
-import { SlidersHorizontal } from 'lucide-react'
+// 手动意图交给后端规划；只有与当前输入完全一致的预览可以提交。
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { SlidersHorizontal, Plus, X } from 'lucide-react'
 
 import { api, newIdempotencyKey } from '../api/client'
-import type {
-  InstrumentInfo,
-  ManualPlanRequest,
-  ManualPreview,
-  Side,
-} from '../api/types'
+import type { InstrumentInfo, ManualPreview, Side } from '../api/types'
+import { InputField } from '../components/FormControls'
 import { num, pct, signed } from '../format'
 import { useAction } from '../state/store'
-
-/**
- * 一个 tick 需要几位小数。
- *
- * `tick_size` 是 `0.01` 这种形式，取它的小数位即可。用字符串判断而不是
- * `Math.log10`——后者对 0.001 这类值会因浮点误差算出 2.9999999。
- */
-function decimalsFor(tick: number): number {
-  const s = String(tick)
-  const dot = s.indexOf('.')
-  return dot < 0 ? 0 : s.length - dot - 1
-}
-
-interface RungInput {
-  /** 距入场价的基点。 */
-  bp: string
-  /** 该档平仓比例（百分比）。 */
-  percent: string
-}
+import { manualPlan, type RungInput } from './manualPlan'
 
 interface Props {
   instrument: InstrumentInfo
-  /** 当前是否已有持仓或在途单。有则禁用下单。 */
   hasPosition: boolean
   onSubmitted: () => void
-  /**
-   * 当前市场中间价（字符串）。
-   *
-   * 用作入场价的初始值——硬编码一个价格（比如 `3200`）在 ETH 涨到 4000 时
-   * 会让每次下单都被风控拒绝，而且用户看不出为什么。`null` 时不覆盖。
-   */
   referencePrice?: string | null
 }
-
-/** 默认三档止盈：25/50/75 bp，比例 40/30/30。 */
 const DEFAULT_RUNGS: RungInput[] = [
-  { bp: '25', percent: '40' },
-  { bp: '50', percent: '30' },
-  { bp: '75', percent: '30' },
+  { bp: '25', percent: '40' }, { bp: '50', percent: '30' }, { bp: '75', percent: '30' },
 ]
 
-export function ManualPanel({
-  instrument,
-  hasPosition,
-  onSubmitted,
-  referencePrice = null,
-}: Props) {
+export function ManualPanel({ instrument, hasPosition, onSubmitted, referencePrice = null }: Props) {
   const [side, setSide] = useState<Side>('BUY')
   const [entry, setEntry] = useState('')
-  // 用户是否手动改过入场价。一旦改过就不再跟随行情——
-  // 否则辛苦算好的价格会被下一次刷新悄悄覆盖掉。
-  const entryTouchedRef = useRef(false)
+  const entryInitialized = useRef(false)
   const [stopBp, setStopBp] = useState('25')
   const [leverage, setLeverage] = useState('3')
   const [sizePct, setSizePct] = useState('10')
@@ -87,332 +31,157 @@ export function ManualPanel({
   const [singleTpBp, setSingleTpBp] = useState('50')
   const [breakEven, setBreakEven] = useState(true)
   const [cancelSecs, setCancelSecs] = useState('120')
-
-  const [preview, setPreview] = useState<ManualPreview | null>(null)
+  const [touched, setTouched] = useState<Record<string, boolean>>({})
   const action = useAction()
 
-  // 行情到位且用户没手动改过时，用中间价填入入场价。
+  // 仅初始化一次；之后行情更新不能悄悄改变待提交价格。
   useEffect(() => {
-    if (entryTouchedRef.current) return
-    if (referencePrice === null || referencePrice === '') return
-    // 中间价带 4 位小数（买卖价各 2 位的平均），按 tick 对齐
-    const tick = Number(instrument.tick_size)
-    const n = Number(referencePrice)
-    if (!Number.isFinite(n) || n <= 0) return
-    const aligned = tick > 0 ? Math.round(n / tick) * tick : n
-    setEntry(aligned.toFixed(tick > 0 ? decimalsFor(tick) : 2))
-  }, [referencePrice, instrument.tick_size])
-
-  // 由入场价与基点算出止损价。
-  //
-  // 这里用定点算术（经 decimal 工具）而非浮点。虽然只是构造请求参数，
-  // 但浮点误差会在量化后放大到一整个 tick 的差异。
-  const stopPrice = useMemo(() => {
-    const e = Number(entry)
-    const bp = Number(stopBp)
-    if (!Number.isFinite(e) || !Number.isFinite(bp) || e <= 0) return ''
-    const delta = (e * bp) / 10_000
-    const raw = side === 'BUY' ? e - delta : e + delta
-    // 按 tick 对齐到合理精度后交给后端量化
-    const tick = Number(instrument.tick_size)
-    const aligned = tick > 0 ? Math.round(raw / tick) * tick : raw
-    return aligned.toFixed(8).replace(/\.?0+$/, '')
-  }, [entry, stopBp, side, instrument.tick_size])
-
-  const buildPlan = useCallback((): ManualPlanRequest | null => {
-    if (entry.trim() === '' || stopPrice === '') return null
-
-    const plan: ManualPlanRequest = {
-      symbol: instrument.symbol,
-      side,
-      entry: entry.trim(),
-      size_pct: (Number(sizePct) / 100).toString(),
-      leverage,
-      stop: stopPrice,
-      client_ref: 'manual',
+    if (!entryInitialized.current && referencePrice) {
+      entryInitialized.current = true
+      setEntry(referencePrice)
     }
-    if (cancelSecs.trim() !== '') {
-      plan.cancel_unfilled_after_secs = Number(cancelSecs)
-    }
-    if (breakEven) {
-      plan.break_even = { trigger_r: '1', offset: '0' }
-    }
-    if (useLadder) {
-      plan.take_profit = rungs
-        .filter((r) => r.bp.trim() !== '' && r.percent.trim() !== '')
-        .map((r) => ({
-          pct: (Number(r.bp) / 10_000).toString(),
-          fraction: (Number(r.percent) / 100).toString(),
-        }))
-    } else {
-      plan.take_profit_pct = (Number(singleTpBp) / 10_000).toString()
-    }
-    return plan
-  }, [
-    instrument.symbol,
-    side,
-    entry,
-    stopPrice,
-    sizePct,
-    leverage,
-    cancelSecs,
-    breakEven,
-    useLadder,
-    rungs,
-    singleTpBp,
-  ])
+  }, [referencePrice])
 
-  // 参数变化后自动重新预览。
-  //
-  // 防抖 300ms：用户连续输入时不必每次都发请求。预览是只读操作，不会
-  // 改变引擎状态，所以频繁调用是安全的。
+  const { plan, errors, total } = useMemo(() => manualPlan({
+    symbol: instrument.symbol, side, entry, stopBp, leverage, sizePct,
+    rungs, useLadder, singleTpBp, breakEven, cancelSecs,
+  }), [instrument.symbol, side, entry, stopBp, leverage, sizePct, rungs, useLadder, singleTpBp, breakEven, cancelSecs])
+  const planKey = plan === null ? null : JSON.stringify(plan)
+  const [result, setResult] = useState<{ key: string; preview?: ManualPreview; error?: string } | null>(null)
+  const [retry, setRetry] = useState(0)
+  const current = result?.key === planKey ? result : null
+  const preview = current?.preview ?? null
+  const previewing = planKey !== null && current === null
+
   useEffect(() => {
-    const plan = buildPlan()
-    if (plan === null) {
-      setPreview(null)
-      return
-    }
+    if (planKey === null) return
+    const controller = new AbortController()
+    let active = true
     const timer = setTimeout(() => {
-      void action.run(async () => {
-        const p = await api.previewManual(plan)
-        setPreview(p)
-        return p
+      void api.previewManual(JSON.parse(planKey), controller.signal).then((preview) => {
+        if (active) setResult({ key: planKey, preview })
+      }).catch((error: unknown) => {
+        if (active) setResult({ key: planKey, error: error instanceof Error ? error.message : String(error) })
       })
     }, 300)
-    return () => clearTimeout(timer)
-    // action.run 是稳定的 useCallback，不需要进依赖
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [buildPlan])
+    return () => { active = false; clearTimeout(timer); controller.abort() }
+  }, [planKey, retry])
 
-  const submit = useCallback(async () => {
-    const plan = buildPlan()
-    if (plan === null) return
-    // 幂等键在此生成：同一次点击的重复提交会因键重复被后端拒绝，
-    // 而不是下出两张单。
-    const key = newIdempotencyKey('manual')
-    const result = await action.run(() => api.submitManual(plan, key))
-    if (result !== undefined) {
-      onSubmitted()
-    }
-  }, [buildPlan, action, onSubmitted])
+  const submission = useRef<{ planKey: string; key: string } | null>(null)
+  const submitting = useRef(false)
+  const [submittedKey, setSubmittedKey] = useState<string | null>(null)
+  const canSubmit = !hasPosition && !action.busy && plan !== null && preview?.accepted === true && submittedKey !== planKey
+  async function submit() {
+    if (!canSubmit || !plan || !planKey || submitting.current) return
+    submitting.current = true
+    if (submission.current?.planKey !== planKey) submission.current = { planKey, key: newIdempotencyKey('manual') }
+    const key = submission.current.key
+    try {
+      const response = await action.run(() => api.submitManual(plan, key))
+      if (response) {
+        setResult({ key: planKey, preview: response })
+        if (response.accepted) { setSubmittedKey(planKey); onSubmitted() }
+      }
+    } finally { submitting.current = false }
+  }
+  const errorFor = (field: string) => touched[field] ? errors[field] : undefined
+  const markTouched = (field: string) => () => setTouched((value) => ({ ...value, [field]: true }))
+  const status = hasPosition ? '已有持仓或挂单，请先处理后再下新单'
+    : submittedKey !== null && submittedKey === planKey ? '已提交，请在当前委托中查看'
+    : plan === null ? '填写有效参数后自动生成下单预览'
+    : previewing ? '正在更新预览…'
+    : current?.error ? '预览失败，请重试'
+    : preview?.accepted ? '当前参数已通过风控检查' : '请根据预览提示调整参数'
 
-  // 分批比例之和校验。超过 100% 会超卖，必须在前端就拦住并说明。
-  const rungPercentTotal = rungs.reduce((sum, r) => {
-    const v = Number(r.percent)
-    return sum + (Number.isFinite(v) ? v : 0)
-  }, 0)
-  const rungTotalOk = !useLadder || rungPercentTotal <= 100
-
-  const disabled = hasPosition || action.busy
-
-  return (
-    <section className="panel manual-panel" aria-labelledby="manual-title">
-      <div className="panel-head">
-        <h2 id="manual-title">
-          <SlidersHorizontal size={17} aria-hidden="true" />
-          手动下单
-        </h2>
-        <span className="tag">仅 Maker</span>
+  return <section className="panel manual-panel" aria-labelledby="manual-title">
+    <div className="panel-head">
+      <h2 id="manual-title"><SlidersHorizontal size={17} aria-hidden="true" />手动下单</h2>
+      <span className="tag">仅 Maker</span>
+    </div>
+    <fieldset className="manual-body" disabled={action.busy}>
+      <legend className="sr-only">下单参数</legend>
+      <div className="segmented manual-direction" role="group" aria-label="下单方向">
+        {(['BUY', 'SELL'] as const).map((value) => <button key={value} type="button"
+          className={side === value ? `seg-on ${value === 'BUY' ? 'seg-buy' : 'seg-sell'}` : 'seg'}
+          onClick={() => setSide(value)} aria-pressed={side === value}>{value === 'BUY' ? '买入 / 做多' : '卖出 / 做空'}</button>)}
       </div>
-      <p className="panel-intro">一个入场点，完整规划止盈与止损。</p>
-
-      {hasPosition && (
-        <p className="notice notice-warn">
-          当前已有持仓或在途订单。要下新单请先平仓或撤掉在途单。
-        </p>
-      )}
-
-      <div className="row">
-        <div className="direction-field">
-          <span className="field-label">交易方向</span>
-          <div className="segmented" role="group" aria-label="下单方向">
-            <button
-              type="button"
-              className={side === 'BUY' ? 'seg-on seg-buy' : 'seg'}
-              onClick={() => setSide('BUY')}
-              aria-pressed={side === 'BUY'}
-            >
-              做多
-            </button>
-            <button
-              type="button"
-              className={side === 'SELL' ? 'seg-on seg-sell' : 'seg'}
-              onClick={() => setSide('SELL')}
-              aria-pressed={side === 'SELL'}
-            >
-              做空
-            </button>
-          </div>
+      <section className="manual-section" aria-labelledby="entry-section">
+        <h3 id="entry-section"><span>01</span> 入场与仓位</h3>
+        <InputField label="挂单价格" unit={instrument.quote_asset} value={entry} inputMode="decimal"
+          placeholder="输入限价" error={errorFor('entry')} onBlur={markTouched('entry')}
+          onChange={(value) => { entryInitialized.current = true; setEntry(value) }}
+          action={<button type="button" className="input-action" disabled={!referencePrice} onClick={() => {
+            if (referencePrice) { entryInitialized.current = true; setEntry(referencePrice) }
+          }}>最新价</button>}
+          hint="仅挂限价单，实际价位以下方预览为准" />
+        <div className="manual-grid">
+          <InputField label="杠杆" unit="倍" value={leverage} onChange={setLeverage} inputMode="decimal"
+            error={errorFor('leverage')} onBlur={markTouched('leverage')} />
+          <InputField label="仓位比例" unit="%" value={sizePct} onChange={setSizePct} inputMode="decimal"
+            error={errorFor('sizePct')} onBlur={markTouched('sizePct')} />
         </div>
-      </div>
-
-      <div className="row">
-        <Field
-          label="挂单价格"
-          unit={instrument.quote_asset}
-          value={entry}
-          onChange={(v) => {
-            // 用户一动手就不再跟随行情——否则填好的价格会被刷新覆盖
-            entryTouchedRef.current = true
-            setEntry(v)
-          }}
-          hint="限价单（GTX），只会作为 maker 成交"
-        />
-        <Field
-          label="止损距离"
-          unit="基点"
-          value={stopBp}
-          onChange={setStopBp}
-          hint={`突破即认错。止损价 ${stopPrice || '—'}`}
-        />
-      </div>
-
-      <div className="row">
-        <Field
-          label="杠杆"
-          unit="倍"
-          value={leverage}
-          onChange={setLeverage}
-          hint={`维持保证金率 ${instrument.maint_margin_pct}%`}
-        />
-        <Field
-          label="仓位比例"
-          unit="%"
-          value={sizePct}
-          onChange={setSizePct}
-          hint="占可用权益的百分比"
-        />
-      </div>
-
-      <div className="row protection-options">
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={useLadder}
-            onChange={(e) => setUseLadder(e.target.checked)}
-          />
-          <span>分批止盈</span>
-        </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={breakEven}
-            onChange={(e) => setBreakEven(e.target.checked)}
-          />
-          <span>
-            保本止损<small>浮盈 1 倍止损距离后推到入场价</small>
-          </span>
-        </label>
-      </div>
-
-      {useLadder ? (
-        <div className="rungs">
-          <div className="rungs-head">
-            <span>档位</span>
-            <span>距入场</span>
-            <span>平仓比例</span>
-            <span />
-          </div>
-          {rungs.map((r, i) => (
-            <div className="rung-row" key={i}>
-              <span className="rung-index">第 {i + 1} 档</span>
-              <Field
-                label={`第 ${i + 1} 档止盈距离`}
-                unit="基点"
-                value={r.bp}
-                onChange={(v) =>
-                  setRungs((prev) =>
-                    prev.map((x, j) => (j === i ? { ...x, bp: v } : x)),
-                  )
-                }
-                compact
-              />
-              <Field
-                label={`第 ${i + 1} 档平仓比例`}
-                unit="%"
-                value={r.percent}
-                onChange={(v) =>
-                  setRungs((prev) =>
-                    prev.map((x, j) => (j === i ? { ...x, percent: v } : x)),
-                  )
-                }
-                compact
-              />
-              <button
-                type="button"
-                className="icon-btn"
-                aria-label={`删除第 ${i + 1} 档止盈`}
-                onClick={() =>
-                  setRungs((prev) => prev.filter((_, j) => j !== i))
-                }
-                disabled={rungs.length <= 1}
-              >
-                ×
-              </button>
-            </div>
-          ))}
+        <div className="size-presets" role="group" aria-label="仓位比例快捷选择">
+          {['5', '10', '25', '50'].map((value) => <button key={value} type="button" aria-pressed={sizePct === value}
+            onClick={() => setSizePct(value)}>{value}%</button>)}
+        </div>
+        <p className="field-hint">仓位按可用权益计算 · 维持保证金率 {instrument.maint_margin_pct}%</p>
+      </section>
+      <section className="manual-section" aria-labelledby="protection-section">
+        <h3 id="protection-section"><span>02</span> 止盈与止损</h3>
+        <InputField label="止损距离" unit="基点" value={stopBp} onChange={setStopBp} inputMode="decimal"
+          error={errorFor('stopBp')} onBlur={markTouched('stopBp')}
+          hint={`1 基点 = 0.01% · 止损价 ${preview ? num(preview.stop) : '等待预览'}`} />
+        <div className="segmented" role="group" aria-label="止盈方式">
+          <button type="button" aria-pressed={!useLadder} onClick={() => setUseLadder(false)}>单档止盈</button>
+          <button type="button" aria-pressed={useLadder} onClick={() => setUseLadder(true)}>分批止盈</button>
+        </div>
+        {useLadder ? <div className="manual-rungs">
+          <div className="rungs-head"><span>档位</span><span>距离 / bp</span><span>平仓 / %</span><span /></div>
+          {rungs.map((r, i) => <div className="rung-row" key={i}>
+            <span className="rung-index">{i + 1}</span>
+            <InputField label={`第 ${i + 1} 档止盈距离`} value={r.bp} inputMode="decimal" compact
+              error={errorFor(`bp-${i}`)} onBlur={markTouched(`bp-${i}`)}
+              onChange={(value) => setRungs((prev) => prev.map((item, j) => j === i ? { ...item, bp: value } : item))} />
+            <InputField label={`第 ${i + 1} 档平仓比例`} value={r.percent} inputMode="decimal" compact
+              error={errorFor(`percent-${i}`)} onBlur={markTouched(`percent-${i}`)}
+              onChange={(value) => setRungs((prev) => prev.map((item, j) => j === i ? { ...item, percent: value } : item))} />
+            <button type="button" className="icon-btn" aria-label={`删除第 ${i + 1} 档止盈`} disabled={rungs.length <= 1}
+              onClick={() => setRungs((prev) => prev.filter((_, j) => i !== j))}><X size={15} aria-hidden="true" /></button>
+          </div>)}
           <div className="rungs-foot">
-            <span>合计平仓 {rungPercentTotal}%</span>
-            <button
-              type="button"
-              className="link-btn"
-              onClick={() =>
-                setRungs((prev) => [...prev, { bp: '100', percent: '0' }])
-              }
-            >
-              + 增加档位
-            </button>
+            <span className={errors.rungs ? 'neg' : 'muted'}>合计 {total}%</span>
+            <button type="button" className="link-btn" onClick={() => setRungs((prev) => [...prev, { bp: '', percent: '' }])}>
+              <Plus size={14} aria-hidden="true" />增加档位</button>
           </div>
-          {!rungTotalOk && (
-            <p className="notice notice-error">
-              各档平仓比例合计 {rungPercentTotal}% 超过 100%，会被后端拒绝。
-            </p>
-          )}
-        </div>
-      ) : (
-        <div className="row">
-          <Field
-            label="止盈距离"
-            unit="基点"
-            value={singleTpBp}
-            onChange={setSingleTpBp}
-            hint="单一止盈价，全额平仓"
-          />
-        </div>
-      )}
-
-      <div className="row">
-        <Field
-          label="挂单自动撤销"
-          unit="秒"
-          value={cancelSecs}
-          onChange={setCancelSecs}
-          hint="超过此时间未成交则撤单"
-        />
-      </div>
-
-      {preview !== null && <PreviewBlock preview={preview} />}
-
-      {action.error !== null && (
-        <p className="notice notice-error" role="alert">
-          {action.error}
-        </p>
-      )}
-
-      <div className="row actions">
-        <button
-          type="button"
-          className={`primary ${side === 'BUY' ? 'buy' : 'sell'}`}
-          onClick={() => void submit()}
-          disabled={
-            disabled || preview === null || !preview.accepted || !rungTotalOk
-          }
-        >
-          {action.busy ? '提交中…' : side === 'BUY' ? '挂买单' : '挂卖单'}
-        </button>
-      </div>
-    </section>
-  )
+          {errors.rungs && <p className="field-error" role="alert">{errors.rungs}</p>}
+          <p className="field-hint">各档比例均以入场时的原始持仓量为基准。</p>
+        </div> : <InputField label="止盈距离" unit="基点" value={singleTpBp} onChange={setSingleTpBp} inputMode="decimal"
+          error={errorFor('singleTpBp')} onBlur={markTouched('singleTpBp')} hint="单档止盈，全额平仓" />}
+        <label className="checkbox manual-break-even"><input type="checkbox" checked={breakEven} onChange={(e) => setBreakEven(e.target.checked)} />
+          <span>保本止损<small>浮盈达到 1 倍止损距离后，止损推至入场价</small></span></label>
+        <InputField label="未成交自动撤单" unit="秒" value={cancelSecs} onChange={setCancelSecs} inputMode="numeric"
+          error={errorFor('cancelSecs')} onBlur={markTouched('cancelSecs')} hint="留空则不自动撤销" />
+      </section>
+      <section className="manual-section manual-review" aria-labelledby="review-section">
+        <h3 id="review-section"><span>03</span> 确认下单</h3>
+        {preview ? <PreviewBlock preview={preview} /> : <p className="manual-preview-status" role="status">{status}</p>}
+        {current?.error && <div className="notice notice-error" role="alert">{current.error}
+          <button type="button" className="link-btn" onClick={() => { setResult(null); setRetry((value) => value + 1) }}>重新预览</button>
+        </div>}
+      </section>
+    </fieldset>
+    <div className="manual-submit">
+      <p role="status">{status}</p>
+      {preview && <div className="manual-submit-summary">
+        <span>数量 <strong>{num(preview.quantity)} {instrument.base_asset}</strong></span>
+        <span>保证金 <strong>{num(preview.margin_required, 2)} {instrument.margin_asset}</strong></span>
+      </div>}
+      {action.error && <p className="field-error" role="alert">{action.error}</p>}
+      <button type="button" className={`primary ${side === 'BUY' ? 'buy' : 'sell'}`} disabled={!canSubmit} onClick={() => void submit()}>
+        {action.busy ? '正在提交…' : side === 'BUY' ? '确认挂买单' : '确认挂卖单'}
+      </button>
+    </div>
+  </section>
 }
 
 /** 预览块。展示后端量化后的真实价位。 */
@@ -496,52 +265,6 @@ function PreviewBlock({ preview }: { preview: ManualPreview }) {
           ))}
         </ul>
       )}
-    </div>
-  )
-}
-
-/**
- * 数值输入框。
- *
- * 用 `type="text"` 而非 `type="number"`：数字输入框在部分浏览器上会对小数
- * 做本地化处理（逗号小数点），而我们的价格必须原样传给后端。
- */
-function Field({
-  label,
-  unit,
-  value,
-  onChange,
-  hint,
-  compact = false,
-}: {
-  label: string
-  unit: string
-  value: string
-  onChange: (v: string) => void
-  hint?: string
-  compact?: boolean
-}) {
-  const id = useId()
-  return (
-    <div className={compact ? 'field field-compact' : 'field'}>
-      {label !== '' && (
-        <label className={compact ? 'sr-only' : undefined} htmlFor={id}>
-          {label}
-        </label>
-      )}
-      <div className="input-wrap">
-        <input
-          id={id}
-          type="text"
-          inputMode="decimal"
-          aria-describedby={hint === undefined ? undefined : `${id}-hint`}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          aria-label={label !== '' ? undefined : unit}
-        />
-        {unit !== '' && <span className="unit">{unit}</span>}
-      </div>
-      {hint !== undefined && <small id={`${id}-hint`}>{hint}</small>}
     </div>
   )
 }
